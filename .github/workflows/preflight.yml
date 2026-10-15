@@ -275,38 +275,60 @@ jobs:
           # forbidden exposure, 2+ = unreadable or malformed mountinfo.
           set +e
           awk '
-            function allowed_target(path) {
-              return path == "/" || path == "/proc" || path ~ /^\/proc\// || \
-                     path == "/sys" || path ~ /^\/sys\// || \
-                     path == "/dev" || path ~ /^\/dev\// || \
-                     path == "/tmp" || path == "/run" || \
-                     path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf"
-            }
+            # MOUNTINFO_AWK_BEGIN
             function has_option(options, wanted, n, values, i) {
               n = split(options, values, ",")
               for (i = 1; i <= n; i++) if (values[i] == wanted) return 1
               return 0
             }
+            function is_ro(options) { return has_option(options, "ro") && !has_option(options, "rw") }
+            function is_rw(options) { return has_option(options, "rw") && !has_option(options, "ro") }
+            function is_proc_readonly_path(path) {
+              return path == "/proc/bus" || path == "/proc/fs" || path == "/proc/irq" || \
+                     path == "/proc/sys" || path == "/proc/sysrq-trigger"
+            }
+            function is_masked_proc_path(path) {
+              return path == "/proc/acpi" || path == "/proc/asound" || path == "/proc/scsi" || \
+                     path == "/proc/interrupts" || path == "/proc/kcore" || path == "/proc/keys" || \
+                     path == "/proc/latency_stats" || path == "/proc/timer_list" || path == "/proc/timer_stats"
+            }
+            function allowed_mount(path, filesystem, source, options) {
+              # This is intentionally an exact destination allowlist.  Docker/runc
+              # can add known pseudo-filesystems, but never an arbitrary descendant.
+              if (path == "/") return filesystem == "overlay" && source == "overlay" && is_ro(options)
+              if (path == "/proc") return filesystem == "proc" && source == "proc" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (is_proc_readonly_path(path)) return filesystem == "proc" && source == "proc" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (is_masked_proc_path(path)) return filesystem == "tmpfs" && source == "tmpfs" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/dev") return filesystem == "tmpfs" && source == "tmpfs" && is_rw(options) && has_option(options, "nosuid")
+              if (path == "/dev/pts") return filesystem == "devpts" && source == "devpts" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
+              if (path == "/dev/mqueue") return filesystem == "mqueue" && source == "mqueue" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/dev/shm") return filesystem == "tmpfs" && source == "shm" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/sys") return filesystem == "sysfs" && source == "sysfs" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/sys/fs/cgroup") return filesystem == "cgroup2" && source == "cgroup" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return filesystem == "tmpfs" && source == "tmpfs" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/tmp" || path == "/run") return filesystem == "tmpfs" && source == "tmpfs" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
+              if (path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf") return filesystem == "tmpfs" && source == "tmpfs" && is_rw(options)
+              return 0
+            }
             {
+              records++
               if (NF < 7) { malformed = 1; next }
               separator = 0
               for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
               if (!separator || separator + 2 > NF) { malformed = 1; next }
               target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2)
-              if (!allowed_target(target)) forbidden = 1
-              if (target == "/tmp" || target == "/run") {
-                if (filesystem != "tmpfs" || !has_option(options, "rw")) forbidden = 1
-              }
-              if (target == "/" && !has_option(options, "ro")) forbidden = 1
+              if (seen[target]++) forbidden = 1
+              if (!allowed_mount(target, filesystem, source, options)) forbidden = 1
               if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ || \
                   target ~ /^\/(home\/runner|__w|github)(\/|$)/ || \
                   source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) forbidden = 1
             }
             END {
-              if (malformed) exit 2
+              if (records == 0 || malformed) exit 2
               if (forbidden) exit 1
               exit 0
             }
+            # MOUNTINFO_AWK_END
           ' /proc/self/mountinfo
           mountinfo_rc=$?
           set -e
