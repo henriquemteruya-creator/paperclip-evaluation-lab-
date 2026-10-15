@@ -190,8 +190,25 @@ assert_rc 1 "$rc" known_mount_identity_mismatch_is_no_go
 printf '%s\n' '36 25 0:32 / /tmp rw,nosuid - tmpfs tmpfs rw' >"$tmpdir/mounts-known-options-mismatch"
 set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-known-options-mismatch")"; rc=$?; set -e
 assert_rc 1 "$rc" known_mount_options_mismatch_is_no_go
-[[ "$mountinfo_diagnostic" == *'reason=mount_options_incompatible destination_class=expected'* ]] || {
+[[ "$mountinfo_diagnostic" == *'reason=mount_options_incompatible destination_class=expected destination_id=tmp per_mount=missing_noexec superblock_access=rw'* ]] || {
   printf 'FAIL missing known-mount options diagnostic\n' >&2
+  exit 1
+}
+
+printf '%s\n' '36 25 0:32 / /etc/hosts rw,relatime - tmpfs /private/host-generated-file rw' >"$tmpdir/mounts-etc-identity-mismatch"
+set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-etc-identity-mismatch")"; rc=$?; set -e
+assert_rc 1 "$rc" etc_special_identity_mismatch_is_no_go
+[[ "$mountinfo_diagnostic" == *'reason=filesystem_or_source_incompatible destination_class=expected destination_id=etc_hosts fstype_category=tmpfs source_category=other'* && "$mountinfo_diagnostic" != *'/private/host-generated-file'* ]] || {
+  printf 'FAIL etc special-file diagnostic is missing or exposed raw source\n' >&2
+  exit 1
+}
+printf 'PASS etc_special_identity_diagnostic_is_sanitized\n'
+
+printf '%s\n' '36 25 0:32 / /etc/hostname ro,relatime - tmpfs tmpfs ro' >"$tmpdir/mounts-etc-options-mismatch"
+set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-etc-options-mismatch")"; rc=$?; set -e
+assert_rc 1 "$rc" etc_special_options_mismatch_is_no_go
+[[ "$mountinfo_diagnostic" == *'destination_id=etc_hostname per_mount=access_rw_required superblock_access=ro'* ]] || {
+  printf 'FAIL etc special-file options diagnostic is incomplete\n' >&2
   exit 1
 }
 
