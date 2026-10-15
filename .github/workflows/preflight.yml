@@ -166,7 +166,7 @@ jobs:
             }
 
             validate_tmpfs_config() {
-              local entries="$1" path options extra expected_bytes token size_raw size_bytes
+              local entries="$1" path options extra expected_bytes token size_raw size_bytes tmpfs_key
               local tmp_seen=0 run_seen=0 unexpected_keys=0 invalid=0 parse_error=0
               local rw_seen=0 noexec_seen=0 nosuid_seen=0 size_seen=0
               while IFS='|' read -r path options extra; do
@@ -175,16 +175,17 @@ jobs:
                   parse_error=1
                   continue
                 fi
+                case "$path" in
+                  /tmp) expected_bytes=67108864; tmpfs_key=tmp; (( ++tmp_seen )) ;;
+                  /run) expected_bytes=8388608; tmpfs_key=run; (( ++run_seen )) ;;
+                  *) expected_bytes=''; tmpfs_key=unexpected; (( ++unexpected_keys )) ;;
+                esac
                 if [[ "$options" == *, || "$options" == *',,'* ]]; then
                   parse_error=1
-                  printf 'tmpfs_key=%s state=invalid\n' "$path"
+                  printf 'tmpfs_key=%s state=invalid\n' "$tmpfs_key"
                   continue
                 fi
-                case "$path" in
-                  /tmp) expected_bytes=67108864; (( ++tmp_seen )) ;;
-                  /run) expected_bytes=8388608; (( ++run_seen )) ;;
-                  *) (( ++unexpected_keys )); continue ;;
-                esac
+                [[ "$tmpfs_key" != unexpected ]] || continue
                 if (( tmp_seen > 1 || run_seen > 1 )); then
                   invalid=1
                   continue
@@ -273,17 +274,46 @@ jobs:
             # its entries vary by Docker version and lifecycle state.  Check it
             # independently without assuming a fixed count; the closed runtime
             # allowlist below remains the authoritative observation.
-            if ! docker_reported_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t\n" .Type .Destination .RW}}{{end}}')"; then
-              fail 'docker inspect failed for reported mounts'
-            elif [[ -n "$docker_reported_mounts" ]]; then
-              while IFS='|' read -r mount_type mount_destination mount_rw; do
-                [[ -z "$mount_type" ]] && continue
+            # DOCKER_REPORTED_MOUNTS_VALIDATOR_BEGIN
+            validate_docker_reported_mounts() {
+              local entries="$1" mount_type mount_destination mount_rw extra
+              local unexpected=0 parse_error=0
+              while IFS='|' read -r mount_type mount_destination mount_rw extra; do
+                [[ -z "$mount_type" && -z "$mount_destination" && -z "$mount_rw" && -z "$extra" ]] && continue
+                if [[ -z "$mount_type" || -z "$mount_destination" || -z "$mount_rw" || -n "$extra" ]]; then
+                  parse_error=1
+                  continue
+                fi
                 case "$mount_type|$mount_destination|$mount_rw" in
                   'tmpfs|/tmp|true'|'tmpfs|/run|true'|\
                   'bind|/etc/hosts|true'|'bind|/etc/hostname|true'|'bind|/etc/resolv.conf|true') ;;
-                  *) fail "Docker reported unexpected mount: $mount_type $mount_destination" ;;
+                  *) (( ++unexpected )) ;;
                 esac
-              done <<< "$docker_reported_mounts"
+              done <<< "$entries"
+              printf 'docker_reported_mount_unexpected_count=%s\n' "$unexpected"
+              if (( parse_error != 0 )); then
+                printf '%s\n' 'docker_reported_mount_parser_error'
+                return 2
+              fi
+              (( unexpected == 0 )) || return 1
+              return 0
+            }
+            # DOCKER_REPORTED_MOUNTS_VALIDATOR_END
+            if ! docker_reported_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t\n" .Type .Destination .RW}}{{end}}')"; then
+              fail 'docker inspect failed for reported mounts'
+            else
+              set +e
+              docker_reported_mount_diagnostic="$(validate_docker_reported_mounts "$docker_reported_mounts")"
+              docker_reported_mount_rc=$?
+              set -e
+              while IFS= read -r docker_reported_mount_line; do
+                [[ -n "$docker_reported_mount_line" ]] && info "$docker_reported_mount_line"
+              done <<< "$docker_reported_mount_diagnostic"
+              case "$docker_reported_mount_rc" in
+                0) pass 'docker reported mounts match closed allowlist' ;;
+                1) fail 'docker reported unexpected mount' ;;
+                *) fail 'docker reported mounts parser failed' ;;
+              esac
             fi
           fi
 
