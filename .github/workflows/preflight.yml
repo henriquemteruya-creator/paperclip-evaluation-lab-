@@ -1,211 +1,205 @@
-name: Paperclip TI-0093 - isolation diagnostic only
+name: Paperclip TI-0093 - isolation preflight v2
 
-# DIAGNOSTIC ONLY. Never downloads, installs or executes Paperclip.
-# PASS of this diagnostic is NOT permission to run Paperclip P01/P02/P04.
-# A later execution workflow requires a separate review, immutable image,
-# offline dependencies, isolated filesystem and explicit approval.
+# DIAGNOSTIC ONLY.  This workflow never downloads, installs or executes
+# Paperclip.  It has no automatic trigger and deliberately uses no actions.
 on:
   workflow_dispatch:
 
+# No repository-content, issue, package, deployment or OIDC permission.
+# GitHub may still report its unavoidable Metadata: read capability.
 permissions: {}
 
 concurrency:
-  group: paperclip-ti-0093-diagnostic
+  group: paperclip-ti-0093-preflight-v2
   cancel-in-progress: false
 
 jobs:
-  isolation-diagnostic:
+  isolation-preflight:
+    # No jobs.container: Actions injects docker.sock and runner bind mounts
+    # into job containers before steps begin.  This trusted host script creates
+    # the diagnostic container itself with no --mount or --volume arguments.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    container:
-      # Mutable tag intentionally acceptable ONLY for a diagnostic without
-      # executing third-party code. Never use this image reference for P01/2/4.
-      image: ubuntu:24.04
-      options: >-
-        --cap-drop=ALL
-        --security-opt=no-new-privileges
-        --pids-limit=256
-        --memory=2g
-        --cpus=1
+
     steps:
-      - name: Fail-closed isolation diagnostic (no third-party code)
+      - name: Fail-closed Docker isolation diagnostic (no Paperclip)
         shell: bash
         run: |
           set -Eeuo pipefail
           umask 077
+
+          # This shell runs on the GitHub-hosted runner and is trusted only as
+          # infrastructure.  No third-party source or script is invoked here.
           failures=()
+          container_id=''
           fail() { failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
           pass() { printf 'PASS %s\n' "$1"; }
           info() { printf 'INFO %s\n' "$1"; }
+          cleanup() {
+            if [[ -n "$container_id" ]]; then
+              docker rm --force "$container_id" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
 
-          # Fail rather than printing credentials or full environment.
+          # Never print the environment.  A value here is a hard failure;
+          # nothing from this host environment is passed to docker run/create.
           for name in GITHUB_TOKEN GH_TOKEN GH_PAT CI_TOKEN \
                       ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
                       AWS_ACCESS_KEY_ID GOOGLE_APPLICATION_CREDENTIALS \
                       AZURE_CLIENT_SECRET OPENAI_API_KEY ANTHROPIC_API_KEY; do
-            if [[ -n "${!name:-}" ]]; then fail "credential variable present: $name"; fi
+            [[ -z "${!name:-}" ]] || fail "credential-like host environment variable present: $name"
           done
 
-          ws="${GITHUB_WORKSPACE:-/github/workspace}"
-          if [[ -e "$ws/.git" || -e "$ws/package.json" || -e "$ws/pnpm-lock.yaml" ]]; then
+          # No checkout action is used.  A populated workspace would be an
+          # unexpected source exposure and blocks this diagnostic.
+          workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be defined}"
+          if [[ -e "$workspace/.git" || -e "$workspace/package.json" || -e "$workspace/pnpm-lock.yaml" ]]; then
             fail 'workspace is not source-free'
           else
-            pass 'no checked-out source detected at workspace root'
+            pass 'workspace has no checked-out source'
           fi
 
-          for command in bash setpriv unshare getent openssl awk grep readlink \
-                         timeout id cat sort wc tee find; do
-            if ! command -v "$command" >/dev/null 2>&1; then
-              fail "required diagnostic program unavailable: $command"
-            fi
-          done
+          command -v docker >/dev/null 2>&1 || fail 'Docker client unavailable on runner'
+          if (( ${#failures[@]} == 0 )); then
+            docker version --format '{{.Server.APIVersion}}' >/dev/null 2>&1 || fail 'Docker daemon unavailable on runner'
+          fi
+
+          # Digest copied from the publisher’s GHCR package page.  It is a
+          # public diagnostic image; it is not Paperclip and carries no user
+          # data.  Its Dockerfile includes bash, openssl, curl, iproute2 and nc.
+          image='ghcr.io/nicolaka/netshoot:v0.16@sha256:147f2c4cb0aa7a741151bce2bfef71d9e1a04631636e24665ee2a5ed799feb47'
+          expected_digest="${image##*@}"
 
           if (( ${#failures[@]} == 0 )); then
-            # The inherited container process may start privileged. No
-            # third-party code is ever invoked in that context.
+            # Image acquisition is the only intentional runner egress.  It is
+            # completed before the isolated diagnostic starts.
+            docker pull "$image" >/dev/null 2>&1 || fail 'cannot pull pinned public diagnostic image'
+          fi
+          if (( ${#failures[@]} == 0 )); then
+            docker image inspect "$image" --format '{{join .RepoDigests "\n"}}' | \
+              grep -Fq "@$expected_digest" || fail 'pulled image does not retain expected digest'
+          fi
+
+          if (( ${#failures[@]} == 0 )); then
+            # No --mount, --volume, --env-file, --privileged, --pid=host,
+            # --ipc=host or --userns=host.  The two tmpfs mounts are explicit,
+            # bounded scratch space; the root filesystem is read-only.
             set +e
-            setpriv \
-              --reuid=10001 --regid=10001 --clear-groups \
-              --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
-              --no-new-privs bash -s <<'REDUCED'
+            container_id="$(docker create \
+              --network none \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+              --tmpfs /run:rw,noexec,nosuid,size=8m \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 128 \
+              --memory 512m \
+              --cpus 1 \
+              --user 10001:10001 \
+              --workdir /tmp \
+              --entrypoint /bin/bash \
+              "$image" -s 2>/dev/null)"
+            create_rc=$?
+            set -e
+            if (( create_rc != 0 )) || [[ -z "$container_id" ]]; then
+              fail 'Docker could not create the isolated diagnostic container'
+            fi
+          fi
+
+          if [[ -n "$container_id" ]]; then
+            # Validate Docker’s effective configuration before starting it.
+            [[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == none ]] || fail 'effective network mode is not none'
+            [[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" == true ]] || fail 'root filesystem is not read-only'
+            [[ "$(docker inspect --format '{{.Config.User}}' "$container_id")" == 10001:10001 ]] || fail 'effective container user is not 10001:10001'
+            [[ "$(docker inspect --format '{{.HostConfig.PidMode}}' "$container_id")" != host ]] || fail 'host PID namespace requested'
+            [[ "$(docker inspect --format '{{.HostConfig.IpcMode}}' "$container_id")" != host ]] || fail 'host IPC namespace requested'
+            [[ "$(docker inspect --format '{{.HostConfig.UTSMode}}' "$container_id")" != host ]] || fail 'host UTS namespace requested'
+            [[ "$(docker inspect --format '{{.HostConfig.Privileged}}' "$container_id")" == false ]] || fail 'privileged container requested'
+            [[ "$(docker inspect --format '{{.HostConfig.Binds}}' "$container_id")" == '<no value>' || "$(docker inspect --format '{{.HostConfig.Binds}}' "$container_id")" == '[]' ]] || fail 'host bind mount requested'
+            [[ "$(docker inspect --format '{{.HostConfig.VolumesFrom}}' "$container_id")" == '<no value>' || "$(docker inspect --format '{{.HostConfig.VolumesFrom}}' "$container_id")" == '[]' ]] || fail 'volumes-from requested'
+            [[ "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$container_id")" == *ALL* ]] || fail 'Docker did not retain cap-drop ALL'
+            [[ "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container_id")" == *no-new-privileges* ]] || fail 'Docker did not retain no-new-privileges'
+          fi
+
+          diagnostic_rc=99
+          if (( ${#failures[@]} == 0 )); then
+            # The heredoc is trusted workflow text.  It is the only payload
+            # executed inside the isolated container.
+            set +e
+            docker start --attach --interactive "$container_id" <<'DIAGNOSTIC'
           set -Eeuo pipefail
           bad=0
           probe_pass() { printf 'PASS %s\n' "$1"; }
           probe_fail() { printf 'FAIL %s\n' "$1"; bad=1; }
-          verify() {
-            local name="$1"
-            shift
-            if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi
-          }
+          verify() { local name="$1"; shift; if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi; }
 
-          verify 'uid_is_10001' test "$(id -u)" -eq 10001
-          verify 'gid_is_10001' test "$(id -g)" -eq 10001
-          verify 'no_extra_groups' bash -c 'test "$(id -G | wc -w)" -eq 1'
-          verify 'no_new_privileges' grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status
+          for tool in bash openssl curl nc getent ip awk grep find readlink timeout id cat; do
+            command -v "$tool" >/dev/null 2>&1 || probe_fail "required_tool_missing_${tool}"
+          done
+
+          verify uid_is_non_root test "$(id -u)" -eq 10001
+          verify gid_is_non_root test "$(id -g)" -eq 10001
+          verify no_supplementary_groups bash -c 'test "$(id -G | wc -w)" -eq 1'
+          verify no_new_privileges grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status
           for cap in CapInh CapPrm CapEff CapBnd CapAmb; do
             verify "${cap}_is_zero" grep -q "^${cap}:[[:space:]]*0000000000000000$" /proc/self/status
           done
 
-          # cgroup-v2-only. Missing/unreadable files mean NO-GO, not zero use.
-          verify 'cgroup_v2_memory_lte_2GiB' bash -c \
-            'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 2147483648 ]]'
-          verify 'cgroup_v2_pids_lte_256' bash -c \
-            'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 256 ]]'
-          verify 'cgroup_v2_cpu_lte_1_core' bash -c \
-            'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
+          verify root_filesystem_is_read_only bash -c '! touch /paperclip-preflight-must-not-write'
+          verify tmpfs_tmp_is_writable bash -c 'touch /tmp/preflight-write-test && rm /tmp/preflight-write-test'
+          verify cgroup_memory_lte_512MiB bash -c 'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 536870912 ]]'
+          verify cgroup_pids_lte_128 bash -c 'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 128 ]]'
+          verify cgroup_cpu_lte_one_core bash -c 'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
 
-          for ns in user mnt pid net ipc uts cgroup; do
-            if [[ -e "/proc/self/ns/$ns" ]]; then
-              printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")"
-            else
-              probe_fail "namespace_${ns}_missing"
-            fi
+          for ns in mnt pid net ipc uts cgroup user; do
+            [[ -e "/proc/self/ns/$ns" ]] && printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")" || probe_fail "namespace_missing_${ns}"
           done
+          verify only_loopback_interface bash -c 'test "$(ip -o link show | wc -l)" -eq 1 && ip -o link show | grep -Eq "^[0-9]+: lo:"'
+          verify no_default_route bash -c '! ip route show default | grep -q .'
 
-          sockets=(/var/run/docker.sock /run/docker.sock
-                   /var/run/containerd/containerd.sock /run/containerd/containerd.sock
-                   /var/run/podman/podman.sock /run/podman/podman.sock)
-          sock_bad=0
-          for socket in "${sockets[@]}"; do
-            if [[ -e "$socket" || -S "$socket" ]]; then
-              probe_fail 'known_host_control_socket_present'
-              sock_bad=1
-            fi
+          socket_bad=0
+          for socket in /var/run/docker.sock /run/docker.sock /var/run/containerd/containerd.sock /run/containerd/containerd.sock /var/run/podman/podman.sock /run/podman/podman.sock; do
+            [[ ! -e "$socket" && ! -S "$socket" ]] || socket_bad=1
           done
-          if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
-            probe_fail 'container_runtime_client_present'
-            sock_bad=1
-          fi
-          if (( sock_bad == 0 )); then probe_pass 'no_known_host_control_socket'; fi
-
-          # Compare mount TARGET ($5), not substring-match all mountinfo fields:
-          # a normal read-only /proc/sys mount is not host-control access.
-          # Runner support bind mounts may still be visible; flag them as
-          # NO-GO until a later runtime can prevent exposing them to the app.
-          if awk '
-            $5 ~ /^\/(root|home\/runner)(\/|$)/ { bad=1 }
-            $5 ~ /^\/(var\/run\/docker\.sock|run\/docker\.sock|run\/containerd|run\/podman)(\/|$)/ { bad=1 }
-            $5 ~ /^\/dev\/(kvm|fuse)$/ { bad=1 }
-            $5 ~ /^\/(__w\/_temp|__w\/_actions|github\/workflow|github\/file_commands)(\/|$)/ { bad=1 }
-            END { exit !bad }
-          ' /proc/self/mountinfo; then
-            probe_fail 'sensitive_or_runner_control_mount_detected'
+          find / -xdev -type s \( -name '*docker*.sock' -o -name '*containerd*.sock' -o -name '*podman*.sock' \) -print -quit 2>/dev/null | grep -q . && socket_bad=1 || true
+          (( socket_bad == 0 )) && probe_pass no_host_control_socket || probe_fail host_control_socket_present
+          if grep -Eq '(docker\.sock|containerd\.sock|podman\.sock|/home/runner|/__w|/github)' /proc/self/mountinfo; then
+            probe_fail prohibited_mount_visible
           else
-            probe_pass 'no_listed_sensitive_mount_target'
-          fi
-          # Print only the mount COUNT: public Actions logs must not disclose paths.
-          awk 'END { printf "INFO mount_count=%d\n", NR }' /proc/self/mountinfo
-
-          outer_user="$(readlink /proc/self/ns/user)"
-          outer_net="$(readlink /proc/self/ns/net)"
-          outer_mnt="$(readlink /proc/self/ns/mnt)"
-          export outer_user outer_net outer_mnt
-
-          # User, network AND mount namespaces must be distinct. A GitHub job
-          # container may reject this call; that is a legitimate NO-GO.
-          if unshare -Urnm -- bash -s <<'NO_NETWORK'
-          set -Eeuo pipefail
-          [[ "$(readlink /proc/self/ns/user)" != "$outer_user" ]] || exit 40
-          [[ "$(readlink /proc/self/ns/net)" != "$outer_net" ]] || exit 41
-          [[ "$(readlink /proc/self/ns/mnt)" != "$outer_mnt" ]] || exit 42
-
-          # Fail if any interface except loopback or any default route exists.
-          for iface in /sys/class/net/*; do
-            [[ -e "$iface" ]] || continue
-            [[ "${iface##*/}" == lo ]] || exit 43
-          done
-          if awk 'NR>1 && $2=="00000000" { bad=1 } END { exit !bad }' /proc/net/route; then
-            exit 44
+            probe_pass no_prohibited_mount_visible
           fi
 
-          # Negative probes are additional evidence, not a standalone proof.
-          # A failed TLS handshake alone is insufficient: test raw TCP too.
-          timeout 6 getent ahostsv4 example.com >/dev/null 2>&1 && exit 45
-          timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1 && exit 46
-          timeout 6 openssl s_client -connect 1.1.1.1:443 \
-            -servername one.one.one.one -brief </dev/null >/dev/null 2>&1 && exit 47
-          exit 0
-          NO_NETWORK
-          then
-            probe_pass 'fresh_user_network_mount_namespaces'
-            probe_pass 'loopback_only_and_no_default_route'
-            probe_pass 'dns_tcp_https_negative'
-          else
-            rc=$?
-            case "$rc" in
-              40|41|42) probe_fail "namespace_identity_unchanged_rc_${rc}" ;;
-              43|44) probe_fail "namespace_network_route_or_interface_rc_${rc}" ;;
-              45|46|47) probe_fail "unexpected_network_egress_rc_${rc}" ;;
-              *) probe_fail "unshare_unavailable_or_probe_failed_rc_${rc}" ;;
-            esac
-          fi
-          if (( bad != 0 )); then exit 86; fi
-          REDUCED
-            reduced_rc=$?
+          # --network none plus one loopback interface is primary evidence.
+          # DNS, raw TCP and TLS/HTTPS attempts are independent negative probes.
+          timeout 5 getent ahostsv4 example.com >/dev/null 2>&1 && probe_fail dns_egress_available || probe_pass dns_negative
+          timeout 5 nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1 && probe_fail tcp_egress_available || probe_pass tcp_negative
+          timeout 5 openssl s_client -connect 1.1.1.1:443 -servername one.one.one.one -brief </dev/null >/dev/null 2>&1 && probe_fail tls_egress_available || probe_pass tls_negative
+          HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY= timeout 5 curl --noproxy '*' --insecure --silent --show-error --output /dev/null https://1.1.1.1/ >/dev/null 2>&1 && probe_fail https_egress_available || probe_pass https_negative
+
+          (( bad == 0 )) || exit 86
+          DIAGNOSTIC
+            diagnostic_rc=$?
             set -e
-            if (( reduced_rc != 0 )); then
-              fail "reduced boundary probes rejected (exit $reduced_rc)"
-            else
-              pass 'reduced boundary diagnostic'
-            fi
+            (( diagnostic_rc == 0 )) || fail "isolated diagnostic rejected (exit $diagnostic_rc)"
           fi
 
           {
-            echo '## Paperclip TI-0093 - diagnostic only'
+            echo '## Paperclip TI-0093 isolation preflight v2'
             echo
-            echo '- No Paperclip source, packages, models or third-party scripts were fetched/executed.'
-            echo '- Container image uses mutable `ubuntu:24.04` for diagnostics only.'
-            echo '- Actual P01/P02/P04 execution remains prohibited pending a new digest-pinned, separately reviewed workflow.'
+            echo '- No Paperclip source, packages, models, third-party repository scripts or private data were accessed.'
+            echo '- The runner used Docker only to create the separately configured diagnostic container.'
+            echo '- The summary is written by the trusted runner process, not the UID 10001 container process.'
+            echo '- A pass validates only this diagnostic configuration; it does not authorize P01, P02 or P04.'
             echo
-            if (( ${#failures[@]} > 0 )); then
-              echo '### Preflight verdict: NO-GO'
-              printf -- '- %s\n' "${failures[@]}"
+            if (( ${#failures[@]} == 0 )); then
+              echo '### Verdict: GO for separate review of a later Paperclip test workflow only'
+              echo '- P01/P02/P04 remain NO-GO pending explicit approval and a separately reviewed workflow.'
             else
-              echo '### Preflight verdict: diagnostic probes passed'
-              echo '- **NOT an authorization to run Paperclip.**'
+              echo '### Verdict: NO-GO'
+              printf -- '- %s\n' "${failures[@]}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Unlike the original file, the Actions job is red when probes fail.
-          if (( ${#failures[@]} > 0 )); then exit 1; fi
-          exit 0
+          # Fail the GitHub Actions job when any mandatory requirement failed.
+          (( ${#failures[@]} == 0 ))
