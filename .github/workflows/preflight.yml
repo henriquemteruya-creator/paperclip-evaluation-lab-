@@ -32,6 +32,7 @@ jobs:
           # infrastructure.  No third-party source or script is invoked here.
           failures=()
           container_id=''
+          diagnostic_log=''
           fail() { failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
           pass() { printf 'PASS %s\n' "$1"; }
           info() { printf 'INFO %s\n' "$1"; }
@@ -39,6 +40,7 @@ jobs:
             if [[ -n "$container_id" ]]; then
               docker rm --force "$container_id" >/dev/null 2>&1 || true
             fi
+            [[ -z "$diagnostic_log" ]] || rm -f "$diagnostic_log"
           }
           trap cleanup EXIT
 
@@ -97,6 +99,7 @@ jobs:
               --memory 512m \
               --cpus 1 \
               --user 10001:10001 \
+              --interactive \
               --workdir /tmp \
               --entrypoint /bin/bash \
               "$image" -s 2>/dev/null)"
@@ -108,26 +111,99 @@ jobs:
           fi
 
           if [[ -n "$container_id" ]]; then
+            # Every inspect failure is a NO-GO; never interpret a missing value
+            # as a secure default.
+            inspect_value() { docker inspect --format "$1" "$container_id"; }
+            inspect_exact() {
+              local label="$1" expected="$2" template="$3" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" != "$expected" ]]; then
+                fail "$label has unexpected value: $actual"
+              fi
+            }
+            inspect_empty_collection() {
+              local label="$1" template="$2" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" != 'null' && "$actual" != '[]' && "$actual" != '{}' && "$actual" != '<no value>' ]]; then
+                fail "$label is unexpectedly populated"
+              fi
+            }
+            inspect_not_host() {
+              local label="$1" template="$2" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" == host ]]; then
+                fail "$label is host"
+              fi
+            }
+            inspect_contains() {
+              local label="$1" needle="$2" template="$3" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" != *"$needle"* ]]; then
+                fail "$label does not contain required value"
+              fi
+            }
+
             # Validate Docker’s effective configuration before starting it.
-            [[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == none ]] || fail 'effective network mode is not none'
-            [[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" == true ]] || fail 'root filesystem is not read-only'
-            [[ "$(docker inspect --format '{{.Config.User}}' "$container_id")" == 10001:10001 ]] || fail 'effective container user is not 10001:10001'
-            [[ "$(docker inspect --format '{{.HostConfig.PidMode}}' "$container_id")" != host ]] || fail 'host PID namespace requested'
-            [[ "$(docker inspect --format '{{.HostConfig.IpcMode}}' "$container_id")" != host ]] || fail 'host IPC namespace requested'
-            [[ "$(docker inspect --format '{{.HostConfig.UTSMode}}' "$container_id")" != host ]] || fail 'host UTS namespace requested'
-            [[ "$(docker inspect --format '{{.HostConfig.Privileged}}' "$container_id")" == false ]] || fail 'privileged container requested'
-            [[ "$(docker inspect --format '{{.HostConfig.Binds}}' "$container_id")" == '<no value>' || "$(docker inspect --format '{{.HostConfig.Binds}}' "$container_id")" == '[]' ]] || fail 'host bind mount requested'
-            [[ "$(docker inspect --format '{{.HostConfig.VolumesFrom}}' "$container_id")" == '<no value>' || "$(docker inspect --format '{{.HostConfig.VolumesFrom}}' "$container_id")" == '[]' ]] || fail 'volumes-from requested'
-            [[ "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$container_id")" == *ALL* ]] || fail 'Docker did not retain cap-drop ALL'
-            [[ "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container_id")" == *no-new-privileges* ]] || fail 'Docker did not retain no-new-privileges'
+            inspect_exact network_mode none '{{.HostConfig.NetworkMode}}'
+            inspect_exact readonly_rootfs true '{{.HostConfig.ReadonlyRootfs}}'
+            inspect_exact container_user 10001:10001 '{{.Config.User}}'
+            inspect_exact open_stdin true '{{.Config.OpenStdin}}'
+            inspect_exact privileged false '{{.HostConfig.Privileged}}'
+            inspect_exact memory_bytes 536870912 '{{.HostConfig.Memory}}'
+            inspect_exact pids_limit 128 '{{.HostConfig.PidsLimit}}'
+            inspect_exact nano_cpus 1000000000 '{{.HostConfig.NanoCpus}}'
+            inspect_not_host pid_mode '{{.HostConfig.PidMode}}'
+            inspect_not_host ipc_mode '{{.HostConfig.IpcMode}}'
+            inspect_not_host uts_mode '{{.HostConfig.UTSMode}}'
+            inspect_empty_collection host_binds '{{json .HostConfig.Binds}}'
+            inspect_empty_collection volumes_from '{{json .HostConfig.VolumesFrom}}'
+            inspect_empty_collection host_mounts '{{json .HostConfig.Mounts}}'
+            inspect_empty_collection image_declared_volumes '{{json .Config.Volumes}}'
+            inspect_contains cap_drop ALL '{{json .HostConfig.CapDrop}}'
+            inspect_contains security_opt no-new-privileges '{{json .HostConfig.SecurityOpt}}'
+
+            if ! tmpfs_actual="$(inspect_value '{{range $k,$v := .HostConfig.Tmpfs}}{{printf "%s|%s\n" $k $v}}{{end}}' | LC_ALL=C sort)"; then
+              fail 'docker inspect failed for tmpfs configuration'
+            elif [[ "$tmpfs_actual" != $'/run|rw,noexec,nosuid,size=8m\n/tmp|rw,noexec,nosuid,size=64m' ]]; then
+              fail 'tmpfs configuration differs from the closed allowlist'
+            fi
+
+            if ! docker_root="$(docker info --format '{{.DockerRootDir}}')"; then
+              fail 'cannot determine Docker root directory for mount validation'
+            elif ! effective_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Type .Destination .RW .Source}}{{end}}')"; then
+              fail 'docker inspect failed for effective mounts'
+            else
+              mount_count=0
+              while IFS='|' read -r mount_type mount_destination mount_rw mount_source; do
+                [[ -z "$mount_type" ]] && continue
+                mount_count=$((mount_count + 1))
+                case "$mount_type|$mount_destination|$mount_rw|$mount_source" in
+                  'tmpfs|/tmp|true|'|'tmpfs|/run|true|') ;;
+                  "bind|/etc/hosts|true|$docker_root/containers/$container_id/hosts"|\
+                  "bind|/etc/hostname|true|$docker_root/containers/$container_id/hostname"|\
+                  "bind|/etc/resolv.conf|true|$docker_root/containers/$container_id/resolv.conf") ;;
+                  *) fail "effective mount outside allowlist: $mount_type $mount_destination" ;;
+                esac
+              done <<< "$effective_mounts"
+              (( mount_count == 5 )) || fail 'effective mount count differs from allowlist'
+            fi
           fi
 
           diagnostic_rc=99
           if (( ${#failures[@]} == 0 )); then
+            if ! diagnostic_log="$(mktemp)"; then
+              fail 'cannot create trusted host diagnostic log'
+            fi
+          fi
+          if (( ${#failures[@]} == 0 )); then
             # The heredoc is trusted workflow text.  It is the only payload
             # executed inside the isolated container.
             set +e
-            docker start --attach --interactive "$container_id" <<'DIAGNOSTIC'
+            docker start --attach --interactive "$container_id" >"$diagnostic_log" 2>&1 <<'DIAGNOSTIC'
           set -Eeuo pipefail
           bad=0
           probe_pass() { printf 'PASS %s\n' "$1"; }
@@ -151,9 +227,9 @@ jobs:
             END { exit !ok }
           ' /proc/self/mountinfo
           verify tmpfs_tmp_is_writable bash -c 'touch /tmp/preflight-write-test && rm /tmp/preflight-write-test'
-          verify cgroup_memory_lte_512MiB bash -c 'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 536870912 ]]'
-          verify cgroup_pids_lte_128 bash -c 'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 128 ]]'
-          verify cgroup_cpu_lte_one_core bash -c 'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
+          verify cgroup_memory_lte_512MiB bash -c 'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -le 536870912 ]]'
+          verify cgroup_pids_lte_128 bash -c 'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -le 128 ]]'
+          verify cgroup_cpu_lte_one_core bash -c 'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$quota" -gt 0 && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
 
           for ns in mnt pid net ipc uts cgroup user; do
             [[ -e "/proc/self/ns/$ns" ]] && printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")" || probe_fail "namespace_missing_${ns}"
@@ -165,8 +241,19 @@ jobs:
           for socket in /var/run/docker.sock /run/docker.sock /var/run/containerd/containerd.sock /run/containerd/containerd.sock /var/run/podman/podman.sock /run/podman/podman.sock; do
             [[ ! -e "$socket" && ! -S "$socket" ]] || socket_bad=1
           done
-          find / -xdev -type s \( -name '*docker*.sock' -o -name '*containerd*.sock' -o -name '*podman*.sock' \) -print -quit 2>/dev/null | grep -q . && socket_bad=1 || true
-          (( socket_bad == 0 )) && probe_pass no_host_control_socket || probe_fail host_control_socket_present
+          socket_scan=$(mktemp) || { probe_fail socket_scan_setup_failed; socket_bad=1; }
+          socket_scan_err=$(mktemp) || { probe_fail socket_scan_errorlog_setup_failed; socket_bad=1; }
+          if (( socket_bad == 0 )); then
+            if ! find / -xdev -type s \( -name '*docker*.sock' -o -name '*containerd*.sock' -o -name '*podman*.sock' \) -print >"$socket_scan" 2>"$socket_scan_err"; then
+              probe_fail socket_scan_failed
+              socket_bad=1
+            elif [[ -s "$socket_scan" || -s "$socket_scan_err" ]]; then
+              probe_fail host_control_socket_present_or_scan_warning
+              socket_bad=1
+            fi
+          fi
+          rm -f "${socket_scan:-}" "${socket_scan_err:-}"
+          (( socket_bad == 0 )) && probe_pass no_host_control_socket || probe_fail host_control_socket_or_scan_failure
           if grep -Eq '(docker\.sock|containerd\.sock|podman\.sock|/home/runner|/__w|/github)' /proc/self/mountinfo; then
             probe_fail prohibited_mount_visible
           else
@@ -181,13 +268,25 @@ jobs:
           HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY= timeout 5 curl --noproxy '*' --insecure --silent --show-error --output /dev/null https://1.1.1.1/ >/dev/null 2>&1 && probe_fail https_egress_available || probe_pass https_negative
 
           (( bad == 0 )) || exit 86
+          printf '%s\n' 'PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE'
           DIAGNOSTIC
-            diagnostic_rc=$?
+            start_rc=$?
             set -e
-            (( diagnostic_rc == 0 )) || fail "isolated diagnostic rejected (exit $diagnostic_rc)"
+            cat "$diagnostic_log"
+            if ! diagnostic_rc="$(inspect_value '{{.State.ExitCode}}')"; then
+              fail 'docker inspect failed for diagnostic exit code'
+            fi
+            if ! diagnostic_state="$(inspect_value '{{.State.Status}}')"; then
+              fail 'docker inspect failed for diagnostic state'
+            fi
+            [[ "$start_rc" == 0 ]] || fail "docker start returned non-zero: $start_rc"
+            [[ "$diagnostic_state" == exited ]] || fail "diagnostic container state is not exited: $diagnostic_state"
+            [[ "$diagnostic_rc" == 0 ]] || fail "diagnostic container exit code is not zero: $diagnostic_rc"
+            [[ "$(grep -Fxc 'PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE' "$diagnostic_log")" == 1 ]] || fail 'diagnostic completion marker missing or duplicated'
+            [[ "$(tail -n 1 "$diagnostic_log")" == PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE ]] || fail 'diagnostic completion marker is not final output'
           fi
 
-          {
+          summary_payload="$({
             echo '## Paperclip TI-0093 isolation preflight v2'
             echo
             echo '- No Paperclip source, packages, models, third-party repository scripts or private data were accessed.'
@@ -202,7 +301,10 @@ jobs:
               echo '### Verdict: NO-GO'
               printf -- '- %s\n' "${failures[@]}"
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          })"
+          if ! printf '%s\n' "$summary_payload" >> "$GITHUB_STEP_SUMMARY"; then
+            fail 'cannot write GITHUB_STEP_SUMMARY from trusted runner process'
+          fi
 
           # Fail the GitHub Actions job when any mandatory requirement failed.
           (( ${#failures[@]} == 0 ))
