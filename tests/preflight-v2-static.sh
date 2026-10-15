@@ -4,7 +4,8 @@
 set -Eeuo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workflow="$root_dir/.github/workflows/preflight.yml"
+workflow="${PREFLIGHT_WORKFLOW:-$root_dir/.github/workflows/preflight.yml}"
+[[ -f "$workflow" ]] || { printf 'FAIL workflow not found: %s\n' "$workflow" >&2; exit 1; }
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -15,37 +16,6 @@ assert_rc() {
     exit 1
   }
   printf 'PASS %s\n' "$label"
-}
-
-mountinfo_verdict() {
-  awk '
-    function allowed_target(path) {
-      return path == "/" || path == "/proc" || path ~ /^\/proc\// ||
-             path == "/sys" || path ~ /^\/sys\// ||
-             path == "/dev" || path ~ /^\/dev\// ||
-             path == "/tmp" || path == "/run" ||
-             path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf"
-    }
-    function has_option(options, wanted, n, values, i) {
-      n = split(options, values, ",")
-      for (i = 1; i <= n; i++) if (values[i] == wanted) return 1
-      return 0
-    }
-    {
-      if (NF < 7) { malformed = 1; next }
-      separator = 0
-      for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
-      if (!separator || separator + 2 > NF) { malformed = 1; next }
-      target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2)
-      if (!allowed_target(target)) forbidden = 1
-      if ((target == "/tmp" || target == "/run") && (filesystem != "tmpfs" || !has_option(options, "rw"))) forbidden = 1
-      if (target == "/" && !has_option(options, "ro")) forbidden = 1
-      if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ ||
-          target ~ /^\/(home\/runner|__w|github)(\/|$)/ ||
-          source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) forbidden = 1
-    }
-    END { if (malformed) exit 2; if (forbidden) exit 1; exit 0 }
-  ' "$1"
 }
 
 route_verdict() {
@@ -66,6 +36,22 @@ awk '
   in_run { sub(/^          /, ""); print }
 ' "$workflow" >"$embedded_bash"
 bash -n "$embedded_bash"
+mountinfo_program="$tmpdir/mountinfo-verifier.awk"
+awk '
+  /MOUNTINFO_AWK_BEGIN/ { in_program = 1; next }
+  /MOUNTINFO_AWK_END/ { exit }
+  in_program { sub(/^            /, ""); print }
+' "$workflow" >"$mountinfo_program"
+[[ -s "$mountinfo_program" ]] || { printf 'FAIL mountinfo verifier was not extracted from workflow\n' >&2; exit 1; }
+set +e
+awk -f "$mountinfo_program" /dev/null >/dev/null 2>"$tmpdir/mountinfo-awkeval.err"
+awk_rc=$?
+set -e
+[[ "$awk_rc" == 2 && ! -s "$tmpdir/mountinfo-awkeval.err" ]] || {
+  printf 'FAIL extracted mountinfo verifier is not valid AWK\n' >&2
+  exit 1
+}
+mountinfo_verdict() { awk -f "$mountinfo_program" "$1"; }
 rg -Fq 'mountinfo_inspection_error_rc_' "$workflow"
 rg -Fq 'verify_no_default_route 4' "$workflow"
 rg -Fq 'verify_no_default_route 6' "$workflow"
@@ -77,9 +63,19 @@ fi
 printf 'PASS workflow_static_contract\n'
 
 printf '%s\n' \
-  '36 25 0:32 / / ro - overlay overlay ro' \
-  '37 36 0:33 / /tmp rw,nosuid - tmpfs tmpfs rw' \
-  '38 36 0:34 / /run rw,nosuid - tmpfs tmpfs rw' >"$tmpdir/mounts-allowed"
+  '36 25 0:32 / / ro,relatime - overlay overlay ro' \
+  '37 36 0:33 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw' \
+  '38 36 0:34 / /dev rw,nosuid - tmpfs tmpfs rw' \
+  '39 38 0:35 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw' \
+  '40 38 0:36 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw' \
+  '41 38 0:37 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw' \
+  '42 36 0:38 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro' \
+  '43 42 0:39 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup ro' \
+  '44 36 0:40 / /tmp rw,nosuid,noexec - tmpfs tmpfs rw' \
+  '45 36 0:41 / /run rw,nosuid,noexec - tmpfs tmpfs rw' \
+  '46 36 0:42 / /etc/hosts rw,relatime - tmpfs tmpfs rw' \
+  '47 36 0:42 / /etc/hostname rw,relatime - tmpfs tmpfs rw' \
+  '48 36 0:42 / /etc/resolv.conf rw,relatime - tmpfs tmpfs rw' >"$tmpdir/mounts-allowed"
 set +e; mountinfo_verdict "$tmpdir/mounts-allowed"; rc=$?; set -e
 assert_rc 0 "$rc" mountinfo_allowed
 
@@ -87,7 +83,34 @@ printf '%s\n' '36 25 0:32 / /__w rw - ext4 /dev/sda1 rw' >"$tmpdir/mounts-forbid
 set +e; mountinfo_verdict "$tmpdir/mounts-forbidden"; rc=$?; set -e
 assert_rc 1 "$rc" mountinfo_forbidden_is_no_go
 
-set +e; mountinfo_verdict "$tmpdir/does-not-exist"; rc=$?; set -e
+printf '%s\n' \
+  '36 25 0:32 / / ro,relatime - overlay overlay ro' \
+  '37 36 0:33 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw' \
+  '38 37 8:1 / /proc/unexpected-host-mount rw,relatime - ext4 /dev/sda1 rw' >"$tmpdir/mounts-unexpected-proc"
+set +e; mountinfo_verdict "$tmpdir/mounts-unexpected-proc"; rc=$?; set -e
+assert_rc 1 "$rc" unexpected_proc_descendant_is_no_go
+
+printf '%s\n' \
+  '36 25 0:32 / / ro,relatime - overlay overlay ro' \
+  '37 36 8:1 / /sys/unexpected-host-mount rw,relatime - ext4 /dev/sda1 rw' >"$tmpdir/mounts-unexpected-sys"
+set +e; mountinfo_verdict "$tmpdir/mounts-unexpected-sys"; rc=$?; set -e
+assert_rc 1 "$rc" unexpected_sys_descendant_is_no_go
+
+printf '%s\n' \
+  '36 25 0:32 / / ro,relatime - overlay overlay ro' \
+  '37 36 8:1 / /dev/unexpected-host-mount rw,relatime - ext4 /dev/sda1 rw' >"$tmpdir/mounts-unexpected-dev"
+set +e; mountinfo_verdict "$tmpdir/mounts-unexpected-dev"; rc=$?; set -e
+assert_rc 1 "$rc" unexpected_dev_descendant_is_no_go
+
+: >"$tmpdir/mounts-empty"
+set +e; mountinfo_verdict "$tmpdir/mounts-empty"; rc=$?; set -e
+assert_rc 2 "$rc" empty_mountinfo_is_no_go
+
+printf '%s\n' 'malformed mountinfo record' >"$tmpdir/mounts-malformed"
+set +e; mountinfo_verdict "$tmpdir/mounts-malformed"; rc=$?; set -e
+assert_rc 2 "$rc" malformed_mountinfo_is_no_go
+
+set +e; mountinfo_verdict "$tmpdir/does-not-exist" 2>/dev/null; rc=$?; set -e
 (( rc >= 2 )) || { printf 'FAIL unreadable mountinfo did not return an error\n' >&2; exit 1; }
 printf 'PASS mountinfo_error_is_no_go\n'
 
