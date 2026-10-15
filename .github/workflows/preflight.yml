@@ -175,6 +175,11 @@ jobs:
                   parse_error=1
                   continue
                 fi
+                if [[ "$options" == *, || "$options" == *',,'* ]]; then
+                  parse_error=1
+                  printf 'tmpfs_key=%s state=invalid\n' "$path"
+                  continue
+                fi
                 case "$path" in
                   /tmp) expected_bytes=67108864; (( ++tmp_seen )) ;;
                   /run) expected_bytes=8388608; (( ++run_seen )) ;;
@@ -346,6 +351,36 @@ jobs:
           verify_no_default_route 4
           verify_no_default_route 6
 
+          # SOCKET_SCAN_CLASSIFIER_BEGIN
+          classify_socket_scan() {
+            local scan_rc="$1" stderr_file="$2" result_file="$3"
+            if (( scan_rc != 0 )); then
+              if grep -Eq 'Permission denied|Operation not permitted' "$stderr_file"; then
+                printf 'socket_scan_incomplete_permission_rc_%s\n' "$scan_rc"
+              elif (( scan_rc == 127 )); then
+                printf '%s\n' socket_scan_tool_unavailable
+              else
+                printf 'socket_scan_incomplete_tool_or_io_rc_%s\n' "$scan_rc"
+              fi
+              return 1
+            fi
+            if [[ -s "$stderr_file" ]]; then
+              printf '%s\n' socket_scan_stderr_without_failure
+              return 1
+            fi
+            if [[ -s "$result_file" ]]; then
+              printf '%s\n' host_control_socket_candidate_found
+              return 1
+            fi
+            printf '%s\n' socket_scan_complete_no_candidates
+            return 0
+          }
+          # SOCKET_SCAN_CLASSIFIER_END
+
+          # The socket scan is deliberately restricted to traversable container
+          # locations. An all-filesystem scan as UID 10001 is incomplete on
+          # pseudo-filesystems and therefore cannot prove absence. This scope is
+          # paired with the closed mount allowlist and direct path checks below.
           socket_bad=0
           for socket in /var/run/docker.sock /run/docker.sock /var/run/containerd/containerd.sock /run/containerd/containerd.sock /var/run/podman/podman.sock /run/podman/podman.sock; do
             [[ ! -e "$socket" && ! -S "$socket" ]] || socket_bad=1
@@ -353,12 +388,28 @@ jobs:
           socket_scan=$(mktemp) || { probe_fail socket_scan_setup_failed; socket_bad=1; }
           socket_scan_err=$(mktemp) || { probe_fail socket_scan_errorlog_setup_failed; socket_bad=1; }
           if (( socket_bad == 0 )); then
-            if ! find / -xdev -type s \( -name '*docker*.sock' -o -name '*containerd*.sock' -o -name '*podman*.sock' \) -print >"$socket_scan" 2>"$socket_scan_err"; then
-              probe_fail socket_scan_failed
+            socket_scan_scope_inaccessible=0
+            for socket_root in /tmp /run /var/run /dev /etc; do
+              [[ -d "$socket_root" && -r "$socket_root" && -x "$socket_root" ]] || socket_scan_scope_inaccessible=1
+            done
+            if (( socket_scan_scope_inaccessible != 0 )); then
+              probe_fail socket_scan_scope_inaccessible
               socket_bad=1
-            elif [[ -s "$socket_scan" || -s "$socket_scan_err" ]]; then
-              probe_fail host_control_socket_present_or_scan_warning
-              socket_bad=1
+            else
+              set +e
+              find /tmp /run /var/run /dev /etc -xdev -type s \( -name '*docker*.sock' -o -name '*containerd*.sock' -o -name '*podman*.sock' \) -print >"$socket_scan" 2>"$socket_scan_err"
+              socket_scan_rc=$?
+              set -e
+              set +e
+              socket_scan_diagnostic="$(classify_socket_scan "$socket_scan_rc" "$socket_scan_err" "$socket_scan")"
+              socket_scan_status=$?
+              set -e
+              if (( socket_scan_status == 0 )); then
+                probe_pass "$socket_scan_diagnostic"
+              else
+                probe_fail "$socket_scan_diagnostic"
+                socket_bad=1
+              fi
             fi
           fi
           rm -f "${socket_scan:-}" "${socket_scan_err:-}"
@@ -384,39 +435,74 @@ jobs:
                      path == "/proc/interrupts" || path == "/proc/kcore" || path == "/proc/keys" || \
                      path == "/proc/latency_stats" || path == "/proc/timer_list" || path == "/proc/timer_stats"
             }
-            function allowed_mount(path, filesystem, source, options) {
-              # This is intentionally an exact destination allowlist.  Docker/runc
-              # can add known pseudo-filesystems, but never an arbitrary descendant.
-              if (path == "/") return filesystem == "overlay" && source == "overlay" && is_ro(options)
-              if (path == "/proc") return filesystem == "proc" && source == "proc" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (is_proc_readonly_path(path)) return filesystem == "proc" && source == "proc" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (is_masked_proc_path(path)) return filesystem == "tmpfs" && source == "tmpfs" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/dev") return filesystem == "tmpfs" && source == "tmpfs" && is_rw(options) && has_option(options, "nosuid")
-              if (path == "/dev/pts") return filesystem == "devpts" && source == "devpts" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
-              if (path == "/dev/mqueue") return filesystem == "mqueue" && source == "mqueue" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/dev/shm") return filesystem == "tmpfs" && source == "shm" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/sys") return filesystem == "sysfs" && source == "sysfs" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/sys/fs/cgroup") return filesystem == "cgroup2" && source == "cgroup" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return filesystem == "tmpfs" && source == "tmpfs" && is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/tmp" || path == "/run") return filesystem == "tmpfs" && source == "tmpfs" && is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
-              if (path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf") return filesystem == "tmpfs" && source == "tmpfs" && is_rw(options)
+            function expected_path(path) {
+              return path == "/" || path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || \
+                     path == "/dev" || path == "/dev/pts" || path == "/dev/mqueue" || path == "/dev/shm" || \
+                     path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || \
+                     path == "/tmp" || path == "/run" || path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf"
+            }
+            function destination_class(path) {
+              if (expected_path(path)) return "expected"
+              if (path ~ /^\/proc(\/|$)/) return "proc_descendant"
+              if (path ~ /^\/sys(\/|$)/) return "sys_descendant"
+              if (path ~ /^\/dev(\/|$)/) return "dev_descendant"
+              if (path ~ /^\/etc(\/|$)/) return "etc_other"
+              return "other"
+            }
+            function identity_matches(path, filesystem, source) {
+              if (path == "/") return filesystem == "overlay" && source == "overlay"
+              if (path == "/proc" || is_proc_readonly_path(path)) return filesystem == "proc" && source == "proc"
+              if (is_masked_proc_path(path) || path == "/dev" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || path == "/tmp" || path == "/run" || path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf") return filesystem == "tmpfs" && source == "tmpfs"
+              if (path == "/dev/pts") return filesystem == "devpts" && source == "devpts"
+              if (path == "/dev/mqueue") return filesystem == "mqueue" && source == "mqueue"
+              if (path == "/dev/shm") return filesystem == "tmpfs" && source == "shm"
+              if (path == "/sys") return filesystem == "sysfs" && source == "sysfs"
+              if (path == "/sys/fs/cgroup") return filesystem == "cgroup2" && source == "cgroup"
               return 0
+            }
+            function options_match(path, options) {
+              if (path == "/") return is_ro(options)
+              if (path == "/proc") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/dev") return is_rw(options) && has_option(options, "nosuid")
+              if (path == "/dev/pts") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
+              if (path == "/dev/mqueue" || path == "/dev/shm") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
+              if (path == "/tmp" || path == "/run") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
+              if (path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf") return is_rw(options)
+              return 0
+            }
+            function report_rejection(reason, path) {
+              printf "INFO mountinfo_reject reason=%s destination_class=%s\n", reason, destination_class(path)
+              rejected++
             }
             {
               records++
-              if (NF < 7) { malformed = 1; next }
+              if (NF < 7) { malformed = 1; report_rejection("format_invalid", ""); next }
               separator = 0
               for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
-              if (!separator || separator + 2 > NF) { malformed = 1; next }
+              if (!separator || separator + 2 > NF) { malformed = 1; report_rejection("format_invalid", ""); next }
               target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2)
-              if (seen[target]++) forbidden = 1
-              if (!allowed_mount(target, filesystem, source, options)) forbidden = 1
+              if (seen[target]++) { forbidden = 1; report_rejection("duplicate_destination", target) }
+              if (!expected_path(target)) {
+                forbidden = 1
+                report_rejection("destination_not_allowlisted", target)
+              } else if (!identity_matches(target, filesystem, source)) {
+                forbidden = 1
+                report_rejection("filesystem_or_source_incompatible", target)
+              } else if (!options_match(target, options)) {
+                forbidden = 1
+                report_rejection("mount_options_incompatible", target)
+              }
               if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ || \
                   target ~ /^\/(home\/runner|__w|github)(\/|$)/ || \
-                  source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) forbidden = 1
+                  source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) {
+                forbidden = 1
+                report_rejection("forbidden_host_reference", target)
+              }
             }
             END {
-              if (records == 0 || malformed) exit 2
+              if (records == 0) { printf "%s\n", "INFO mountinfo_reject reason=empty destination_class=none"; exit 2 }
+              if (malformed) exit 2
               if (forbidden) exit 1
               exit 0
             }
