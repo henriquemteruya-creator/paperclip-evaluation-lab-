@@ -449,6 +449,44 @@ jobs:
               if (path ~ /^\/etc(\/|$)/) return "etc_other"
               return "other"
             }
+            function destination_id(path) {
+              if (path == "/") return "root_overlay"
+              if (path == "/proc") return "proc_root"
+              if (path == "/proc/bus") return "proc_bus"
+              if (path == "/proc/fs") return "proc_fs"
+              if (path == "/proc/irq") return "proc_irq"
+              if (path == "/proc/sys") return "proc_sys"
+              if (path == "/proc/sysrq-trigger") return "proc_sysrq"
+              if (path == "/proc/acpi") return "proc_acpi"
+              if (path == "/proc/asound") return "proc_asound"
+              if (path == "/proc/scsi") return "proc_scsi"
+              if (path == "/proc/interrupts") return "proc_interrupts"
+              if (path == "/proc/kcore") return "proc_kcore"
+              if (path == "/proc/keys") return "proc_keys"
+              if (path == "/proc/latency_stats") return "proc_latency_stats"
+              if (path == "/proc/timer_list") return "proc_timer_list"
+              if (path == "/proc/timer_stats") return "proc_timer_stats"
+              if (path == "/dev") return "dev_root"
+              if (path == "/dev/pts") return "dev_pts"
+              if (path == "/dev/mqueue") return "dev_mqueue"
+              if (path == "/dev/shm") return "dev_shm"
+              if (path == "/sys") return "sys_root"
+              if (path == "/sys/fs/cgroup") return "sys_cgroup"
+              if (path == "/sys/firmware") return "sys_firmware"
+              if (path == "/sys/devices/virtual/powercap") return "sys_powercap"
+              if (path == "/tmp") return "tmp"
+              if (path == "/run") return "run"
+              if (path == "/etc/hosts") return "etc_hosts"
+              if (path == "/etc/hostname") return "etc_hostname"
+              if (path == "/etc/resolv.conf") return "etc_resolv_conf"
+              return "none"
+            }
+            function known_fstype_category(value) {
+              return value == "overlay" || value == "proc" || value == "tmpfs" || value == "devpts" || value == "mqueue" || value == "sysfs" || value == "cgroup2" ? value : "other"
+            }
+            function known_source_category(value) {
+              return value == "overlay" || value == "proc" || value == "tmpfs" || value == "devpts" || value == "mqueue" || value == "shm" || value == "sysfs" || value == "cgroup" ? value : "other"
+            }
             function identity_matches(path, filesystem, source) {
               if (path == "/") return filesystem == "overlay" && source == "overlay"
               if (path == "/proc" || is_proc_readonly_path(path)) return filesystem == "proc" && source == "proc"
@@ -460,44 +498,64 @@ jobs:
               if (path == "/sys/fs/cgroup") return filesystem == "cgroup2" && source == "cgroup"
               return 0
             }
-            function options_match(path, options) {
-              if (path == "/") return is_ro(options)
-              if (path == "/proc") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return is_ro(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/dev") return is_rw(options) && has_option(options, "nosuid")
-              if (path == "/dev/pts") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
-              if (path == "/dev/mqueue" || path == "/dev/shm") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "nodev") && has_option(options, "noexec")
-              if (path == "/tmp" || path == "/run") return is_rw(options) && has_option(options, "nosuid") && has_option(options, "noexec")
-              if (path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf") return is_rw(options)
+            function expected_access(path) {
+              if (path == "/" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return "ro"
+              return "rw"
+            }
+            function requires_option(path, option) {
+              if (option == "nosuid") return path != "/" && !(path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf")
+              if (option == "nodev") return path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/dev/mqueue" || path == "/dev/shm" || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap"
+              if (option == "noexec") return path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/dev/pts" || path == "/dev/mqueue" || path == "/dev/shm" || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || path == "/tmp" || path == "/run"
               return 0
             }
-            function report_rejection(reason, path) {
-              printf "INFO mountinfo_reject reason=%s destination_class=%s\n", reason, destination_class(path)
+            function per_mount_option_code(path, options, code, access) {
+              code = ""
+              access = expected_access(path)
+              if ((access == "ro" && !is_ro(options)) || (access == "rw" && !is_rw(options))) code = "access_" access "_required"
+              if (requires_option(path, "nosuid") && !has_option(options, "nosuid")) code = code (code ? "+" : "") "missing_nosuid"
+              if (requires_option(path, "nodev") && !has_option(options, "nodev")) code = code (code ? "+" : "") "missing_nodev"
+              if (requires_option(path, "noexec") && !has_option(options, "noexec")) code = code (code ? "+" : "") "missing_noexec"
+              return code == "" ? "none" : code
+            }
+            function superblock_access_category(options) {
+              if (has_option(options, "ro") && has_option(options, "rw")) return "conflict"
+              if (has_option(options, "ro")) return "ro"
+              if (has_option(options, "rw")) return "rw"
+              return "other"
+            }
+            function options_match(path, options) { return per_mount_option_code(path, options) == "none" }
+            function report_rejection(reason, path, filesystem, source, options, super_options, id) {
+              id = expected_path(path) ? destination_id(path) : "none"
+              printf "INFO mountinfo_reject reason=%s destination_class=%s", reason, destination_class(path)
+              if (id != "none") printf " destination_id=%s", id
+              if (reason == "filesystem_or_source_incompatible") printf " fstype_category=%s source_category=%s", known_fstype_category(filesystem), known_source_category(source)
+              if (reason == "mount_options_incompatible") printf " per_mount=%s superblock_access=%s", per_mount_option_code(path, options), superblock_access_category(super_options)
+              printf "\n"
               rejected++
             }
             {
               records++
-              if (NF < 7) { malformed = 1; report_rejection("format_invalid", ""); next }
+              if (NF < 7) { malformed = 1; report_rejection("format_invalid", "", "", "", "", ""); next }
               separator = 0
               for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
-              if (!separator || separator + 2 > NF) { malformed = 1; report_rejection("format_invalid", ""); next }
-              target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2)
-              if (seen[target]++) { forbidden = 1; report_rejection("duplicate_destination", target) }
+              if (!separator || separator + 3 > NF) { malformed = 1; report_rejection("format_invalid", "", "", "", "", ""); next }
+              target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2); super_options = $(separator + 3)
+              if (seen[target]++) { forbidden = 1; report_rejection("duplicate_destination", target, filesystem, source, options, super_options) }
               if (!expected_path(target)) {
                 forbidden = 1
-                report_rejection("destination_not_allowlisted", target)
+                report_rejection("destination_not_allowlisted", target, filesystem, source, options, super_options)
               } else if (!identity_matches(target, filesystem, source)) {
                 forbidden = 1
-                report_rejection("filesystem_or_source_incompatible", target)
+                report_rejection("filesystem_or_source_incompatible", target, filesystem, source, options, super_options)
               } else if (!options_match(target, options)) {
                 forbidden = 1
-                report_rejection("mount_options_incompatible", target)
+                report_rejection("mount_options_incompatible", target, filesystem, source, options, super_options)
               }
               if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ || \
                   target ~ /^\/(home\/runner|__w|github)(\/|$)/ || \
                   source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) {
                 forbidden = 1
-                report_rejection("forbidden_host_reference", target)
+                report_rejection("forbidden_host_reference", target, filesystem, source, options, super_options)
               }
             }
             END {
