@@ -57,6 +57,34 @@ awk '
 # shellcheck source=/dev/null
 source "$docker_reported_mounts_validator"
 docker_reported_mounts_verdict() { validate_docker_reported_mounts "$1"; }
+docker_special_files_diagnostic="$tmpdir/docker-special-files-diagnostic.sh"
+awk '
+  /DOCKER_SPECIAL_FILES_DIAGNOSTIC_BEGIN/ { in_program = 1; next }
+  /DOCKER_SPECIAL_FILES_DIAGNOSTIC_END/ { exit }
+  in_program { sub(/^            /, ""); print }
+' "$workflow" >"$docker_special_files_diagnostic"
+[[ -s "$docker_special_files_diagnostic" ]] || { printf 'FAIL Docker special-file diagnostic was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$docker_special_files_diagnostic"
+runtime_mask_shell="$tmpdir/runtime-mask-diagnostic.sh"
+awk '
+  /RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN/ { in_program = 1; next }
+  /RUNTIME_MASK_DIAGNOSTIC_AWK_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$runtime_mask_shell"
+[[ -s "$runtime_mask_shell" ]] || { printf 'FAIL runtime mask mount diagnostic was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$runtime_mask_shell"
+runtime_mask_verdict() { awk "$runtime_mask_diagnostic_awk" "$1"; }
+runtime_object_diagnostic="$tmpdir/runtime-object-diagnostic.sh"
+awk '
+  /RUNTIME_OBJECT_DIAGNOSTIC_BEGIN/ { in_program = 1; next }
+  /RUNTIME_OBJECT_DIAGNOSTIC_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$runtime_object_diagnostic"
+[[ -s "$runtime_object_diagnostic" ]] || { printf 'FAIL runtime mask object diagnostic was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$runtime_object_diagnostic"
 socket_classifier="$tmpdir/socket-scan-classifier.sh"
 awk '
   /SOCKET_SCAN_CLASSIFIER_BEGIN/ { in_program = 1; next }
@@ -282,6 +310,85 @@ assert_rc 2 "$rc" malformed_mountinfo_is_no_go
 set +e; mountinfo_verdict "$tmpdir/does-not-exist" 2>/dev/null; rc=$?; set -e
 (( rc >= 2 )) || { printf 'FAIL unreadable mountinfo did not return an error\n' >&2; exit 1; }
 printf 'PASS mountinfo_error_is_no_go\n'
+
+docker_special_sentinel="$tmpdir/private-special-source"
+printf -v docker_special_entries '%s\n%s\n%s\n%s\n%s' "/etc/hosts|bind|false|$docker_special_sentinel/hosts" "/etc/hostname|bind|true|$docker_special_sentinel/hostname" "/etc/resolv.conf|bind|false|$docker_special_sentinel/resolv" '/tmp|tmpfs|true|tmpfs' '/run|tmpfs|true|tmpfs'
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_entries" "$docker_special_sentinel/hosts" "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" true)"; rc=$?; set -e
+assert_rc 0 "$rc" docker_special_file_correlation_passes
+[[ "$docker_special_diagnostic" == *'id=etc_hosts cardinality_one=true type_bind=true metadata_present=true metadata_source_match=true mount_rw=false readonly_rootfs=true'* && "$docker_special_diagnostic" == *'id=etc_hostname cardinality_one=true type_bind=true metadata_present=true metadata_source_match=true mount_rw=true readonly_rootfs=true'* && "$docker_special_diagnostic" != *"$docker_special_sentinel"* ]] || {
+  printf 'FAIL Docker special-file diagnostic is incomplete or exposed a source\n' >&2
+  exit 1
+}
+printf 'PASS docker_special_file_diagnostic_is_sanitized\n'
+
+printf -v docker_special_missing_metadata '%s\n%s\n%s' "/etc/hosts|bind|false|$docker_special_sentinel/hosts" "/etc/hostname|bind|false|$docker_special_sentinel/hostname" "/etc/resolv.conf|bind|false|$docker_special_sentinel/resolv"
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_missing_metadata" '' "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" true)"; rc=$?; set -e
+assert_rc 1 "$rc" docker_special_missing_metadata_is_no_go
+[[ "$docker_special_diagnostic" != *"$docker_special_sentinel"* ]] || { printf 'FAIL missing metadata diagnostic exposed a source\n' >&2; exit 1; }
+
+printf -v docker_special_wrong_type '%s\n%s\n%s' "/etc/hosts|volume|false|$docker_special_sentinel/hosts" "/etc/hostname|bind|false|$docker_special_sentinel/hostname" "/etc/resolv.conf|bind|false|$docker_special_sentinel/resolv"
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_wrong_type" "$docker_special_sentinel/hosts" "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" true)"; rc=$?; set -e
+assert_rc 1 "$rc" docker_special_wrong_type_is_no_go
+[[ "$docker_special_diagnostic" != *"$docker_special_sentinel"* ]] || { printf 'FAIL wrong-type diagnostic exposed a source\n' >&2; exit 1; }
+
+printf -v docker_special_unexpected '%s\n%s\n%s\n%s' "/etc/hosts|bind|false|$docker_special_sentinel/hosts" "/etc/hostname|bind|false|$docker_special_sentinel/hostname" "/etc/resolv.conf|bind|false|$docker_special_sentinel/resolv" "/private/unexpected|bind|false|$docker_special_sentinel/unexpected"
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_unexpected" "$docker_special_sentinel/hosts" "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" true)"; rc=$?; set -e
+assert_rc 1 "$rc" docker_special_unexpected_mount_is_no_go
+[[ "$docker_special_diagnostic" == *'docker_special_file_unexpected_count=1'* && "$docker_special_diagnostic" != *"$docker_special_sentinel"* && "$docker_special_diagnostic" != *'/private/unexpected'* ]] || { printf 'FAIL unexpected special-file mount was exposed\n' >&2; exit 1; }
+
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_entries" "$docker_special_sentinel/hosts" "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" maybe)"; rc=$?; set -e
+assert_rc 2 "$rc" docker_special_malformed_readonly_metadata_is_no_go
+[[ "$docker_special_diagnostic" == docker_special_file_parser_error && "$docker_special_diagnostic" != *"$docker_special_sentinel"* ]] || { printf 'FAIL malformed special metadata was exposed\n' >&2; exit 1; }
+
+runtime_mask_valid=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
+printf '%s\n' "$runtime_mask_valid" >"$tmpdir/runtime-mask-valid"
+set +e; runtime_mask_diagnostic="$(runtime_mask_verdict "$tmpdir/runtime-mask-valid")"; rc=$?; set -e
+assert_rc 0 "$rc" runtime_mask_metadata_complete
+[[ "$runtime_mask_diagnostic" == *'runtime_mask_directory id=proc_acpi cardinality_one=true type_source_tmpfs=true root_is_slash=true per_mount_ro=true propagation_markers_absent=true submounts_unexpected=false'* && "$runtime_mask_diagnostic" == *'runtime_mask_file id=proc_interrupts cardinality_one=true type_source_tmpfs=true root_is_null=true per_mount_rw=true propagation_markers_absent=true'* ]] || {
+  printf 'FAIL runtime mask diagnostic lacks expected sanitized evidence\n' >&2
+  exit 1
+}
+
+runtime_mask_sentinel='/proc/acpi/unexpected-host-mount'
+runtime_mask_submount=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 36 8:1 / /proc/acpi/unexpected-host-mount rw - ext4 /private/source rw\n38 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n40 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n44 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
+printf '%s\n' "$runtime_mask_submount" >"$tmpdir/runtime-mask-submount"
+set +e; runtime_mask_diagnostic="$(runtime_mask_verdict "$tmpdir/runtime-mask-submount")"; rc=$?; set -e
+assert_rc 1 "$rc" runtime_mask_submount_is_no_go
+[[ "$runtime_mask_diagnostic" == *'id=proc_acpi'*'submounts_unexpected=true'* && "$runtime_mask_diagnostic" != *"$runtime_mask_sentinel"* && "$runtime_mask_diagnostic" != *'/private/source'* ]] || {
+  printf 'FAIL runtime mask submount diagnostic exposed raw mount data\n' >&2
+  exit 1
+}
+
+printf '%s\n' 'malformed mountinfo record' >"$tmpdir/runtime-mask-malformed"
+set +e; runtime_mask_verdict "$tmpdir/runtime-mask-malformed" >/dev/null; rc=$?; set -e
+assert_rc 2 "$rc" runtime_mask_malformed_mountinfo_is_no_go
+
+mkdir "$tmpdir/empty-masked-directory"
+set +e; runtime_object_diagnostic="$(diagnose_masked_directory_objects "proc_acpi|$tmpdir/empty-masked-directory")"; rc=$?; set -e
+assert_rc 0 "$rc" runtime_mask_directory_empty_real_object_passes
+[[ "$runtime_object_diagnostic" == 'runtime_mask_directory_object id=proc_acpi object_dir=true object_symlink=false empty=true inspection_complete=true' && "$runtime_object_diagnostic" != *"$tmpdir"* ]] || { printf 'FAIL directory-object diagnostic exposed a path\n' >&2; exit 1; }
+printf 'x\n' >"$tmpdir/empty-masked-directory/unexpected"
+set +e; runtime_object_diagnostic="$(diagnose_masked_directory_objects "proc_acpi|$tmpdir/empty-masked-directory")"; rc=$?; set -e
+assert_rc 1 "$rc" runtime_mask_directory_nonempty_is_no_go
+rm "$tmpdir/empty-masked-directory/unexpected"
+ln -s "$tmpdir/empty-masked-directory" "$tmpdir/masked-directory-link"
+set +e; runtime_object_diagnostic="$(diagnose_masked_directory_objects "proc_scsi|$tmpdir/masked-directory-link")"; rc=$?; set -e
+assert_rc 1 "$rc" runtime_mask_directory_symlink_is_no_go
+[[ "$runtime_object_diagnostic" != *"$tmpdir"* ]] || { printf 'FAIL symlink diagnostic exposed a path\n' >&2; exit 1; }
+
+set +e; runtime_object_diagnostic="$(diagnose_masked_file_objects 'proc_interrupts|/dev/null')"; rc=$?; set -e
+assert_rc 0 "$rc" runtime_mask_file_dev_null_identity_passes
+[[ "$runtime_object_diagnostic" == 'runtime_mask_file_object id=proc_interrupts character_device=true object_symlink=false null_char_1_3=true null_identity_match=true inspection_complete=true' ]] || { printf 'FAIL file-object diagnostic lacks /dev/null identity result\n' >&2; exit 1; }
+printf 'not-a-device\n' >"$tmpdir/not-a-device"
+set +e; runtime_object_diagnostic="$(diagnose_masked_file_objects "proc_kcore|$tmpdir/not-a-device")"; rc=$?; set -e
+assert_rc 1 "$rc" runtime_mask_file_regular_file_is_no_go
+ln -s /dev/null "$tmpdir/masked-file-link"
+set +e; runtime_object_diagnostic="$(diagnose_masked_file_objects "proc_keys|$tmpdir/masked-file-link")"; rc=$?; set -e
+assert_rc 1 "$rc" runtime_mask_file_symlink_is_no_go
+[[ "$runtime_object_diagnostic" != *"$tmpdir"* ]] || { printf 'FAIL file-object diagnostic exposed a path\n' >&2; exit 1; }
+set +e; runtime_object_diagnostic="$(diagnose_masked_file_objects "unknown_id|$tmpdir/not-a-device")"; rc=$?; set -e
+assert_rc 2 "$rc" runtime_mask_file_unknown_id_is_no_go
+printf 'PASS runtime_mask_diagnostics_are_sanitized\n'
 
 fake_ip="$tmpdir/ip"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 7' >"$fake_ip"
