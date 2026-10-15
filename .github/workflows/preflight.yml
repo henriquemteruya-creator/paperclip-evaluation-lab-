@@ -1,0 +1,211 @@
+name: Paperclip TI-0093 - isolation diagnostic only
+
+# DIAGNOSTIC ONLY. Never downloads, installs or executes Paperclip.
+# PASS of this diagnostic is NOT permission to run Paperclip P01/P02/P04.
+# A later execution workflow requires a separate review, immutable image,
+# offline dependencies, isolated filesystem and explicit approval.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: paperclip-ti-0093-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  isolation-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      # Mutable tag intentionally acceptable ONLY for a diagnostic without
+      # executing third-party code. Never use this image reference for P01/2/4.
+      image: ubuntu:24.04
+      options: >-
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --pids-limit=256
+        --memory=2g
+        --cpus=1
+    steps:
+      - name: Fail-closed isolation diagnostic (no third-party code)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          failures=()
+          fail() { failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
+          pass() { printf 'PASS %s\n' "$1"; }
+          info() { printf 'INFO %s\n' "$1"; }
+
+          # Fail rather than printing credentials or full environment.
+          for name in GITHUB_TOKEN GH_TOKEN GH_PAT CI_TOKEN \
+                      ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+                      AWS_ACCESS_KEY_ID GOOGLE_APPLICATION_CREDENTIALS \
+                      AZURE_CLIENT_SECRET OPENAI_API_KEY ANTHROPIC_API_KEY; do
+            if [[ -n "${!name:-}" ]]; then fail "credential variable present: $name"; fi
+          done
+
+          ws="${GITHUB_WORKSPACE:-/github/workspace}"
+          if [[ -e "$ws/.git" || -e "$ws/package.json" || -e "$ws/pnpm-lock.yaml" ]]; then
+            fail 'workspace is not source-free'
+          else
+            pass 'no checked-out source detected at workspace root'
+          fi
+
+          for command in bash setpriv unshare getent openssl awk grep readlink \
+                         timeout id cat sort wc tee find; do
+            if ! command -v "$command" >/dev/null 2>&1; then
+              fail "required diagnostic program unavailable: $command"
+            fi
+          done
+
+          if (( ${#failures[@]} == 0 )); then
+            # The inherited container process may start privileged. No
+            # third-party code is ever invoked in that context.
+            set +e
+            setpriv \
+              --reuid=10001 --regid=10001 --clear-groups \
+              --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+              --no-new-privs bash -s <<'REDUCED'
+          set -Eeuo pipefail
+          bad=0
+          probe_pass() { printf 'PASS %s\n' "$1"; }
+          probe_fail() { printf 'FAIL %s\n' "$1"; bad=1; }
+          verify() {
+            local name="$1"
+            shift
+            if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi
+          }
+
+          verify 'uid_is_10001' test "$(id -u)" -eq 10001
+          verify 'gid_is_10001' test "$(id -g)" -eq 10001
+          verify 'no_extra_groups' bash -c 'test "$(id -G | wc -w)" -eq 1'
+          verify 'no_new_privileges' grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status
+          for cap in CapInh CapPrm CapEff CapBnd CapAmb; do
+            verify "${cap}_is_zero" grep -q "^${cap}:[[:space:]]*0000000000000000$" /proc/self/status
+          done
+
+          # cgroup-v2-only. Missing/unreadable files mean NO-GO, not zero use.
+          verify 'cgroup_v2_memory_lte_2GiB' bash -c \
+            'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 2147483648 ]]'
+          verify 'cgroup_v2_pids_lte_256' bash -c \
+            'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 256 ]]'
+          verify 'cgroup_v2_cpu_lte_1_core' bash -c \
+            'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
+
+          for ns in user mnt pid net ipc uts cgroup; do
+            if [[ -e "/proc/self/ns/$ns" ]]; then
+              printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")"
+            else
+              probe_fail "namespace_${ns}_missing"
+            fi
+          done
+
+          sockets=(/var/run/docker.sock /run/docker.sock
+                   /var/run/containerd/containerd.sock /run/containerd/containerd.sock
+                   /var/run/podman/podman.sock /run/podman/podman.sock)
+          sock_bad=0
+          for socket in "${sockets[@]}"; do
+            if [[ -e "$socket" || -S "$socket" ]]; then
+              probe_fail 'known_host_control_socket_present'
+              sock_bad=1
+            fi
+          done
+          if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
+            probe_fail 'container_runtime_client_present'
+            sock_bad=1
+          fi
+          if (( sock_bad == 0 )); then probe_pass 'no_known_host_control_socket'; fi
+
+          # Compare mount TARGET ($5), not substring-match all mountinfo fields:
+          # a normal read-only /proc/sys mount is not host-control access.
+          # Runner support bind mounts may still be visible; flag them as
+          # NO-GO until a later runtime can prevent exposing them to the app.
+          if awk '
+            $5 ~ /^\/(root|home\/runner)(\/|$)/ { bad=1 }
+            $5 ~ /^\/(var\/run\/docker\.sock|run\/docker\.sock|run\/containerd|run\/podman)(\/|$)/ { bad=1 }
+            $5 ~ /^\/dev\/(kvm|fuse)$/ { bad=1 }
+            $5 ~ /^\/(__w\/_temp|__w\/_actions|github\/workflow|github\/file_commands)(\/|$)/ { bad=1 }
+            END { exit !bad }
+          ' /proc/self/mountinfo; then
+            probe_fail 'sensitive_or_runner_control_mount_detected'
+          else
+            probe_pass 'no_listed_sensitive_mount_target'
+          fi
+          # Print only the mount COUNT: public Actions logs must not disclose paths.
+          awk 'END { printf "INFO mount_count=%d\n", NR }' /proc/self/mountinfo
+
+          outer_user="$(readlink /proc/self/ns/user)"
+          outer_net="$(readlink /proc/self/ns/net)"
+          outer_mnt="$(readlink /proc/self/ns/mnt)"
+          export outer_user outer_net outer_mnt
+
+          # User, network AND mount namespaces must be distinct. A GitHub job
+          # container may reject this call; that is a legitimate NO-GO.
+          if unshare -Urnm -- bash -s <<'NO_NETWORK'
+          set -Eeuo pipefail
+          [[ "$(readlink /proc/self/ns/user)" != "$outer_user" ]] || exit 40
+          [[ "$(readlink /proc/self/ns/net)" != "$outer_net" ]] || exit 41
+          [[ "$(readlink /proc/self/ns/mnt)" != "$outer_mnt" ]] || exit 42
+
+          # Fail if any interface except loopback or any default route exists.
+          for iface in /sys/class/net/*; do
+            [[ -e "$iface" ]] || continue
+            [[ "${iface##*/}" == lo ]] || exit 43
+          done
+          if awk 'NR>1 && $2=="00000000" { bad=1 } END { exit !bad }' /proc/net/route; then
+            exit 44
+          fi
+
+          # Negative probes are additional evidence, not a standalone proof.
+          # A failed TLS handshake alone is insufficient: test raw TCP too.
+          timeout 6 getent ahostsv4 example.com >/dev/null 2>&1 && exit 45
+          timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1 && exit 46
+          timeout 6 openssl s_client -connect 1.1.1.1:443 \
+            -servername one.one.one.one -brief </dev/null >/dev/null 2>&1 && exit 47
+          exit 0
+          NO_NETWORK
+          then
+            probe_pass 'fresh_user_network_mount_namespaces'
+            probe_pass 'loopback_only_and_no_default_route'
+            probe_pass 'dns_tcp_https_negative'
+          else
+            rc=$?
+            case "$rc" in
+              40|41|42) probe_fail "namespace_identity_unchanged_rc_${rc}" ;;
+              43|44) probe_fail "namespace_network_route_or_interface_rc_${rc}" ;;
+              45|46|47) probe_fail "unexpected_network_egress_rc_${rc}" ;;
+              *) probe_fail "unshare_unavailable_or_probe_failed_rc_${rc}" ;;
+            esac
+          fi
+          if (( bad != 0 )); then exit 86; fi
+          REDUCED
+            reduced_rc=$?
+            set -e
+            if (( reduced_rc != 0 )); then
+              fail "reduced boundary probes rejected (exit $reduced_rc)"
+            else
+              pass 'reduced boundary diagnostic'
+            fi
+          fi
+
+          {
+            echo '## Paperclip TI-0093 - diagnostic only'
+            echo
+            echo '- No Paperclip source, packages, models or third-party scripts were fetched/executed.'
+            echo '- Container image uses mutable `ubuntu:24.04` for diagnostics only.'
+            echo '- Actual P01/P02/P04 execution remains prohibited pending a new digest-pinned, separately reviewed workflow.'
+            echo
+            if (( ${#failures[@]} > 0 )); then
+              echo '### Preflight verdict: NO-GO'
+              printf -- '- %s\n' "${failures[@]}"
+            else
+              echo '### Preflight verdict: diagnostic probes passed'
+              echo '- **NOT an authorization to run Paperclip.**'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Unlike the original file, the Actions job is red when probes fail.
+          if (( ${#failures[@]} > 0 )); then exit 1; fi
+          exit 0
