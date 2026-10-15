@@ -36,6 +36,17 @@ awk '
   in_run { sub(/^          /, ""); print }
 ' "$workflow" >"$embedded_bash"
 bash -n "$embedded_bash"
+tmpfs_validator="$tmpdir/tmpfs-validator.sh"
+awk '
+  /TMPFS_VALIDATOR_BEGIN/ { in_program = 1; next }
+  /TMPFS_VALIDATOR_END/ { exit }
+  in_program { sub(/^            /, ""); print }
+' "$workflow" >"$tmpfs_validator"
+[[ -s "$tmpfs_validator" ]] || { printf 'FAIL tmpfs validator was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$tmpfs_validator"
+tmpfs_verdict() { validate_tmpfs_config "$1" >/dev/null; }
+tmpfs_inspect_verdict() { validate_inspected_tmpfs >/dev/null; }
 mountinfo_program="$tmpdir/mountinfo-verifier.awk"
 awk '
   /MOUNTINFO_AWK_BEGIN/ { in_program = 1; next }
@@ -61,6 +72,42 @@ if rg -Fq 'mount_count ==' "$workflow"; then
   exit 1
 fi
 printf 'PASS workflow_static_contract\n'
+
+tmpfs_equivalent=$'/tmp|size=67108864,nosuid,rw,noexec\n/run|noexec,size=8MiB,rw,nosuid'
+set +e; tmpfs_verdict "$tmpfs_equivalent"; rc=$?; set -e
+assert_rc 0 "$rc" tmpfs_equivalent_order_and_size_pass
+
+tmpfs_equivalent_units=$'/run|size=8192k,nosuid,noexec,rw\n/tmp|rw,size=64mb,noexec,nosuid'
+set +e; tmpfs_verdict "$tmpfs_equivalent_units"; rc=$?; set -e
+assert_rc 0 "$rc" tmpfs_equivalent_units_pass
+
+tmpfs_too_large=$'/tmp|rw,noexec,nosuid,size=65m\n/run|rw,noexec,nosuid,size=8m'
+set +e; tmpfs_verdict "$tmpfs_too_large"; rc=$?; set -e
+assert_rc 1 "$rc" tmpfs_excessive_size_is_no_go
+
+tmpfs_missing_flag=$'/tmp|rw,nosuid,size=64m\n/run|rw,noexec,nosuid,size=8m'
+set +e; tmpfs_verdict "$tmpfs_missing_flag"; rc=$?; set -e
+assert_rc 1 "$rc" tmpfs_missing_noexec_is_no_go
+
+tmpfs_extra_mount=$'/tmp|rw,noexec,nosuid,size=64m\n/run|rw,noexec,nosuid,size=8m\n/scratch|rw,noexec,nosuid,size=1m'
+set +e; tmpfs_verdict "$tmpfs_extra_mount"; rc=$?; set -e
+assert_rc 1 "$rc" tmpfs_extra_mount_is_no_go
+set +e; tmpfs_diagnostic="$(validate_tmpfs_config "$tmpfs_extra_mount")"; rc=$?; set -e
+assert_rc 1 "$rc" tmpfs_extra_mount_diagnostic_is_no_go
+[[ "$tmpfs_diagnostic" == *'tmpfs_unexpected_key_count=1'* && "$tmpfs_diagnostic" != *'/scratch'* && "$tmpfs_diagnostic" != *'size=1m'* ]] || {
+  printf 'FAIL tmpfs diagnostic exposed an unexpected path or raw option\n' >&2
+  exit 1
+}
+printf 'PASS tmpfs_diagnostic_is_sanitized\n'
+
+tmpfs_malformed=$'/tmp|rw,noexec,nosuid,size=64m\n/run rw,noexec,nosuid,size=8m'
+set +e; tmpfs_verdict "$tmpfs_malformed"; rc=$?; set -e
+assert_rc 2 "$rc" tmpfs_parser_error_is_no_go
+
+inspect_value() { return 9; }
+set +e; tmpfs_inspect_verdict; rc=$?; set -e
+assert_rc 2 "$rc" tmpfs_inspect_error_is_no_go
+unset -f inspect_value
 
 printf '%s\n' \
   '36 25 0:32 / / ro,relatime - overlay overlay ro' \
