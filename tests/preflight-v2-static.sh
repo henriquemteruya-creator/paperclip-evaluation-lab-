@@ -47,6 +47,16 @@ awk '
 source "$tmpfs_validator"
 tmpfs_verdict() { validate_tmpfs_config "$1" >/dev/null; }
 tmpfs_inspect_verdict() { validate_inspected_tmpfs >/dev/null; }
+docker_reported_mounts_validator="$tmpdir/docker-reported-mounts-validator.sh"
+awk '
+  /DOCKER_REPORTED_MOUNTS_VALIDATOR_BEGIN/ { in_program = 1; next }
+  /DOCKER_REPORTED_MOUNTS_VALIDATOR_END/ { exit }
+  in_program { sub(/^            /, ""); print }
+' "$workflow" >"$docker_reported_mounts_validator"
+[[ -s "$docker_reported_mounts_validator" ]] || { printf 'FAIL Docker-reported-mount validator was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$docker_reported_mounts_validator"
+docker_reported_mounts_verdict() { validate_docker_reported_mounts "$1"; }
 socket_classifier="$tmpdir/socket-scan-classifier.sh"
 awk '
   /SOCKET_SCAN_CLASSIFIER_BEGIN/ { in_program = 1; next }
@@ -116,6 +126,33 @@ assert_rc 2 "$rc" tmpfs_parser_error_is_no_go
 tmpfs_trailing_comma=$'/tmp|rw,noexec,nosuid,size=64m,\n/run|rw,noexec,nosuid,size=8m'
 set +e; tmpfs_verdict "$tmpfs_trailing_comma"; rc=$?; set -e
 assert_rc 2 "$rc" tmpfs_trailing_comma_is_no_go
+
+tmpfs_unknown_sentinel='/unexpected/sensitive-tmpfs-key'
+tmpfs_unknown_trailing_comma="$tmpfs_unknown_sentinel|rw,noexec,nosuid,size=64m,"$'\n'"/run|rw,noexec,nosuid,size=8m"
+set +e; tmpfs_diagnostic="$(validate_tmpfs_config "$tmpfs_unknown_trailing_comma")"; rc=$?; set -e
+assert_rc 2 "$rc" tmpfs_unknown_trailing_comma_is_no_go
+[[ "$tmpfs_diagnostic" == *'tmpfs_key=unexpected state=invalid'* && "$tmpfs_diagnostic" != *"$tmpfs_unknown_sentinel"* ]] || {
+  printf 'FAIL malformed unexpected tmpfs key was exposed in diagnostic\n' >&2
+  exit 1
+}
+
+tmpfs_unknown_double_comma="$tmpfs_unknown_sentinel|rw,,noexec,nosuid,size=64m"$'\n'"/run|rw,noexec,nosuid,size=8m"
+set +e; tmpfs_diagnostic="$(validate_tmpfs_config "$tmpfs_unknown_double_comma")"; rc=$?; set -e
+assert_rc 2 "$rc" tmpfs_unknown_double_comma_is_no_go
+[[ "$tmpfs_diagnostic" == *'tmpfs_key=unexpected state=invalid'* && "$tmpfs_diagnostic" != *"$tmpfs_unknown_sentinel"* ]] || {
+  printf 'FAIL doubly malformed unexpected tmpfs key was exposed in diagnostic\n' >&2
+  exit 1
+}
+printf 'PASS tmpfs_unknown_key_diagnostic_is_sanitized\n'
+
+docker_mount_sentinel='/unexpected/sensitive-docker-destination'
+set +e; docker_reported_mount_diagnostic="$(docker_reported_mounts_verdict "bind|$docker_mount_sentinel|true")"; rc=$?; set -e
+assert_rc 1 "$rc" docker_reported_unexpected_mount_is_no_go
+[[ "$docker_reported_mount_diagnostic" == 'docker_reported_mount_unexpected_count=1' && "$docker_reported_mount_diagnostic" != *"$docker_mount_sentinel"* && "$docker_reported_mount_diagnostic" != *'bind'* ]] || {
+  printf 'FAIL Docker-reported mount diagnostic exposed an unexpected mount\n' >&2
+  exit 1
+}
+printf 'PASS docker_reported_mount_diagnostic_is_sanitized\n'
 
 inspect_value() { return 9; }
 set +e; tmpfs_inspect_verdict; rc=$?; set -e
