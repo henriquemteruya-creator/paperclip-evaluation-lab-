@@ -47,6 +47,15 @@ awk '
 source "$tmpfs_validator"
 tmpfs_verdict() { validate_tmpfs_config "$1" >/dev/null; }
 tmpfs_inspect_verdict() { validate_inspected_tmpfs >/dev/null; }
+socket_classifier="$tmpdir/socket-scan-classifier.sh"
+awk '
+  /SOCKET_SCAN_CLASSIFIER_BEGIN/ { in_program = 1; next }
+  /SOCKET_SCAN_CLASSIFIER_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$socket_classifier"
+[[ -s "$socket_classifier" ]] || { printf 'FAIL socket classifier was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$socket_classifier"
 mountinfo_program="$tmpdir/mountinfo-verifier.awk"
 awk '
   /MOUNTINFO_AWK_BEGIN/ { in_program = 1; next }
@@ -104,10 +113,36 @@ tmpfs_malformed=$'/tmp|rw,noexec,nosuid,size=64m\n/run rw,noexec,nosuid,size=8m'
 set +e; tmpfs_verdict "$tmpfs_malformed"; rc=$?; set -e
 assert_rc 2 "$rc" tmpfs_parser_error_is_no_go
 
+tmpfs_trailing_comma=$'/tmp|rw,noexec,nosuid,size=64m,\n/run|rw,noexec,nosuid,size=8m'
+set +e; tmpfs_verdict "$tmpfs_trailing_comma"; rc=$?; set -e
+assert_rc 2 "$rc" tmpfs_trailing_comma_is_no_go
+
 inspect_value() { return 9; }
 set +e; tmpfs_inspect_verdict; rc=$?; set -e
 assert_rc 2 "$rc" tmpfs_inspect_error_is_no_go
 unset -f inspect_value
+
+socket_stderr="$tmpdir/socket-stderr"
+socket_result="$tmpdir/socket-result"
+: >"$socket_stderr"; : >"$socket_result"
+set +e; socket_diagnostic="$(classify_socket_scan 1 "$socket_stderr" "$socket_result")"; rc=$?; set -e
+assert_rc 1 "$rc" socket_tool_or_io_failure_is_no_go
+[[ "$socket_diagnostic" == socket_scan_incomplete_tool_or_io_rc_1 ]] || { printf 'FAIL unexpected socket tool/IO diagnostic\n' >&2; exit 1; }
+set +e; socket_diagnostic="$(classify_socket_scan 127 "$socket_stderr" "$socket_result")"; rc=$?; set -e
+assert_rc 1 "$rc" socket_tool_unavailable_is_no_go
+[[ "$socket_diagnostic" == socket_scan_tool_unavailable ]] || { printf 'FAIL unexpected socket unavailable diagnostic\n' >&2; exit 1; }
+printf '%s\n' 'Permission denied: hidden directory' >"$socket_stderr"
+set +e; socket_diagnostic="$(classify_socket_scan 1 "$socket_stderr" "$socket_result")"; rc=$?; set -e
+assert_rc 1 "$rc" socket_permission_failure_is_no_go
+[[ "$socket_diagnostic" == socket_scan_incomplete_permission_rc_1 ]] || { printf 'FAIL unexpected socket permission diagnostic\n' >&2; exit 1; }
+: >"$socket_stderr"; printf '%s\n' 'opaque candidate marker' >"$socket_result"
+set +e; socket_diagnostic="$(classify_socket_scan 0 "$socket_stderr" "$socket_result")"; rc=$?; set -e
+assert_rc 1 "$rc" socket_candidate_is_no_go
+[[ "$socket_diagnostic" == host_control_socket_candidate_found ]] || { printf 'FAIL unexpected socket candidate diagnostic\n' >&2; exit 1; }
+: >"$socket_result"
+set +e; socket_diagnostic="$(classify_socket_scan 0 "$socket_stderr" "$socket_result")"; rc=$?; set -e
+assert_rc 0 "$rc" socket_complete_scan_passes
+[[ "$socket_diagnostic" == socket_scan_complete_no_candidates ]] || { printf 'FAIL unexpected clean socket diagnostic\n' >&2; exit 1; }
 
 printf '%s\n' \
   '36 25 0:32 / / ro,relatime - overlay overlay ro' \
@@ -136,6 +171,39 @@ printf '%s\n' \
   '38 37 8:1 / /proc/unexpected-host-mount rw,relatime - ext4 /dev/sda1 rw' >"$tmpdir/mounts-unexpected-proc"
 set +e; mountinfo_verdict "$tmpdir/mounts-unexpected-proc"; rc=$?; set -e
 assert_rc 1 "$rc" unexpected_proc_descendant_is_no_go
+set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-unexpected-proc")"; rc=$?; set -e
+assert_rc 1 "$rc" unexpected_proc_diagnostic_is_no_go
+[[ "$mountinfo_diagnostic" == *'reason=destination_not_allowlisted destination_class=proc_descendant'* && "$mountinfo_diagnostic" != *'/proc/unexpected-host-mount'* && "$mountinfo_diagnostic" != *'/dev/sda1'* ]] || {
+  printf 'FAIL unexpected mount diagnostic exposed sensitive mountinfo fields\n' >&2
+  exit 1
+}
+printf 'PASS unexpected_mount_diagnostic_is_sanitized\n'
+
+printf '%s\n' '36 25 0:32 / /tmp rw,nosuid,noexec - ext4 /dev/sda1 rw' >"$tmpdir/mounts-known-identity-mismatch"
+set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-known-identity-mismatch")"; rc=$?; set -e
+assert_rc 1 "$rc" known_mount_identity_mismatch_is_no_go
+[[ "$mountinfo_diagnostic" == *'reason=filesystem_or_source_incompatible destination_class=expected'* ]] || {
+  printf 'FAIL missing known-mount identity diagnostic\n' >&2
+  exit 1
+}
+
+printf '%s\n' '36 25 0:32 / /tmp rw,nosuid - tmpfs tmpfs rw' >"$tmpdir/mounts-known-options-mismatch"
+set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-known-options-mismatch")"; rc=$?; set -e
+assert_rc 1 "$rc" known_mount_options_mismatch_is_no_go
+[[ "$mountinfo_diagnostic" == *'reason=mount_options_incompatible destination_class=expected'* ]] || {
+  printf 'FAIL missing known-mount options diagnostic\n' >&2
+  exit 1
+}
+
+printf '%s\n' \
+  '36 25 0:32 / /tmp rw,nosuid,noexec - tmpfs tmpfs rw' \
+  '37 25 0:32 / /tmp rw,nosuid,noexec - tmpfs tmpfs rw' >"$tmpdir/mounts-duplicate"
+set +e; mountinfo_diagnostic="$(mountinfo_verdict "$tmpdir/mounts-duplicate")"; rc=$?; set -e
+assert_rc 1 "$rc" duplicate_mount_is_no_go
+[[ "$mountinfo_diagnostic" == *'reason=duplicate_destination destination_class=expected'* ]] || {
+  printf 'FAIL missing duplicate-mount diagnostic\n' >&2
+  exit 1
+}
 
 printf '%s\n' \
   '36 25 0:32 / / ro,relatime - overlay overlay ro' \
