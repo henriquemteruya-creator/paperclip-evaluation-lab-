@@ -147,6 +147,91 @@ jobs:
               fi
             }
 
+            # TMPFS_VALIDATOR_BEGIN
+            normalize_tmpfs_size() {
+              local raw="${1,,}" expected_bytes="$2" number unit expected_value
+              if [[ ! "$raw" =~ ^([0-9]+)(b|k|kb|ki|kib|m|mb|mi|mib)?$ ]]; then
+                return 2
+              fi
+              number="${BASH_REMATCH[1]}"
+              unit="${BASH_REMATCH[2]:-b}"
+              case "$unit" in
+                b) expected_value="$expected_bytes" ;;
+                k|kb|ki|kib) expected_value="$(( expected_bytes / 1024 ))" ;;
+                m|mb|mi|mib) expected_value="$(( expected_bytes / 1048576 ))" ;;
+                *) return 2 ;;
+              esac
+              [[ "$number" == "$expected_value" ]] || return 1
+              printf '%s\n' "$expected_bytes"
+            }
+
+            validate_tmpfs_config() {
+              local entries="$1" path options extra expected_bytes token size_raw size_bytes
+              local tmp_seen=0 run_seen=0 unexpected_keys=0 invalid=0 parse_error=0
+              local rw_seen=0 noexec_seen=0 nosuid_seen=0 size_seen=0
+              while IFS='|' read -r path options extra; do
+                [[ -z "$path" && -z "$options" && -z "$extra" ]] && continue
+                if [[ -z "$path" || -z "$options" || -n "$extra" ]]; then
+                  parse_error=1
+                  continue
+                fi
+                case "$path" in
+                  /tmp) expected_bytes=67108864; (( ++tmp_seen )) ;;
+                  /run) expected_bytes=8388608; (( ++run_seen )) ;;
+                  *) (( ++unexpected_keys )); continue ;;
+                esac
+                if (( tmp_seen > 1 || run_seen > 1 )); then
+                  invalid=1
+                  continue
+                fi
+                rw_seen=0; noexec_seen=0; nosuid_seen=0; size_seen=0; size_bytes=''
+                IFS=',' read -r -a tmpfs_tokens <<< "$options"
+                for token in "${tmpfs_tokens[@]}"; do
+                  case "$token" in
+                    rw) (( ++rw_seen )) ;;
+                    noexec) (( ++noexec_seen )) ;;
+                    nosuid) (( ++nosuid_seen )) ;;
+                    size=*)
+                      (( ++size_seen ))
+                      size_raw="${token#size=}"
+                      if ! size_bytes="$(normalize_tmpfs_size "$size_raw" "$expected_bytes")"; then
+                        invalid=1
+                      fi
+                      ;;
+                    *) invalid=1 ;;
+                  esac
+                done
+                if (( rw_seen != 1 || noexec_seen != 1 || nosuid_seen != 1 || size_seen != 1 )); then
+                  invalid=1
+                fi
+                # Only sanitized, expected keys and normalized sizes are emitted.
+                if [[ -n "$size_bytes" && "$size_bytes" == "$expected_bytes" && "$rw_seen" == 1 && "$noexec_seen" == 1 && "$nosuid_seen" == 1 ]]; then
+                  printf 'tmpfs_key=%s flags=rw,noexec,nosuid size_bytes=%s\n' "$path" "$size_bytes"
+                else
+                  printf 'tmpfs_key=%s state=invalid\n' "$path"
+                fi
+              done <<< "$entries"
+              (( tmp_seen != 0 )) || printf '%s\n' 'tmpfs_key=/tmp state=missing'
+              (( run_seen != 0 )) || printf '%s\n' 'tmpfs_key=/run state=missing'
+              printf 'tmpfs_unexpected_key_count=%s\n' "$unexpected_keys"
+              if (( parse_error != 0 )); then
+                printf '%s\n' 'tmpfs_parser_error'
+                return 2
+              fi
+              (( tmp_seen == 1 && run_seen == 1 && unexpected_keys == 0 && invalid == 0 )) || return 1
+              return 0
+            }
+
+            validate_inspected_tmpfs() {
+              local entries
+              if ! entries="$(inspect_value '{{range $k,$v := .HostConfig.Tmpfs}}{{printf "%s|%s\n" $k $v}}{{end}}')"; then
+                printf '%s\n' 'tmpfs_inspect_error'
+                return 2
+              fi
+              validate_tmpfs_config "$entries"
+            }
+            # TMPFS_VALIDATOR_END
+
             # Validate Docker’s effective configuration before starting it.
             inspect_exact network_mode none '{{.HostConfig.NetworkMode}}'
             inspect_exact readonly_rootfs true '{{.HostConfig.ReadonlyRootfs}}'
@@ -166,11 +251,18 @@ jobs:
             inspect_contains cap_drop ALL '{{json .HostConfig.CapDrop}}'
             inspect_contains security_opt no-new-privileges '{{json .HostConfig.SecurityOpt}}'
 
-            if ! tmpfs_actual="$(inspect_value '{{range $k,$v := .HostConfig.Tmpfs}}{{printf "%s|%s\n" $k $v}}{{end}}' | LC_ALL=C sort)"; then
-              fail 'docker inspect failed for tmpfs configuration'
-            elif [[ "$tmpfs_actual" != $'/run|rw,noexec,nosuid,size=8m\n/tmp|rw,noexec,nosuid,size=64m' ]]; then
-              fail 'tmpfs configuration differs from the closed allowlist'
-            fi
+            set +e
+            tmpfs_diagnostic="$(validate_inspected_tmpfs)"
+            tmpfs_rc=$?
+            set -e
+            while IFS= read -r tmpfs_line; do
+              [[ -n "$tmpfs_line" ]] && info "$tmpfs_line"
+            done <<< "$tmpfs_diagnostic"
+            case "$tmpfs_rc" in
+              0) pass 'tmpfs configuration matches semantic closed allowlist' ;;
+              1) fail 'tmpfs configuration violates semantic closed allowlist' ;;
+              *) fail 'docker inspect or tmpfs parser failed' ;;
+            esac
 
             # Docker's .Mounts is a report, not the declared configuration, and
             # its entries vary by Docker version and lifecycle state.  Check it
