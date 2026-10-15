@@ -299,6 +299,71 @@ jobs:
               return 0
             }
             # DOCKER_REPORTED_MOUNTS_VALIDATOR_END
+            # DOCKER_SPECIAL_FILES_DIAGNOSTIC_BEGIN
+            # This is diagnostic evidence only.  It does not relax the
+            # independent Docker configuration or runtime mount allowlists.
+            # Raw paths and sources remain in local shell variables and are
+            # never written to the public workflow log.
+            diagnose_docker_special_files() {
+              local entries="$1" hosts_path="$2" hostname_path="$3" resolv_path="$4" readonly_rootfs="$5"
+              local destination mount_type mount_rw mount_source extra expected_source id
+              local hosts_seen=0 hostname_seen=0 resolv_seen=0 unexpected=0 malformed=0 invalid=0
+              local hosts_type=false hosts_present=false hosts_match=false hosts_rw=unknown
+              local hostname_type=false hostname_present=false hostname_match=false hostname_rw=unknown
+              local resolv_type=false resolv_present=false resolv_match=false resolv_rw=unknown
+              # The template is expected to produce a boolean.  Do not log or
+              # trust another value as secure metadata.
+              if [[ "$readonly_rootfs" != true && "$readonly_rootfs" != false ]]; then
+                printf '%s\n' 'docker_special_file_parser_error'
+                return 2
+              fi
+              while IFS='|' read -r destination mount_type mount_rw mount_source extra; do
+                [[ -z "$destination" && -z "$mount_type" && -z "$mount_rw" && -z "$mount_source" && -z "$extra" ]] && continue
+                if [[ -z "$destination" || -z "$mount_type" || -z "$mount_rw" || -z "$mount_source" || -n "$extra" ]]; then
+                  malformed=1
+                  continue
+                fi
+                case "$destination" in
+                  /etc/hosts) id=etc_hosts; expected_source="$hosts_path"; (( ++hosts_seen )) ;;
+                  /etc/hostname) id=etc_hostname; expected_source="$hostname_path"; (( ++hostname_seen )) ;;
+                  /etc/resolv.conf) id=etc_resolv_conf; expected_source="$resolv_path"; (( ++resolv_seen )) ;;
+                  /tmp|/run) continue ;;
+                  *) (( ++unexpected )); continue ;;
+                esac
+                if [[ "$mount_rw" != true && "$mount_rw" != false ]]; then
+                  malformed=1
+                  continue
+                fi
+                local type_bind=false metadata_present=false metadata_source_match=false
+                [[ "$mount_type" == bind ]] && type_bind=true
+                [[ -n "$expected_source" ]] && metadata_present=true
+                [[ "$metadata_present" == true && "$mount_source" == "$expected_source" ]] && metadata_source_match=true
+                [[ "$type_bind" == true && "$metadata_source_match" == true ]] || invalid=1
+                case "$id" in
+                  etc_hosts) hosts_type="$type_bind"; hosts_present="$metadata_present"; hosts_match="$metadata_source_match"; hosts_rw="$mount_rw" ;;
+                  etc_hostname) hostname_type="$type_bind"; hostname_present="$metadata_present"; hostname_match="$metadata_source_match"; hostname_rw="$mount_rw" ;;
+                  etc_resolv_conf) resolv_type="$type_bind"; resolv_present="$metadata_present"; resolv_match="$metadata_source_match"; resolv_rw="$mount_rw" ;;
+                esac
+              done <<< "$entries"
+              (( hosts_seen == 1 && hostname_seen == 1 && resolv_seen == 1 )) || invalid=1
+              (( hosts_seen <= 1 && hostname_seen <= 1 && resolv_seen <= 1 )) || invalid=1
+              # readonly_rootfs is deliberately reported but is not used to
+              # infer bind-mount writability.
+              printf 'docker_special_file id=etc_hosts cardinality_one=%s type_bind=%s metadata_present=%s metadata_source_match=%s mount_rw=%s readonly_rootfs=%s\n' \
+                "$([[ "$hosts_seen" == 1 ]] && printf true || printf false)" "$hosts_type" "$hosts_present" "$hosts_match" "$hosts_rw" "$readonly_rootfs"
+              printf 'docker_special_file id=etc_hostname cardinality_one=%s type_bind=%s metadata_present=%s metadata_source_match=%s mount_rw=%s readonly_rootfs=%s\n' \
+                "$([[ "$hostname_seen" == 1 ]] && printf true || printf false)" "$hostname_type" "$hostname_present" "$hostname_match" "$hostname_rw" "$readonly_rootfs"
+              printf 'docker_special_file id=etc_resolv_conf cardinality_one=%s type_bind=%s metadata_present=%s metadata_source_match=%s mount_rw=%s readonly_rootfs=%s\n' \
+                "$([[ "$resolv_seen" == 1 ]] && printf true || printf false)" "$resolv_type" "$resolv_present" "$resolv_match" "$resolv_rw" "$readonly_rootfs"
+              printf 'docker_special_file_unexpected_count=%s\n' "$unexpected"
+              if (( malformed != 0 )); then
+                printf '%s\n' 'docker_special_file_parser_error'
+                return 2
+              fi
+              (( unexpected == 0 && invalid == 0 )) || return 1
+              return 0
+            }
+            # DOCKER_SPECIAL_FILES_DIAGNOSTIC_END
             if ! docker_reported_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t\n" .Type .Destination .RW}}{{end}}')"; then
               fail 'docker inspect failed for reported mounts'
             else
@@ -313,6 +378,28 @@ jobs:
                 0) pass 'docker reported mounts match closed allowlist' ;;
                 1) fail 'docker reported unexpected mount' ;;
                 *) fail 'docker reported mounts parser failed' ;;
+              esac
+            fi
+            # Keep sources private: these values are used only for equality
+            # checks against the .Mounts report from this same container.
+            if ! docker_special_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')" || \
+               ! docker_hosts_path="$(inspect_value '{{.HostsPath}}')" || \
+               ! docker_hostname_path="$(inspect_value '{{.HostnamePath}}')" || \
+               ! docker_resolv_path="$(inspect_value '{{.ResolvConfPath}}')" || \
+               ! docker_readonly_rootfs="$(inspect_value '{{.HostConfig.ReadonlyRootfs}}')"; then
+              fail 'docker special-file diagnostic inspect failed'
+            else
+              set +e
+              docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_mounts" "$docker_hosts_path" "$docker_hostname_path" "$docker_resolv_path" "$docker_readonly_rootfs")"
+              docker_special_rc=$?
+              set -e
+              while IFS= read -r docker_special_line; do
+                [[ -n "$docker_special_line" ]] && info "$docker_special_line"
+              done <<< "$docker_special_diagnostic"
+              case "$docker_special_rc" in
+                0) info 'docker special-file correlation diagnostic complete; not a runtime authorization' ;;
+                1) fail 'docker special-file correlation is incomplete or unexpected' ;;
+                *) fail 'docker special-file diagnostic parser failed' ;;
               esac
             fi
           fi
@@ -334,7 +421,7 @@ jobs:
           probe_fail() { printf 'FAIL %s\n' "$1"; bad=1; }
           verify() { local name="$1"; shift; if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi; }
 
-          for tool in bash openssl curl nc getent ip awk grep find readlink timeout id cat; do
+          for tool in bash openssl curl nc getent ip awk grep find readlink timeout id cat stat; do
             command -v "$tool" >/dev/null 2>&1 || probe_fail "required_tool_missing_${tool}"
           done
 
@@ -603,6 +690,184 @@ jobs:
             1) probe_fail prohibited_or_unexpected_runtime_mount ;;
             *) probe_fail "mountinfo_inspection_error_rc_${mountinfo_rc}" ;;
           esac
+
+          # The following probes explain known runtime mask representations;
+          # they do not modify the closed mount allowlist above.  All raw
+          # mountinfo fields stay inside awk/shell variables.
+          # RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN
+          runtime_mask_diagnostic_awk='\
+            BEGIN {
+              dir_paths["proc_acpi"] = "/proc/acpi"
+              dir_paths["proc_scsi"] = "/proc/scsi"
+              dir_paths["sys_firmware"] = "/sys/firmware"
+            }
+            function option(options, wanted, n, values, i) {
+              n = split(options, values, ",")
+              for (i = 1; i <= n; i++) if (values[i] == wanted) return 1
+              return 0
+            }
+            function ro(options) { return option(options, "ro") && !option(options, "rw") }
+            function rw(options) { return option(options, "rw") && !option(options, "ro") }
+            function dir_id(path) {
+              if (path == "/proc/acpi") return "proc_acpi"
+              if (path == "/proc/scsi") return "proc_scsi"
+              if (path == "/sys/firmware") return "sys_firmware"
+              return ""
+            }
+            function file_id(path) {
+              if (path == "/proc/interrupts") return "proc_interrupts"
+              if (path == "/proc/kcore") return "proc_kcore"
+              if (path == "/proc/keys") return "proc_keys"
+              if (path == "/proc/latency_stats") return "proc_latency_stats"
+              if (path == "/proc/timer_list") return "proc_timer_list"
+              return ""
+            }
+            function propagation_clear(first, last, i) {
+              for (i = first; i <= last; i++)
+                if ($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) return "false"
+              return "true"
+            }
+            function bool(value) { return value ? "true" : "false" }
+            function report_dir(id, path, fs, source, root, options, propagation) {
+              dir_seen[id]++
+              dir_fs[id] = bool(fs == "tmpfs" && source == "tmpfs")
+              dir_root[id] = bool(root == "/")
+              dir_ro[id] = bool(ro(options))
+              dir_propagation[id] = propagation
+            }
+            function report_file(id, path, fs, source, root, options, propagation) {
+              file_seen[id]++
+              file_fs[id] = bool(fs == "tmpfs" && source == "tmpfs")
+              file_root[id] = bool(root == "/null")
+              file_rw[id] = bool(rw(options))
+              file_propagation[id] = propagation
+            }
+            {
+              records++
+              if (NF < 7) { malformed = 1; next }
+              separator = 0
+              for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+              if (!separator || separator + 3 > NF) { malformed = 1; next }
+              root = $4; target = $5; options = $6; fs = $(separator + 1); source = $(separator + 2)
+              propagation = propagation_clear(7, separator - 1)
+              id = dir_id(target)
+              if (id != "") report_dir(id, target, fs, source, root, options, propagation)
+              id = file_id(target)
+              if (id != "") report_file(id, target, fs, source, root, options, propagation)
+              for (d in dir_paths) if (target ~ ("^" dir_paths[d] "/")) dir_submount[d] = "true"
+            }
+            END {
+              split("proc_acpi proc_scsi sys_firmware", dirs, " ")
+              split("proc_interrupts proc_kcore proc_keys proc_latency_stats proc_timer_list", files, " ")
+              if (records == 0 || malformed) { print "runtime_mask_mountinfo_parser_error"; exit 2 }
+              bad = 0
+              for (i in dirs) {
+                id = dirs[i]; seen = dir_seen[id] == 1 ? "true" : "false"
+                submount = dir_submount[id] == "true" ? "true" : "false"
+                printf "runtime_mask_directory id=%s cardinality_one=%s type_source_tmpfs=%s root_is_slash=%s per_mount_ro=%s propagation_markers_absent=%s submounts_unexpected=%s\\n", id, seen, dir_fs[id] ? dir_fs[id] : "false", dir_root[id] ? dir_root[id] : "false", dir_ro[id] ? dir_ro[id] : "false", dir_propagation[id] ? dir_propagation[id] : "false", submount
+                if (seen != "true" || submount != "false" || dir_fs[id] != "true" || dir_root[id] != "true" || dir_ro[id] != "true" || dir_propagation[id] != "true") bad = 1
+              }
+              for (i in files) {
+                id = files[i]; seen = file_seen[id] == 1 ? "true" : "false"
+                printf "runtime_mask_file id=%s cardinality_one=%s type_source_tmpfs=%s root_is_null=%s per_mount_rw=%s propagation_markers_absent=%s\\n", id, seen, file_fs[id] ? file_fs[id] : "false", file_root[id] ? file_root[id] : "false", file_rw[id] ? file_rw[id] : "false", file_propagation[id] ? file_propagation[id] : "false"
+                if (seen != "true" || file_fs[id] != "true" || file_root[id] != "true" || file_rw[id] != "true" || file_propagation[id] != "true") bad = 1
+              }
+              exit bad ? 1 : 0
+            }'
+          # RUNTIME_MASK_DIAGNOSTIC_AWK_END
+          # RUNTIME_OBJECT_DIAGNOSTIC_BEGIN
+          diagnose_masked_directory_objects() {
+            local entries="$1" id path extra listing error_file find_rc
+            local invalid=0 parse_error=0
+            while IFS='|' read -r id path extra; do
+              [[ -z "$id" && -z "$path" && -z "$extra" ]] && continue
+              if [[ -z "$id" || -z "$path" || -n "$extra" ]]; then parse_error=1; continue; fi
+              # Production supplies the fixed paths below; this helper keeps
+              # the ID closed so fixtures can exercise its object checks
+              # without emitting their temporary paths.
+              case "$id" in
+                proc_acpi|proc_scsi|sys_firmware) ;;
+                *) parse_error=1; continue ;;
+              esac
+              local object_dir=false object_symlink=false empty=false inspection_complete=false
+              [[ -L "$path" ]] && object_symlink=true
+              [[ -d "$path" && "$object_symlink" == false ]] && object_dir=true
+              if [[ "$object_dir" == true ]]; then
+                error_file="$(mktemp)" || { parse_error=1; continue; }
+                set +e
+                listing="$(find "$path" -xdev -mindepth 1 -maxdepth 1 -print -quit 2>"$error_file")"
+                find_rc=$?
+                set -e
+                if (( find_rc == 0 )) && [[ ! -s "$error_file" ]]; then
+                  inspection_complete=true
+                  [[ -z "$listing" ]] && empty=true
+                fi
+                rm -f "$error_file"
+              fi
+              [[ "$object_dir" == true && "$object_symlink" == false && "$empty" == true && "$inspection_complete" == true ]] || invalid=1
+              printf 'runtime_mask_directory_object id=%s object_dir=%s object_symlink=%s empty=%s inspection_complete=%s\n' "$id" "$object_dir" "$object_symlink" "$empty" "$inspection_complete"
+            done <<< "$entries"
+            if (( parse_error != 0 )); then printf '%s\n' runtime_mask_directory_object_parser_error; return 2; fi
+            (( invalid == 0 )) || return 1
+          }
+
+          diagnose_masked_file_objects() {
+            local entries="$1" id path extra details null_details object_type major minor null_type null_major null_minor
+            local invalid=0 parse_error=0
+            if ! null_details="$(stat -Lc '%F|%t|%T' /dev/null)"; then
+              printf '%s\n' runtime_mask_file_null_stat_error
+              return 2
+            fi
+            IFS='|' read -r null_type null_major null_minor <<< "$null_details"
+            while IFS='|' read -r id path extra; do
+              [[ -z "$id" && -z "$path" && -z "$extra" ]] && continue
+              if [[ -z "$id" || -z "$path" || -n "$extra" ]]; then parse_error=1; continue; fi
+              # Production supplies the fixed paths below; only known IDs are
+              # accepted and the inspected path is never logged.
+              case "$id" in
+                proc_interrupts|proc_kcore|proc_keys|proc_latency_stats|proc_timer_list) ;;
+                *) parse_error=1; continue ;;
+              esac
+              local character_device=false object_symlink=false null_1_3=false null_identity_match=false inspection_complete=false
+              [[ -L "$path" ]] && object_symlink=true
+              if details="$(stat -Lc '%F|%t|%T' "$path" 2>/dev/null)"; then
+                IFS='|' read -r object_type major minor <<< "$details"
+                inspection_complete=true
+                [[ "$object_type" == 'character special file' ]] && character_device=true
+                [[ "$major" == 1 && "$minor" == 3 && "$null_type" == 'character special file' && "$null_major" == 1 && "$null_minor" == 3 ]] && null_1_3=true
+                [[ "$details" == "$null_details" ]] && null_identity_match=true
+              fi
+              [[ "$character_device" == true && "$object_symlink" == false && "$null_1_3" == true && "$null_identity_match" == true && "$inspection_complete" == true ]] || invalid=1
+              printf 'runtime_mask_file_object id=%s character_device=%s object_symlink=%s null_char_1_3=%s null_identity_match=%s inspection_complete=%s\n' "$id" "$character_device" "$object_symlink" "$null_1_3" "$null_identity_match" "$inspection_complete"
+            done <<< "$entries"
+            if (( parse_error != 0 )); then printf '%s\n' runtime_mask_file_object_parser_error; return 2; fi
+            (( invalid == 0 )) || return 1
+          }
+          # RUNTIME_OBJECT_DIAGNOSTIC_END
+          # The awk probe must have a complete view: malformed input and every
+          # unrecognised descendant of a masked directory are NO-GO.
+          set +e
+          runtime_mask_mount_diagnostic="$(awk "$runtime_mask_diagnostic_awk" /proc/self/mountinfo)"
+          runtime_mask_mount_rc=$?
+          set -e
+          while IFS= read -r runtime_mask_line; do
+            [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"
+          done <<< "$runtime_mask_mount_diagnostic"
+          case "$runtime_mask_mount_rc" in
+            0) printf '%s\n' 'INFO runtime_mask_mount_diagnostic_complete_not_authorization' ;;
+            1) probe_fail runtime_mask_mount_diagnostic_inconclusive_or_mismatch ;;
+            *) probe_fail runtime_mask_mount_diagnostic_parser_error ;;
+          esac
+          set +e
+          runtime_mask_dir_diagnostic="$(diagnose_masked_directory_objects $'proc_acpi|/proc/acpi\nproc_scsi|/proc/scsi\nsys_firmware|/sys/firmware')"
+          runtime_mask_dir_rc=$?
+          runtime_mask_file_diagnostic="$(diagnose_masked_file_objects $'proc_interrupts|/proc/interrupts\nproc_kcore|/proc/kcore\nproc_keys|/proc/keys\nproc_latency_stats|/proc/latency_stats\nproc_timer_list|/proc/timer_list')"
+          runtime_mask_file_rc=$?
+          set -e
+          while IFS= read -r runtime_mask_line; do [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"; done <<< "$runtime_mask_dir_diagnostic"
+          while IFS= read -r runtime_mask_line; do [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"; done <<< "$runtime_mask_file_diagnostic"
+          case "$runtime_mask_dir_rc" in 0) printf '%s\n' 'INFO runtime_mask_directory_object_diagnostic_complete_not_authorization' ;; 1) probe_fail runtime_mask_directory_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_directory_object_diagnostic_parser_error ;; esac
+          case "$runtime_mask_file_rc" in 0) printf '%s\n' 'INFO runtime_mask_file_object_diagnostic_complete_not_authorization' ;; 1) probe_fail runtime_mask_file_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_file_object_diagnostic_parser_error ;; esac
 
           # --network none plus one loopback interface is primary evidence.
           # DNS, raw TCP and TLS/HTTPS attempts are independent negative probes.
