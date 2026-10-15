@@ -172,24 +172,21 @@ jobs:
               fail 'tmpfs configuration differs from the closed allowlist'
             fi
 
-            if ! docker_root="$(docker info --format '{{.DockerRootDir}}')"; then
-              fail 'cannot determine Docker root directory for mount validation'
-            elif ! effective_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Type .Destination .RW .Source}}{{end}}')"; then
-              fail 'docker inspect failed for effective mounts'
-            else
-              mount_count=0
-              while IFS='|' read -r mount_type mount_destination mount_rw mount_source; do
+            # Docker's .Mounts is a report, not the declared configuration, and
+            # its entries vary by Docker version and lifecycle state.  Check it
+            # independently without assuming a fixed count; the closed runtime
+            # allowlist below remains the authoritative observation.
+            if ! docker_reported_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t\n" .Type .Destination .RW}}{{end}}')"; then
+              fail 'docker inspect failed for reported mounts'
+            elif [[ -n "$docker_reported_mounts" ]]; then
+              while IFS='|' read -r mount_type mount_destination mount_rw; do
                 [[ -z "$mount_type" ]] && continue
-                mount_count=$((mount_count + 1))
-                case "$mount_type|$mount_destination|$mount_rw|$mount_source" in
-                  'tmpfs|/tmp|true|'|'tmpfs|/run|true|') ;;
-                  "bind|/etc/hosts|true|$docker_root/containers/$container_id/hosts"|\
-                  "bind|/etc/hostname|true|$docker_root/containers/$container_id/hostname"|\
-                  "bind|/etc/resolv.conf|true|$docker_root/containers/$container_id/resolv.conf") ;;
-                  *) fail "effective mount outside allowlist: $mount_type $mount_destination" ;;
+                case "$mount_type|$mount_destination|$mount_rw" in
+                  'tmpfs|/tmp|true'|'tmpfs|/run|true'|\
+                  'bind|/etc/hosts|true'|'bind|/etc/hostname|true'|'bind|/etc/resolv.conf|true') ;;
+                  *) fail "Docker reported unexpected mount: $mount_type $mount_destination" ;;
                 esac
-              done <<< "$effective_mounts"
-              (( mount_count == 5 )) || fail 'effective mount count differs from allowlist'
+              done <<< "$docker_reported_mounts"
             fi
           fi
 
@@ -234,8 +231,28 @@ jobs:
           for ns in mnt pid net ipc uts cgroup user; do
             [[ -e "/proc/self/ns/$ns" ]] && printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")" || probe_fail "namespace_missing_${ns}"
           done
-          verify only_loopback_interface bash -c 'test "$(ip -o link show | wc -l)" -eq 1 && ip -o link show | grep -Eq "^[0-9]+: lo:"'
-          verify no_default_route bash -c '! ip route show default | grep -q .'
+          verify only_loopback_interface bash -c 'links=$(ip -o link show) || exit 2; test "$(printf "%s\n" "$links" | wc -l)" -eq 1 && printf "%s\n" "$links" | grep -Eq "^[0-9]+: lo:"'
+          verify_no_default_route() {
+            local family="$1" routes route_rc
+            routes=$(mktemp) || { probe_fail "ipv${family}_route_tempfile_failed"; return; }
+            set +e
+            ip "-$family" route show default >"$routes" 2>&1
+            route_rc=$?
+            set -e
+            case "$route_rc" in
+              0)
+                if [[ -s "$routes" ]]; then
+                  probe_fail "ipv${family}_default_route_present"
+                else
+                  probe_pass "ipv${family}_no_default_route"
+                fi
+                ;;
+              *) probe_fail "ipv${family}_route_query_failed_rc_${route_rc}" ;;
+            esac
+            rm -f "$routes"
+          }
+          verify_no_default_route 4
+          verify_no_default_route 6
 
           socket_bad=0
           for socket in /var/run/docker.sock /run/docker.sock /var/run/containerd/containerd.sock /run/containerd/containerd.sock /var/run/podman/podman.sock /run/podman/podman.sock; do
@@ -254,11 +271,50 @@ jobs:
           fi
           rm -f "${socket_scan:-}" "${socket_scan_err:-}"
           (( socket_bad == 0 )) && probe_pass no_host_control_socket || probe_fail host_control_socket_or_scan_failure
-          if grep -Eq '(docker\.sock|containerd\.sock|podman\.sock|/home/runner|/__w|/github)' /proc/self/mountinfo; then
-            probe_fail prohibited_mount_visible
-          else
-            probe_pass no_prohibited_mount_visible
-          fi
+          # Exit status is deliberately tri-state: 0 = valid/allowed, 1 =
+          # forbidden exposure, 2+ = unreadable or malformed mountinfo.
+          set +e
+          awk '
+            function allowed_target(path) {
+              return path == "/" || path == "/proc" || path ~ /^\/proc\// || \
+                     path == "/sys" || path ~ /^\/sys\// || \
+                     path == "/dev" || path ~ /^\/dev\// || \
+                     path == "/tmp" || path == "/run" || \
+                     path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf"
+            }
+            function has_option(options, wanted, n, values, i) {
+              n = split(options, values, ",")
+              for (i = 1; i <= n; i++) if (values[i] == wanted) return 1
+              return 0
+            }
+            {
+              if (NF < 7) { malformed = 1; next }
+              separator = 0
+              for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+              if (!separator || separator + 2 > NF) { malformed = 1; next }
+              target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2)
+              if (!allowed_target(target)) forbidden = 1
+              if (target == "/tmp" || target == "/run") {
+                if (filesystem != "tmpfs" || !has_option(options, "rw")) forbidden = 1
+              }
+              if (target == "/" && !has_option(options, "ro")) forbidden = 1
+              if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ || \
+                  target ~ /^\/(home\/runner|__w|github)(\/|$)/ || \
+                  source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) forbidden = 1
+            }
+            END {
+              if (malformed) exit 2
+              if (forbidden) exit 1
+              exit 0
+            }
+          ' /proc/self/mountinfo
+          mountinfo_rc=$?
+          set -e
+          case "$mountinfo_rc" in
+            0) probe_pass runtime_mountinfo_closed_allowlist ;;
+            1) probe_fail prohibited_or_unexpected_runtime_mount ;;
+            *) probe_fail "mountinfo_inspection_error_rc_${mountinfo_rc}" ;;
+          esac
 
           # --network none plus one loopback interface is primary evidence.
           # DNS, raw TCP and TLS/HTTPS attempts are independent negative probes.
