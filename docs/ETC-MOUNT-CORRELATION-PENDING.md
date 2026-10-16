@@ -6,10 +6,9 @@ The three special destinations remain rejected by the runtime allowlist:
 - `/etc/hostname`
 - `/etc/resolv.conf`
 
-Run #6 established only that `docker inspect .Mounts` did not expose matching
-entries while the container was in the pre-start state.  It did not establish
-that the files were absent at runtime, nor did it establish their effective
-origin.
+Runs through #8 established that `docker inspect .Mounts` may not expose
+matching entries for these Docker-managed files.  This does not establish that
+the files are absent at runtime, nor does it establish their effective origin.
 
 ## What is not sufficient
 
@@ -38,3 +37,29 @@ That design crosses the runner/container observation boundary and needs its
 own review before implementation.  Until it has reproducible evidence, the
 preflight records an inconclusive diagnostic and returns NO-GO.  This document
 does not authorize changing the `/etc` allowlist or executing run #7.
+
+## Current #9 evidence policy: `.Mounts=unavailable`
+
+The runtime collector records an empty post-start `.Mounts` response as the
+sanitized state `unavailable`; it does not treat it as a Docker inspection
+error.  The independent kernel evidence (stable PID and mount namespace,
+effective `mountinfo`, object type, source/destination device+inode identity,
+and Docker-root provenance) is still collected so that a future review can
+inspect which layer was conclusive.
+
+For the current diagnostic, however, `unavailable` is **not** sufficient for
+`evidence_complete`: the collector requires the structured post-start report
+to be `consistent` as corroboration.  This is deliberately conservative for
+two reasons:
+
+1. the host-side kernel observation and Docker metadata are related through a
+   rootful daemon controlled by the runner, so neither is an independent
+   attestation of the other; and
+2. no approved runtime-specific proof yet explains why Docker omits these
+   three managed files from `.Mounts` on this runner/version.
+
+Therefore an unavailable `.Mounts` report produces a per-ID diagnostic NO-GO
+while retaining sanitized kernel observations.  This policy is not an
+authorization to relax the runtime allowlist, and the final workflow verdict
+remains NO-GO even if every auxiliary diagnostic is complete.  Changing this
+requirement would require new runtime evidence and an independent review.
