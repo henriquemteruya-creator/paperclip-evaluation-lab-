@@ -510,11 +510,14 @@ jobs:
           validate_docker_managed_etc_record() {
             local id="$1" metadata_present="$2" source_regular="$3" source_nosymlink="$4" provenance="$5" source_stable="$6" target_regular="$7" target_nosymlink="$8" identity_before="$9" identity_after="${10}" mount_rw="${11}" propagation_clear="${12}" pid_stable="${13}" reported_runtime_mount="${14}"
             case "$id" in etc_hosts|etc_hostname|etc_resolv_conf) ;; *) return 2 ;; esac
-            case "$reported_runtime_mount" in consistent|unavailable) ;; *) return 1 ;; esac
+            case "$reported_runtime_mount" in consistent|unavailable|inconsistent) ;; *) return 1 ;; esac
             local complete=true value
             for value in "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable"; do
               [[ "$value" == true ]] || complete=false
             done
+            # The post-start report is corroborating evidence. Its absence is
+            # explicitly inconclusive, never an approval.
+            [[ "$reported_runtime_mount" == consistent ]] || complete=false
             printf 'docker_managed_etc id=%s metadata_present=%s source_regular=%s source_not_symlink=%s provenance_verified=%s source_stable=%s target_regular=%s target_not_symlink=%s identity_before=%s identity_after=%s mount_rw=%s propagation_clear=%s pid_stable=%s reported_runtime_mount=%s\n' \
               "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount"
             [[ "$complete" == true ]] || return 1
