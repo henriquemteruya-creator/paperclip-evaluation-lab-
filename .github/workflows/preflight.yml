@@ -404,23 +404,88 @@ jobs:
                 *) fail 'docker reported mounts parser failed' ;;
               esac
             fi
-            # Keep sources private: these values are used only for equality
-            # checks against the .Mounts report from this same container.
-            # This is an evidence-only correlation.  Docker does not promise
-            # that its generated /etc files appear in .Mounts while a
-            # container is merely created.  An inconclusive result is recorded
-            # as NO-GO, but does not override mandatory pre-start controls or
-            # suppress runtime evidence collection.
-            docker_hosts_path=''; docker_hostname_path=''; docker_resolv_path=''
+            # Keep sources private. These Docker-managed values may be
+            # lifecycle-dependent, so pre-start availability never gates the
+            # later runtime /proc collection.
+            docker_hosts_path_prestart=''; docker_hostname_path_prestart=''; docker_resolv_path_prestart=''
+            docker_hosts_path_runtime=''; docker_hostname_path_runtime=''; docker_resolv_path_runtime=''
+            metadata_prestart_etc_hosts_inspect_ok=false; metadata_prestart_etc_hosts_present=false
+            metadata_prestart_etc_hostname_inspect_ok=false; metadata_prestart_etc_hostname_present=false
+            metadata_prestart_etc_resolv_conf_inspect_ok=false; metadata_prestart_etc_resolv_conf_present=false
+            metadata_runtime_etc_hosts_inspect_ok=false; metadata_runtime_etc_hosts_present=false; metadata_runtime_etc_hosts_consistent=false
+            metadata_runtime_etc_hostname_inspect_ok=false; metadata_runtime_etc_hostname_present=false; metadata_runtime_etc_hostname_consistent=false
+            metadata_runtime_etc_resolv_conf_inspect_ok=false; metadata_runtime_etc_resolv_conf_present=false; metadata_runtime_etc_resolv_conf_consistent=false
+            # DOCKER_MANAGED_ETC_METADATA_PHASE_BEGIN
+            collect_docker_managed_etc_metadata_phase() {
+              local phase="$1" id template value inspect_ok=false present=false pre_value pre_present pre_inspect_ok consistent=false
+              for id in etc_hosts etc_hostname etc_resolv_conf; do
+                inspect_ok=false; present=false; consistent=false; value=''
+                case "$id" in
+                  etc_hosts) template='{{.HostsPath}}' ;;
+                  etc_hostname) template='{{.HostnamePath}}' ;;
+                  etc_resolv_conf) template='{{.ResolvConfPath}}' ;;
+                esac
+                if value="$(inspect_value "$template")"; then
+                  inspect_ok=true
+                  [[ -n "$value" ]] && present=true
+                else
+                  inspect_ok=false
+                fi
+                case "$phase:$id" in
+                  prestart:etc_hosts) docker_hosts_path_prestart="$value"; metadata_prestart_etc_hosts_inspect_ok="$inspect_ok"; metadata_prestart_etc_hosts_present="$present" ;;
+                  prestart:etc_hostname) docker_hostname_path_prestart="$value"; metadata_prestart_etc_hostname_inspect_ok="$inspect_ok"; metadata_prestart_etc_hostname_present="$present" ;;
+                  prestart:etc_resolv_conf) docker_resolv_path_prestart="$value"; metadata_prestart_etc_resolv_conf_inspect_ok="$inspect_ok"; metadata_prestart_etc_resolv_conf_present="$present" ;;
+                  runtime:etc_hosts)
+                    docker_hosts_path_runtime="$value"; metadata_runtime_etc_hosts_inspect_ok="$inspect_ok"; metadata_runtime_etc_hosts_present="$present"
+                    pre_value="$docker_hosts_path_prestart"; pre_present="$metadata_prestart_etc_hosts_present"; pre_inspect_ok="$metadata_prestart_etc_hosts_inspect_ok" ;;
+                  runtime:etc_hostname)
+                    docker_hostname_path_runtime="$value"; metadata_runtime_etc_hostname_inspect_ok="$inspect_ok"; metadata_runtime_etc_hostname_present="$present"
+                    pre_value="$docker_hostname_path_prestart"; pre_present="$metadata_prestart_etc_hostname_present"; pre_inspect_ok="$metadata_prestart_etc_hostname_inspect_ok" ;;
+                  runtime:etc_resolv_conf)
+                    docker_resolv_path_runtime="$value"; metadata_runtime_etc_resolv_conf_inspect_ok="$inspect_ok"; metadata_runtime_etc_resolv_conf_present="$present"
+                    pre_value="$docker_resolv_path_prestart"; pre_present="$metadata_prestart_etc_resolv_conf_present"; pre_inspect_ok="$metadata_prestart_etc_resolv_conf_inspect_ok" ;;
+                  *) return 2 ;;
+                esac
+                if [[ "$phase" == prestart ]]; then
+                  info "docker_managed_etc_metadata id=$id phase=prestart inspect_ok=$inspect_ok metadata_present=$present"
+                else
+                  # Empty pre-start metadata may become available after start.
+                  # Inspect failure or two differing present values is NO-GO.
+                  if [[ "$inspect_ok" == true && "$present" == true && "$pre_inspect_ok" == true ]] &&
+                     { [[ "$pre_present" == false ]] || [[ "$value" == "$pre_value" ]]; }; then consistent=true; fi
+                  case "$id" in
+                    etc_hosts) metadata_runtime_etc_hosts_consistent="$consistent" ;;
+                    etc_hostname) metadata_runtime_etc_hostname_consistent="$consistent" ;;
+                    etc_resolv_conf) metadata_runtime_etc_resolv_conf_consistent="$consistent" ;;
+                  esac
+                  info "docker_managed_etc_metadata id=$id phase=runtime inspect_ok=$inspect_ok metadata_present=$present phase_consistent=$consistent"
+                fi
+              done
+            }
+            runtime_docker_managed_etc_metadata_paths_available() {
+              local id inspect_ok present consistent paths_available=true
+              for id in etc_hosts etc_hostname etc_resolv_conf; do
+                case "$id" in
+                  etc_hosts) inspect_ok="$metadata_runtime_etc_hosts_inspect_ok"; present="$metadata_runtime_etc_hosts_present"; consistent="$metadata_runtime_etc_hosts_consistent" ;;
+                  etc_hostname) inspect_ok="$metadata_runtime_etc_hostname_inspect_ok"; present="$metadata_runtime_etc_hostname_present"; consistent="$metadata_runtime_etc_hostname_consistent" ;;
+                  etc_resolv_conf) inspect_ok="$metadata_runtime_etc_resolv_conf_inspect_ok"; present="$metadata_runtime_etc_resolv_conf_present"; consistent="$metadata_runtime_etc_resolv_conf_consistent" ;;
+                esac
+                if [[ "$inspect_ok" != true || "$present" != true ]]; then
+                  diagnostic_no_go "docker-managed etc runtime metadata unavailable_or_inspect_failed: $id"
+                  paths_available=false
+                fi
+                [[ "$consistent" == true ]] || diagnostic_no_go "docker-managed etc metadata phase inconsistent: $id"
+              done
+              [[ "$paths_available" == true ]]
+            }
+            # DOCKER_MANAGED_ETC_METADATA_PHASE_END
+            collect_docker_managed_etc_metadata_phase prestart
             if ! docker_special_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')" || \
-               ! docker_hosts_path="$(inspect_value '{{.HostsPath}}')" || \
-               ! docker_hostname_path="$(inspect_value '{{.HostnamePath}}')" || \
-               ! docker_resolv_path="$(inspect_value '{{.ResolvConfPath}}')" || \
                ! docker_readonly_rootfs="$(inspect_value '{{.HostConfig.ReadonlyRootfs}}')"; then
               record_docker_special_correlation_result inspect_error
             else
               set +e
-              docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_mounts" "$docker_hosts_path" "$docker_hostname_path" "$docker_resolv_path" "$docker_readonly_rootfs")"
+              docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_mounts" "$docker_hosts_path_prestart" "$docker_hostname_path_prestart" "$docker_resolv_path_prestart" "$docker_readonly_rootfs")"
               docker_special_rc=$?
               set -e
               while IFS= read -r docker_special_line; do
@@ -486,9 +551,9 @@ jobs:
               [[ -z "$destination" && -z "$mount_type" && -z "$mount_rw" && -z "$mount_source" && -z "$extra" ]] && continue
               if [[ -z "$destination" || -z "$mount_type" || -z "$mount_rw" || -z "$mount_source" || -n "$extra" ]]; then malformed=1; continue; fi
               case "$destination" in
-                /etc/hosts) id=etc_hosts; expected_source="$docker_hosts_path" ;;
-                /etc/hostname) id=etc_hostname; expected_source="$docker_hostname_path" ;;
-                /etc/resolv.conf) id=etc_resolv_conf; expected_source="$docker_resolv_path" ;;
+                /etc/hosts) id=etc_hosts; expected_source="$docker_hosts_path_runtime" ;;
+                /etc/hostname) id=etc_hostname; expected_source="$docker_hostname_path_runtime" ;;
+                /etc/resolv.conf) id=etc_resolv_conf; expected_source="$docker_resolv_path_runtime" ;;
                 /tmp|/run) [[ "$mount_type" == tmpfs && "$mount_rw" == true ]] || unexpected=1; continue ;;
                 *) unexpected=1; continue ;;
               esac
@@ -550,9 +615,9 @@ jobs:
             fi
             while IFS='|' read -r id destination; do
               source=''; case "$id" in
-                etc_hosts) source="$docker_hosts_path" ;;
-                etc_hostname) source="$docker_hostname_path" ;;
-                etc_resolv_conf) source="$docker_resolv_path" ;;
+                etc_hosts) source="$docker_hosts_path_runtime" ;;
+                etc_hostname) source="$docker_hostname_path_runtime" ;;
+                etc_resolv_conf) source="$docker_resolv_path_runtime" ;;
               esac
               local metadata_present=false source_regular=false source_nosymlink=false provenance=false source_stable=false target_regular=false target_nosymlink=false identity_before=false identity_after=false mount_rw=false propagation_clear=false pid_stable=false reported_runtime_mount=unavailable
               if [[ -n "$source" && -e "$source" && ! -L "$source" ]] && source_stat="$(stat -c '%F|%d|%i' "$source" 2>/dev/null)"; then
@@ -1148,10 +1213,9 @@ jobs:
               sleep 0.25
             done
             if [[ "$runtime_ready" == true ]]; then
-              if [[ -n "$docker_hosts_path" && -n "$docker_hostname_path" && -n "$docker_resolv_path" ]]; then
+              collect_docker_managed_etc_metadata_phase runtime
+              if runtime_docker_managed_etc_metadata_paths_available; then
                 collect_docker_managed_etc_runtime
-              else
-                diagnostic_no_go 'docker-managed etc runtime diagnostic metadata unavailable'
               fi
             else
               diagnostic_no_go 'docker-managed etc runtime diagnostic readiness timeout or start failure'
