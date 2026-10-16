@@ -180,6 +180,56 @@ awk '
 [[ -s "$docker_managed_etc_runtime" ]] || { printf 'FAIL Docker-managed /etc runtime diagnostic was not extracted from workflow\n' >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$docker_managed_etc_runtime"
+
+# Exercise the mount-record helper extracted from the real workflow. The
+# optional fixture parameter is test-only; production supplies /proc/PID.
+mount_record_fixture="$tmpdir/mount-record.fixture"
+printf '%s\n' '36 25 0:32 /hosts /etc/hosts rw,nosuid,nodev - ext4 /dev/loop0 rw' >"$mount_record_fixture"
+set +e; mount_record_for_target 999 /etc/hosts "$mount_record_fixture" >"$tmpdir/mount-record.out"; rc=$?; set -e
+assert_rc 0 "$rc" mount_record_single_cardinality_passes
+[[ "$(tr -d '[:space:]' <"$tmpdir/mount-record.out")" == 'true|true' ]] || { printf 'FAIL mount record values were not exact booleans\n' >&2; exit 1; }
+[[ "$(od -An -t x1 "$tmpdir/mount-record.out" | tr -d '[:space:]')" == '747275657c747275650a' ]] || { printf 'FAIL mount record did not terminate with one real newline\n' >&2; exit 1; }
+IFS='|' read -r mount_record_rw mount_record_propagation <"$tmpdir/mount-record.out"
+[[ "$mount_record_rw" == true && "$mount_record_propagation" == true ]] || { printf 'FAIL Bash did not receive exact mount-record booleans\n' >&2; exit 1; }
+printf 'PASS mount_record_real_newline_and_bash_values\n'
+
+printf '%s\n' '36 25 0:32 /hosts /etc/hosts ro,nosuid,nodev - ext4 /dev/loop0 ro' >"$mount_record_fixture"
+set +e; mount_record_flags="$(mount_record_for_target 999 /etc/hosts "$mount_record_fixture")"; rc=$?; set -e
+assert_rc 0 "$rc" mount_record_ro_is_observed
+[[ "$mount_record_flags" == 'false|true' ]] || { printf 'FAIL read-only mount record was parsed incorrectly\n' >&2; exit 1; }
+printf '%s\n' '36 25 0:32 /hosts /etc/hosts rw,nosuid shared:1 - ext4 /dev/loop0 rw' >"$mount_record_fixture"
+set +e; mount_record_flags="$(mount_record_for_target 999 /etc/hosts "$mount_record_fixture")"; rc=$?; set -e
+assert_rc 0 "$rc" mount_record_propagation_is_observed
+[[ "$mount_record_flags" == 'true|false' ]] || { printf 'FAIL propagation marker was parsed incorrectly\n' >&2; exit 1; }
+printf '%s\n' '36 25 0:32 /hosts /etc/hosts rw,nosuid - ext4 /dev/loop0 rw' '37 25 0:33 /hosts /etc/hosts rw,nosuid - ext4 /dev/loop1 rw' >"$mount_record_fixture"
+set +e; mount_record_for_target 999 /etc/hosts "$mount_record_fixture" >/dev/null; rc=$?; set -e
+assert_rc 1 "$rc" mount_record_duplicate_cardinality_is_no_go
+printf '%s\n' '36 25 0:32 /hosts /etc/hosts rw,nosuid' >"$mount_record_fixture"
+set +e; mount_record_for_target 999 /etc/hosts "$mount_record_fixture" >/dev/null; rc=$?; set -e
+assert_rc 1 "$rc" mount_record_malformed_is_no_go
+set +e; mount_record_for_target 999 /etc/hosts "$tmpdir/missing-mountinfo" >/dev/null; rc=$?; set -e
+(( rc >= 2 )) || { printf 'FAIL unreadable mountinfo did not remain an inspection error\n' >&2; exit 1; }
+printf 'PASS mount_record_read_failure_is_no_go\n'
+
+docker_hosts_path='/private/docker/hosts'
+docker_hostname_path='/private/docker/hostname'
+docker_resolv_path='/private/docker/resolv'
+reported_mounts_valid=$'/etc/hosts|bind|true|/private/docker/hosts\n/etc/hostname|bind|true|/private/docker/hostname\n/etc/resolv.conf|bind|true|/private/docker/resolv\n/tmp|tmpfs|true|tmpfs\n/run|tmpfs|true|tmpfs'
+reported_mount_status="$(runtime_reported_etc_mount_status "$reported_mounts_valid" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == consistent ]] || { printf 'FAIL exact valid Docker .Mounts fixture was not accepted\n' >&2; exit 1; }
+printf 'PASS runtime_mounts_exact_structured_match\n'
+reported_mount_duplicate="$reported_mounts_valid"$'\n/etc/hosts|bind|true|/private/docker/hosts'
+reported_mount_status="$(runtime_reported_etc_mount_status "$reported_mount_duplicate" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == inconsistent ]] || { printf 'FAIL duplicate Docker .Mounts record was accepted\n' >&2; exit 1; }
+reported_mount_partial=$'/etc/hosts|bind|true|/private/docker/hosts-unexpected'
+reported_mount_status="$(runtime_reported_etc_mount_status "$reported_mount_partial" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == inconsistent && "$reported_mount_status" != *private* ]] || { printf 'FAIL partial or raw Docker .Mounts value was accepted or leaked\n' >&2; exit 1; }
+reported_mount_extra="$reported_mounts_valid"$'\n/unknown-host-resource|bind|true|/private/docker/unknown'
+reported_mount_status="$(runtime_reported_etc_mount_status "$reported_mount_extra" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == inconsistent && "$reported_mount_status" != *unknown* ]] || { printf 'FAIL unexpected Docker .Mounts record was accepted or leaked\n' >&2; exit 1; }
+reported_mount_status="$(runtime_reported_etc_mount_status '' etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == unavailable ]] || { printf 'FAIL absent Docker .Mounts evidence was not unavailable\n' >&2; exit 1; }
+printf 'PASS runtime_mounts_missing_extra_and_contradictory_are_no_go\n'
 runtime_mask_shell="$tmpdir/runtime-mask-diagnostic.sh"
 awk '
   /RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN/ { in_program = 1; next }
@@ -500,7 +550,7 @@ printf 'PASS special_correlation_decision_is_fail_closed\n'
 # extracted from the workflow and accepts evidence only when every independent
 # predicate holds; callers must still record a final diagnostic NO-GO.
 etc_record_valid() {
-  validate_docker_managed_etc_record etc_hosts true true true true true true true true true true true unavailable
+  validate_docker_managed_etc_record etc_hosts true true true true true true true true true true true true unavailable
 }
 set +e; docker_etc_diagnostic="$(etc_record_valid)"; rc=$?; set -e
 assert_rc 0 "$rc" docker_managed_etc_complete_evidence_is_recognized
@@ -523,18 +573,20 @@ docker_etc_no_go() {
     exit 1
   }
 }
-docker_etc_no_go docker_etc_pid_unstable_is_no_go etc_hosts true true true true true true true true true true false unavailable
-docker_etc_no_go docker_etc_pid_reuse_starttime_change_is_no_go etc_hostname true true true true true true true true true true false unavailable
-docker_etc_no_go docker_etc_namespace_change_is_no_go etc_resolv_conf true true true true true true true true true true false unavailable
-docker_etc_no_go docker_etc_source_outside_root_is_no_go etc_hosts true true true false true true true true true true true unavailable
-docker_etc_no_go docker_etc_source_symlink_is_no_go etc_hosts true true false true true true true true true true true unavailable
-docker_etc_no_go docker_etc_target_symlink_is_no_go etc_hosts true true true true true false true true true true true unavailable
-docker_etc_no_go docker_etc_identity_mismatch_is_no_go etc_hosts true true true true true true false true true true true unavailable
-docker_etc_no_go docker_etc_mount_ro_is_no_go etc_hosts true true true true true true true true false true true unavailable
-docker_etc_no_go docker_etc_propagation_is_no_go etc_hosts true true true true true true true true true false true unavailable
-docker_etc_no_go docker_etc_runtime_report_inconsistent_is_no_go etc_hosts true true true true true true true true true true true inconsistent
-docker_etc_no_go docker_etc_proc_access_failure_is_no_go etc_hosts true true true true false false false false false false false unavailable
-set +e; validate_docker_managed_etc_record unknown_id true true true true true true true true true true true unavailable >/dev/null; rc=$?; set -e
+docker_etc_no_go docker_etc_pid_unstable_is_no_go etc_hosts true true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_pid_reuse_starttime_change_is_no_go etc_hostname true true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_namespace_change_is_no_go etc_resolv_conf true true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_source_outside_root_is_no_go etc_hosts true true true false true true true true true true true true unavailable
+docker_etc_no_go docker_etc_source_symlink_is_no_go etc_hosts true true false true true true true true true true true true unavailable
+docker_etc_no_go docker_etc_source_restat_changed_is_no_go etc_hosts true true true true false true true true true true true true unavailable
+docker_etc_no_go docker_etc_target_symlink_is_no_go etc_hosts true true true true true true false true true true true true unavailable
+docker_etc_no_go docker_etc_identity_mismatch_is_no_go etc_hosts true true true true true true true false true true true true unavailable
+docker_etc_no_go docker_etc_identity_after_restat_mismatch_is_no_go etc_hosts true true true true false true true true false true true true unavailable
+docker_etc_no_go docker_etc_mount_ro_is_no_go etc_hosts true true true true true true true true true false true true unavailable
+docker_etc_no_go docker_etc_propagation_is_no_go etc_hosts true true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_runtime_report_inconsistent_is_no_go etc_hosts true true true true true true true true true true true true inconsistent
+docker_etc_no_go docker_etc_proc_access_failure_is_no_go etc_hosts true true true true false false false false false false false false unavailable
+set +e; validate_docker_managed_etc_record unknown_id true true true true true true true true true true true true unavailable >/dev/null; rc=$?; set -e
 assert_rc 2 "$rc" docker_etc_unknown_id_is_parser_error
 
 # A synthetic source/inode sentinel is never passed to public diagnostics: the
