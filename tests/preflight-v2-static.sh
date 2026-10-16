@@ -240,13 +240,20 @@ set +e; snapshot_value="$(process_snapshot 2>"$tmpdir/process-snapshot.err")"; s
 assert_rc 0 "$snapshot_rc" process_snapshot_parses_spaces_and_parentheses
 [[ "$snapshot_value" == '4242|123456|mnt:[4026532999]' && ! -s "$tmpdir/process-snapshot.err" ]] || { printf 'FAIL process snapshot parsed wrong stat field or leaked a diagnostic\n' >&2; exit 1; }
 
-# Missing /proc metadata represents an access failure.  It must fail closed
+# Missing proc stat represents an access failure.  It must fail closed
 # and name only the fixed stage ID, never a PID or host path.
 snapshot_reset
 set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
 assert_rc 1 "$snapshot_rc" process_snapshot_proc_access_failure_is_no_go
 snapshot_log="$(<"$tmpdir/process-snapshot.err")"
-[[ "$snapshot_log" == 'INFO process_snapshot stage=proc_access state=failed' && "$snapshot_log" != *4242* && "$snapshot_log" != *"$snapshot_proc_root"* ]] || { printf 'FAIL process access diagnostic was not sanitized\n' >&2; exit 1; }
+[[ "$snapshot_log" == 'INFO process_snapshot stage=proc_stat_access state=failed' && "$snapshot_log" != *4242* && "$snapshot_log" != *"$snapshot_proc_root"* ]] || { printf 'FAIL process access diagnostic was not sanitized\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+rmdir "$snapshot_proc_root/4242/root"
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 1 "$snapshot_rc" process_snapshot_proc_root_failure_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=proc_root_access state=failed' ]] || { printf 'FAIL proc root failure stage was not reported\n' >&2; exit 1; }
 
 snapshot_reset
 write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
@@ -281,7 +288,7 @@ write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[40265329
 rm "$snapshot_proc_root/4242/ns/mnt"
 set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
 assert_rc 1 "$snapshot_rc" process_snapshot_namespace_failure_is_no_go
-[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=namespace state=failed' ]] || { printf 'FAIL namespace failure stage was not reported\n' >&2; exit 1; }
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=namespace_link state=failed' ]] || { printf 'FAIL namespace failure stage was not reported\n' >&2; exit 1; }
 
 snapshot_reset
 write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
