@@ -544,7 +544,7 @@ jobs:
               return 2
             fi
             IFS='|' read -r pid starttime mountns <<<"$before"
-            if ! raw_report="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\\n" .Destination .Type .RW .Source}}{{end}}')"; then
+            if ! raw_report="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')"; then
               diagnostic_no_go 'docker-managed etc runtime diagnostic runtime Mounts inspect failed'
               return 2
             fi
