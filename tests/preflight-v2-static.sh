@@ -171,6 +171,15 @@ awk '
 [[ -s "$preflight_decision_helpers" ]] || { printf 'FAIL preflight decision helpers were not extracted from workflow\n' >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$preflight_decision_helpers"
+docker_managed_etc_runtime="$tmpdir/docker-managed-etc-runtime.sh"
+awk '
+  /DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_BEGIN/ { in_program = 1; next }
+  /DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$docker_managed_etc_runtime"
+[[ -s "$docker_managed_etc_runtime" ]] || { printf 'FAIL Docker-managed /etc runtime diagnostic was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$docker_managed_etc_runtime"
 runtime_mask_shell="$tmpdir/runtime-mask-diagnostic.sh"
 awk '
   /RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN/ { in_program = 1; next }
@@ -486,6 +495,66 @@ diagnostic_findings=()
 final_verdict_is_go; rc=$?
 assert_rc 0 "$rc" clean_preflight_decision_is_go
 printf 'PASS special_correlation_decision_is_fail_closed\n'
+
+# The Docker-managed /etc diagnostic is observation-only.  Its validator is
+# extracted from the workflow and accepts evidence only when every independent
+# predicate holds; callers must still record a final diagnostic NO-GO.
+etc_record_valid() {
+  validate_docker_managed_etc_record etc_hosts true true true true true true true true true true true unavailable
+}
+set +e; docker_etc_diagnostic="$(etc_record_valid)"; rc=$?; set -e
+assert_rc 0 "$rc" docker_managed_etc_complete_evidence_is_recognized
+[[ "$docker_etc_diagnostic" == *'id=etc_hosts'*'provenance_verified=true'*'identity_before=true'*'identity_after=true'*'reported_runtime_mount=unavailable'* ]] || {
+  printf 'FAIL complete Docker-managed /etc diagnostic is incomplete\n' >&2
+  exit 1
+}
+hard_prestart_failures=()
+diagnostic_findings=()
+diagnostic_no_go 'docker-managed etc runtime evidence is diagnostic-only'
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" docker_etc_complete_evidence_preserves_final_no_go
+
+docker_etc_no_go() {
+  local label="$1"; shift
+  set +e; docker_etc_diagnostic="$(validate_docker_managed_etc_record "$@")"; rc=$?; set -e
+  assert_rc 1 "$rc" "$label"
+  [[ "$docker_etc_diagnostic" != *'/private/'* && "$docker_etc_diagnostic" != *'987654'* ]] || {
+    printf 'FAIL Docker-managed /etc diagnostic exposed raw fixture data\n' >&2
+    exit 1
+  }
+}
+docker_etc_no_go docker_etc_pid_unstable_is_no_go etc_hosts true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_pid_reuse_starttime_change_is_no_go etc_hostname true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_namespace_change_is_no_go etc_resolv_conf true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_source_outside_root_is_no_go etc_hosts true true true false true true true true true true true unavailable
+docker_etc_no_go docker_etc_source_symlink_is_no_go etc_hosts true true false true true true true true true true true unavailable
+docker_etc_no_go docker_etc_target_symlink_is_no_go etc_hosts true true true true true false true true true true true unavailable
+docker_etc_no_go docker_etc_identity_mismatch_is_no_go etc_hosts true true true true true true false true true true true unavailable
+docker_etc_no_go docker_etc_mount_ro_is_no_go etc_hosts true true true true true true true true false true true unavailable
+docker_etc_no_go docker_etc_propagation_is_no_go etc_hosts true true true true true true true true true false true unavailable
+docker_etc_no_go docker_etc_runtime_report_inconsistent_is_no_go etc_hosts true true true true true true true true true true true inconsistent
+docker_etc_no_go docker_etc_proc_access_failure_is_no_go etc_hosts true true true true false false false false false false false unavailable
+set +e; validate_docker_managed_etc_record unknown_id true true true true true true true true true true true unavailable >/dev/null; rc=$?; set -e
+assert_rc 2 "$rc" docker_etc_unknown_id_is_parser_error
+
+# A synthetic source/inode sentinel is never passed to public diagnostics: the
+# effective validator accepts only booleans and known IDs.  Its absence proves
+# fixture paths and identity numbers cannot leak through this log surface.
+docker_etc_sentinel='/private/docker-root/987654/sensitive-source'
+[[ "$docker_etc_diagnostic" != *"$docker_etc_sentinel"* && "$docker_etc_diagnostic" != *987654* ]] || {
+  printf 'FAIL Docker-managed /etc sanitization regression\n' >&2
+  exit 1
+}
+rg -Fq 'PAPERCLIP_PREFLIGHT_RUNTIME_READY' "$workflow"
+rg -Fq 'kill "$diagnostic_start_pid"' "$workflow"
+rg -Fq 'readiness timeout or start failure' "$workflow"
+rg -Fq '/proc/$pid/mountinfo' "$workflow"
+rg -Fq '/proc/$pid/root$destination' "$workflow"
+if rg -n '(^|[[:space:]])nsenter[[:space:]]+-|sudo[[:space:]]+.*nsenter' "$workflow"; then
+  printf 'FAIL Docker-managed /etc diagnostic unexpectedly uses nsenter\n' >&2
+  exit 1
+fi
+printf 'PASS docker_managed_etc_runtime_diagnostic_is_fail_closed\n'
 
 runtime_mask_valid=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
 printf '%s\n' "$runtime_mask_valid" >"$tmpdir/runtime-mask-valid"
