@@ -30,12 +30,21 @@ jobs:
 
           # This shell runs on the GitHub-hosted runner and is trusted only as
           # infrastructure.  No third-party source or script is invoked here.
-          failures=()
+          # Mandatory controls gate container start.  Diagnostic findings are
+          # fail-closed for the final verdict, but may be collected at runtime
+          # when all mandatory pre-start controls have passed.
+          hard_prestart_failures=()
+          diagnostic_findings=()
           container_id=''
           diagnostic_log=''
-          fail() { failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
+          fail() { hard_prestart_failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
+          diagnostic_no_go() { diagnostic_findings+=("$1"); printf 'DIAGNOSTIC-NO-GO %s\n' "$1"; }
           pass() { printf 'PASS %s\n' "$1"; }
           info() { printf 'INFO %s\n' "$1"; }
+          # PREFLIGHT_DECISION_HELPERS_BEGIN
+          runtime_collection_permitted() { (( ${#hard_prestart_failures[@]} == 0 )); }
+          final_verdict_is_go() { (( ${#hard_prestart_failures[@]} == 0 && ${#diagnostic_findings[@]} == 0 )); }
+          # PREFLIGHT_DECISION_HELPERS_END
           cleanup() {
             if [[ -n "$container_id" ]]; then
               docker rm --force "$container_id" >/dev/null 2>&1 || true
@@ -63,7 +72,7 @@ jobs:
           fi
 
           command -v docker >/dev/null 2>&1 || fail 'Docker client unavailable on runner'
-          if (( ${#failures[@]} == 0 )); then
+          if runtime_collection_permitted; then
             docker version --format '{{.Server.APIVersion}}' >/dev/null 2>&1 || fail 'Docker daemon unavailable on runner'
           fi
 
@@ -73,17 +82,17 @@ jobs:
           image='ghcr.io/nicolaka/netshoot:v0.16@sha256:147f2c4cb0aa7a741151bce2bfef71d9e1a04631636e24665ee2a5ed799feb47'
           expected_digest="${image##*@}"
 
-          if (( ${#failures[@]} == 0 )); then
+          if runtime_collection_permitted; then
             # Image acquisition is the only intentional runner egress.  It is
             # completed before the isolated diagnostic starts.
             docker pull "$image" >/dev/null 2>&1 || fail 'cannot pull pinned public diagnostic image'
           fi
-          if (( ${#failures[@]} == 0 )); then
+          if runtime_collection_permitted; then
             docker image inspect "$image" --format '{{join .RepoDigests "\n"}}' | \
               grep -Fq "@$expected_digest" || fail 'pulled image does not retain expected digest'
           fi
 
-          if (( ${#failures[@]} == 0 )); then
+          if runtime_collection_permitted; then
             # No --mount, --volume, --env-file, --privileged, --pid=host,
             # --ipc=host or --userns=host.  The two tmpfs mounts are explicit,
             # bounded scratch space; the root filesystem is read-only.
@@ -304,6 +313,16 @@ jobs:
             # independent Docker configuration or runtime mount allowlists.
             # Raw paths and sources remain in local shell variables and are
             # never written to the public workflow log.
+            # DOCKER_SPECIAL_CORRELATION_RESULT_BEGIN
+            record_docker_special_correlation_result() {
+              case "$1" in
+                inspect_error) diagnostic_no_go 'docker special-file diagnostic inspect inconclusive' ;;
+                0) info 'docker special-file correlation diagnostic complete; not a runtime authorization' ;;
+                1) diagnostic_no_go 'docker special-file correlation incomplete or unexpected' ;;
+                *) diagnostic_no_go 'docker special-file diagnostic parser inconclusive' ;;
+              esac
+            }
+            # DOCKER_SPECIAL_CORRELATION_RESULT_END
             diagnose_docker_special_files() {
               local entries="$1" hosts_path="$2" hostname_path="$3" resolv_path="$4" readonly_rootfs="$5"
               local destination mount_type mount_rw mount_source extra expected_source id
@@ -382,12 +401,17 @@ jobs:
             fi
             # Keep sources private: these values are used only for equality
             # checks against the .Mounts report from this same container.
+            # This is an evidence-only correlation.  Docker does not promise
+            # that its generated /etc files appear in .Mounts while a
+            # container is merely created.  An inconclusive result is recorded
+            # as NO-GO, but does not override mandatory pre-start controls or
+            # suppress runtime evidence collection.
             if ! docker_special_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')" || \
                ! docker_hosts_path="$(inspect_value '{{.HostsPath}}')" || \
                ! docker_hostname_path="$(inspect_value '{{.HostnamePath}}')" || \
                ! docker_resolv_path="$(inspect_value '{{.ResolvConfPath}}')" || \
                ! docker_readonly_rootfs="$(inspect_value '{{.HostConfig.ReadonlyRootfs}}')"; then
-              fail 'docker special-file diagnostic inspect failed'
+              record_docker_special_correlation_result inspect_error
             else
               set +e
               docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_mounts" "$docker_hosts_path" "$docker_hostname_path" "$docker_resolv_path" "$docker_readonly_rootfs")"
@@ -396,21 +420,17 @@ jobs:
               while IFS= read -r docker_special_line; do
                 [[ -n "$docker_special_line" ]] && info "$docker_special_line"
               done <<< "$docker_special_diagnostic"
-              case "$docker_special_rc" in
-                0) info 'docker special-file correlation diagnostic complete; not a runtime authorization' ;;
-                1) fail 'docker special-file correlation is incomplete or unexpected' ;;
-                *) fail 'docker special-file diagnostic parser failed' ;;
-              esac
+              record_docker_special_correlation_result "$docker_special_rc"
             fi
           fi
 
           diagnostic_rc=99
-          if (( ${#failures[@]} == 0 )); then
+          if runtime_collection_permitted; then
             if ! diagnostic_log="$(mktemp)"; then
               fail 'cannot create trusted host diagnostic log'
             fi
           fi
-          if (( ${#failures[@]} == 0 )); then
+          if runtime_collection_permitted; then
             # The heredoc is trusted workflow text.  It is the only payload
             # executed inside the isolated container.
             set +e
@@ -764,12 +784,12 @@ jobs:
               for (i in dirs) {
                 id = dirs[i]; seen = dir_seen[id] == 1 ? "true" : "false"
                 submount = dir_submount[id] == "true" ? "true" : "false"
-                printf "runtime_mask_directory id=%s cardinality_one=%s type_source_tmpfs=%s root_is_slash=%s per_mount_ro=%s propagation_markers_absent=%s submounts_unexpected=%s\\n", id, seen, dir_fs[id] ? dir_fs[id] : "false", dir_root[id] ? dir_root[id] : "false", dir_ro[id] ? dir_ro[id] : "false", dir_propagation[id] ? dir_propagation[id] : "false", submount
+                printf "runtime_mask_directory id=%s cardinality_one=%s type_source_tmpfs=%s root_is_slash=%s per_mount_ro=%s propagation_markers_absent=%s submounts_unexpected=%s\n", id, seen, dir_fs[id] ? dir_fs[id] : "false", dir_root[id] ? dir_root[id] : "false", dir_ro[id] ? dir_ro[id] : "false", dir_propagation[id] ? dir_propagation[id] : "false", submount
                 if (seen != "true" || submount != "false" || dir_fs[id] != "true" || dir_root[id] != "true" || dir_ro[id] != "true" || dir_propagation[id] != "true") bad = 1
               }
               for (i in files) {
                 id = files[i]; seen = file_seen[id] == 1 ? "true" : "false"
-                printf "runtime_mask_file id=%s cardinality_one=%s type_source_tmpfs=%s root_is_null=%s per_mount_rw=%s propagation_markers_absent=%s\\n", id, seen, file_fs[id] ? file_fs[id] : "false", file_root[id] ? file_root[id] : "false", file_rw[id] ? file_rw[id] : "false", file_propagation[id] ? file_propagation[id] : "false"
+                printf "runtime_mask_file id=%s cardinality_one=%s type_source_tmpfs=%s root_is_null=%s per_mount_rw=%s propagation_markers_absent=%s\n", id, seen, file_fs[id] ? file_fs[id] : "false", file_root[id] ? file_root[id] : "false", file_rw[id] ? file_rw[id] : "false", file_propagation[id] ? file_propagation[id] : "false"
                 if (seen != "true" || file_fs[id] != "true" || file_root[id] != "true" || file_rw[id] != "true" || file_propagation[id] != "true") bad = 1
               }
               exit bad ? 1 : 0
@@ -903,17 +923,17 @@ jobs:
             echo '- The summary is written by the trusted runner process, not the UID 10001 container process.'
             echo '- A pass validates only this diagnostic configuration; it does not authorize P01, P02 or P04.'
             echo
-            if (( ${#failures[@]} == 0 )); then
+            if final_verdict_is_go; then
               echo '### Verdict: GO for separate review of a later Paperclip test workflow only'
               echo '- P01/P02/P04 remain NO-GO pending explicit approval and a separately reviewed workflow.'
             else
               echo '### Verdict: NO-GO'
-              printf -- '- %s\n' "${failures[@]}"
+              printf -- '- %s\n' "${hard_prestart_failures[@]}" "${diagnostic_findings[@]}"
             fi
           })"
           if ! printf '%s\n' "$summary_payload" >> "$GITHUB_STEP_SUMMARY"; then
             fail 'cannot write GITHUB_STEP_SUMMARY from trusted runner process'
           fi
 
-          # Fail the GitHub Actions job when any mandatory requirement failed.
-          (( ${#failures[@]} == 0 ))
+          # Fail the job for any mandatory failure or diagnostic NO-GO.
+          final_verdict_is_go
