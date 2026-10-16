@@ -66,6 +66,28 @@ awk '
 [[ -s "$docker_special_files_diagnostic" ]] || { printf 'FAIL Docker special-file diagnostic was not extracted from workflow\n' >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$docker_special_files_diagnostic"
+docker_special_correlation_result="$tmpdir/docker-special-correlation-result.sh"
+awk '
+  /DOCKER_SPECIAL_CORRELATION_RESULT_BEGIN/ { in_program = 1; next }
+  /DOCKER_SPECIAL_CORRELATION_RESULT_END/ { exit }
+  in_program { sub(/^            /, ""); print }
+' "$workflow" >"$docker_special_correlation_result"
+[[ -s "$docker_special_correlation_result" ]] || { printf 'FAIL Docker special-file result handler was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$docker_special_correlation_result"
+# The extracted result handler depends only on these trusted workflow helpers;
+# keep the test stubs equivalent and silent so diagnostics never leak fixtures.
+diagnostic_no_go() { diagnostic_findings+=("$1"); }
+info() { :; }
+preflight_decision_helpers="$tmpdir/preflight-decision-helpers.sh"
+awk '
+  /PREFLIGHT_DECISION_HELPERS_BEGIN/ { in_program = 1; next }
+  /PREFLIGHT_DECISION_HELPERS_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$preflight_decision_helpers"
+[[ -s "$preflight_decision_helpers" ]] || { printf 'FAIL preflight decision helpers were not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$preflight_decision_helpers"
 runtime_mask_shell="$tmpdir/runtime-mask-diagnostic.sh"
 awk '
   /RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN/ { in_program = 1; next }
@@ -340,6 +362,48 @@ set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_spec
 assert_rc 2 "$rc" docker_special_malformed_readonly_metadata_is_no_go
 [[ "$docker_special_diagnostic" == docker_special_file_parser_error && "$docker_special_diagnostic" != *"$docker_special_sentinel"* ]] || { printf 'FAIL malformed special metadata was exposed\n' >&2; exit 1; }
 
+# An empty or partial .Mounts report is diagnostic-only: it must never be
+# treated as correlation evidence or turn the final verdict into GO, but it
+# also must not suppress runtime data collection after mandatory controls pass.
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files '' "$docker_special_sentinel/hosts" "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" true)"; rc=$?; set -e
+assert_rc 1 "$rc" docker_special_empty_mounts_is_inconclusive
+[[ "$docker_special_diagnostic" == *'cardinality_one=false'* && "$docker_special_diagnostic" != *"$docker_special_sentinel"* ]] || { printf 'FAIL empty special-mount report was not sanitized\n' >&2; exit 1; }
+
+printf -v docker_special_partial '%s\n%s' "/etc/hosts|bind|false|$docker_special_sentinel/hosts" "/etc/hostname|bind|false|$docker_special_sentinel/hostname"
+set +e; docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_partial" "$docker_special_sentinel/hosts" "$docker_special_sentinel/hostname" "$docker_special_sentinel/resolv" true)"; rc=$?; set -e
+assert_rc 1 "$rc" docker_special_partial_mounts_is_inconclusive
+
+hard_prestart_failures=()
+diagnostic_findings=()
+set +e; record_docker_special_correlation_result 1; rc=$?; set -e
+assert_rc 0 "$rc" docker_special_incomplete_result_is_recorded
+runtime_collection_permitted; rc=$?
+assert_rc 0 "$rc" incomplete_special_correlation_does_not_block_runtime_collection
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" incomplete_special_correlation_preserves_final_no_go
+[[ "${diagnostic_findings[*]}" == 'docker special-file correlation incomplete or unexpected' ]] || { printf 'FAIL incomplete special correlation was not recorded\n' >&2; exit 1; }
+
+hard_prestart_failures=()
+diagnostic_findings=()
+set +e; record_docker_special_correlation_result inspect_error; rc=$?; set -e
+assert_rc 0 "$rc" docker_special_inspect_error_is_recorded
+runtime_collection_permitted; rc=$?
+assert_rc 0 "$rc" special_inspect_error_does_not_block_runtime_collection
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" special_inspect_error_preserves_final_no_go
+
+hard_prestart_failures=('docker reported unexpected mount')
+diagnostic_findings=()
+set +e; runtime_collection_permitted; rc=$?; set -e
+assert_rc 1 "$rc" unexpected_mandatory_mount_blocks_runtime_collection
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" unexpected_mandatory_mount_preserves_final_no_go
+hard_prestart_failures=()
+diagnostic_findings=()
+final_verdict_is_go; rc=$?
+assert_rc 0 "$rc" clean_preflight_decision_is_go
+printf 'PASS special_correlation_decision_is_fail_closed\n'
+
 runtime_mask_valid=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
 printf '%s\n' "$runtime_mask_valid" >"$tmpdir/runtime-mask-valid"
 set +e; runtime_mask_diagnostic="$(runtime_mask_verdict "$tmpdir/runtime-mask-valid")"; rc=$?; set -e
@@ -348,6 +412,12 @@ assert_rc 0 "$rc" runtime_mask_metadata_complete
   printf 'FAIL runtime mask diagnostic lacks expected sanitized evidence\n' >&2
   exit 1
 }
+[[ "$runtime_mask_diagnostic" != *'\\n'* ]] || { printf 'FAIL runtime mask diagnostic contains literal newline escapes\n' >&2; exit 1; }
+runtime_mask_line_count="$(printf '%s\n' "$runtime_mask_diagnostic" | awk 'NF { count++ } END { print count + 0 }')"
+[[ "$runtime_mask_line_count" == 8 ]] || { printf 'FAIL runtime mask diagnostic expected 8 lines, got %s\n' "$runtime_mask_line_count" >&2; exit 1; }
+runtime_mask_record_count="$(printf '%s\n' "$runtime_mask_diagnostic" | grep -Ec '^runtime_mask_(directory|file) id=')"
+[[ "$runtime_mask_record_count" == 8 ]] || { printf 'FAIL runtime mask diagnostic expected 8 separate records, got %s\n' "$runtime_mask_record_count" >&2; exit 1; }
+printf 'PASS runtime_mask_diagnostic_has_eight_real_lines\n'
 
 runtime_mask_sentinel='/proc/acpi/unexpected-host-mount'
 runtime_mask_submount=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 36 8:1 / /proc/acpi/unexpected-host-mount rw - ext4 /private/source rw\n38 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n40 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n44 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
