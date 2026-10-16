@@ -419,6 +419,31 @@ runtime_mask_record_count="$(printf '%s\n' "$runtime_mask_diagnostic" | grep -Ec
 [[ "$runtime_mask_record_count" == 8 ]] || { printf 'FAIL runtime mask diagnostic expected 8 separate records, got %s\n' "$runtime_mask_record_count" >&2; exit 1; }
 printf 'PASS runtime_mask_diagnostic_has_eight_real_lines\n'
 
+# The runtime allowlist must accept only the eight observed mask records when
+# every mount-level predicate is satisfied.  Each negative fixture below calls
+# the AWK extracted from the workflow, not a duplicate implementation.
+set +e; mountinfo_verdict "$tmpdir/runtime-mask-valid" >/dev/null; rc=$?; set -e
+assert_rc 0 "$rc" verified_runtime_masks_pass_closed_allowlist
+mask_mountinfo_no_go() {
+  local label="$1" fixture="$2"
+  printf '%s\n' "$fixture" >"$tmpdir/mask-negative"
+  set +e; mountinfo_verdict "$tmpdir/mask-negative" >/dev/null; rc=$?; set -e
+  assert_rc 1 "$rc" "$label"
+}
+mask_mountinfo_no_go mask_directory_type_source_required $'36 25 0:32 / /proc/acpi ro - ext4 private rw\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_directory_root_required $'36 25 0:32 /wrong /proc/acpi ro - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_directory_access_required $'36 25 0:32 / /proc/acpi rw - tmpfs tmpfs rw\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_file_root_required $'36 25 0:32 / /proc/acpi ro - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /wrong /proc/interrupts rw - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_file_access_required $'36 25 0:32 / /proc/acpi ro - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts ro - tmpfs tmpfs ro\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_propagation_required $'36 25 0:32 / /proc/acpi ro shared:1 - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_submount_required $'36 25 0:32 / /proc/acpi ro - tmpfs tmpfs ro\n37 36 0:33 / /proc/acpi/child ro - tmpfs tmpfs ro\n38 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n39 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n40 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n44 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+mask_mountinfo_no_go mask_cardinality_required $'36 25 0:32 / /proc/acpi ro - tmpfs tmpfs ro\n37 25 0:32 / /proc/acpi ro - tmpfs tmpfs ro\n38 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n39 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n40 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n43 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw\n44 25 0:35 /null /proc/timer_list rw - tmpfs tmpfs rw'
+runtime_mask_missing=$'36 25 0:32 / /proc/acpi ro - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw - tmpfs tmpfs rw'
+printf '%s\n' "$runtime_mask_missing" >"$tmpdir/runtime-mask-missing"
+set +e; runtime_mask_verdict "$tmpdir/runtime-mask-missing" >/dev/null; rc=$?; set -e
+assert_rc 1 "$rc" mask_cardinality_missing_is_no_go
+printf 'PASS runtime_mask_closed_exceptions_are_regression_tested\n'
+
 runtime_mask_sentinel='/proc/acpi/unexpected-host-mount'
 runtime_mask_submount=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 36 8:1 / /proc/acpi/unexpected-host-mount rw - ext4 /private/source rw\n38 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n40 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n44 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
 printf '%s\n' "$runtime_mask_submount" >"$tmpdir/runtime-mask-submount"
