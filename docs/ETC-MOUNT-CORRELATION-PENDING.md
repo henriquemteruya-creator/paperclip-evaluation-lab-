@@ -47,6 +47,14 @@ effective `mountinfo`, object type, source/destination device+inode identity,
 and Docker-root provenance) is still collected so that a future review can
 inspect which layer was conclusive.
 
+The Docker-managed path metadata is separately sampled in `created` and again
+after `RUNTIME_READY` in `running`.  A false `metadata_present_prestart` does
+not block the runtime collector: a value may legitimately be materialized only
+after start.  The public log contains only the known ID plus boolean
+`inspect_ok`, `metadata_present`, and (at runtime) `phase_consistent`; it never
+prints a metadata path.  A runtime absence, inspection error, or a conflict
+between two present phase values is still diagnostic NO-GO.
+
 For the current diagnostic, however, `unavailable` is **not** sufficient for
 `evidence_complete`: the collector requires the structured post-start report
 to be `consistent` as corroboration.  This is deliberately conservative for
