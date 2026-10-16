@@ -190,6 +190,121 @@ awk '
 # shellcheck source=/dev/null
 source "$docker_managed_etc_runtime"
 
+# Extracted process snapshots must parse the actual /proc/PID/stat grammar,
+# including a comm field with spaces and closing parentheses.  Fixtures live
+# entirely below a temporary fake proc root; Docker is never invoked.
+process_snapshot_proc="$tmpdir/process-snapshot.sh"
+awk '
+  /PROCESS_SNAPSHOT_BEGIN/ { in_program = 1; next }
+  /PROCESS_SNAPSHOT_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$process_snapshot_proc"
+[[ -s "$process_snapshot_proc" ]] || { printf 'FAIL process snapshot logic was not extracted from workflow\n' >&2; exit 1; }
+bash -n "$process_snapshot_proc"
+# shellcheck source=/dev/null
+source "$process_snapshot_proc"
+
+declare -A snapshot_fixture=() snapshot_fixture_rc=()
+inspect_value() {
+  [[ "$1" == '{{.State.Running}}|{{.State.Pid}}|{{.Id}}' ]] || return 2
+  [[ "${snapshot_fixture_rc[state]:-0}" == 0 ]] || return 1
+  printf '%s' "${snapshot_fixture[state]:-}"
+}
+write_snapshot_fixture() {
+  local proc_root="$1" pid="$2" comm="$3" starttime="$4" mountns="$5" i value
+  mkdir -p "$proc_root/$pid/ns" "$proc_root/$pid/root"
+  {
+    printf '%s (%s) S' "$pid" "$comm"
+    for i in $(seq 1 49); do
+      value="$i"
+      [[ "$i" == 19 ]] && value="$starttime"
+      printf ' %s' "$value"
+    done
+    printf '\n'
+  } >"$proc_root/$pid/stat"
+  rm -f "$proc_root/$pid/ns/mnt"
+  ln -s "$mountns" "$proc_root/$pid/ns/mnt"
+}
+snapshot_reset() {
+  snapshot_proc_root="$tmpdir/fake-proc-$RANDOM"
+  mkdir -p "$snapshot_proc_root"
+  PREFLIGHT_PROC_ROOT="$snapshot_proc_root"
+  container_id='container-fixture-id'
+  snapshot_fixture=([state]='true|4242|container-fixture-id')
+  snapshot_fixture_rc=()
+  : >"$tmpdir/process-snapshot.err"
+}
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'worker name ) with parens' 123456 'mnt:[4026532999]'
+set +e; snapshot_value="$(process_snapshot 2>"$tmpdir/process-snapshot.err")"; snapshot_rc=$?; set -e
+assert_rc 0 "$snapshot_rc" process_snapshot_parses_spaces_and_parentheses
+[[ "$snapshot_value" == '4242|123456|mnt:[4026532999]' && ! -s "$tmpdir/process-snapshot.err" ]] || { printf 'FAIL process snapshot parsed wrong stat field or leaked a diagnostic\n' >&2; exit 1; }
+
+# Missing /proc metadata represents an access failure.  It must fail closed
+# and name only the fixed stage ID, never a PID or host path.
+snapshot_reset
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 1 "$snapshot_rc" process_snapshot_proc_access_failure_is_no_go
+snapshot_log="$(<"$tmpdir/process-snapshot.err")"
+[[ "$snapshot_log" == 'INFO process_snapshot stage=proc_access state=failed' && "$snapshot_log" != *4242* && "$snapshot_log" != *"$snapshot_proc_root"* ]] || { printf 'FAIL process access diagnostic was not sanitized\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+snapshot_fixture_rc[state]=1
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 2 "$snapshot_rc" process_snapshot_docker_inspect_failure_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=docker_inspect state=failed' ]] || { printf 'FAIL inspect failure stage was not reported\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+snapshot_fixture[state]='false|4242|container-fixture-id'
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 1 "$snapshot_rc" process_snapshot_not_running_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=state_running state=failed' ]] || { printf 'FAIL running-state failure stage was not reported\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+snapshot_fixture[state]='true|0|container-fixture-id'
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 1 "$snapshot_rc" process_snapshot_invalid_pid_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=pid state=failed' ]] || { printf 'FAIL PID failure stage was not reported\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+snapshot_fixture[state]='true|4242|different-container'
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 1 "$snapshot_rc" process_snapshot_container_identity_failure_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=container_identity state=failed' ]] || { printf 'FAIL container identity stage was not reported\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+rm "$snapshot_proc_root/4242/ns/mnt"
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 1 "$snapshot_rc" process_snapshot_namespace_failure_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=namespace state=failed' ]] || { printf 'FAIL namespace failure stage was not reported\n' >&2; exit 1; }
+
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+printf 'malformed stat\n' >"$snapshot_proc_root/4242/stat"
+set +e; process_snapshot >/dev/null 2>"$tmpdir/process-snapshot.err"; snapshot_rc=$?; set -e
+assert_rc 2 "$snapshot_rc" process_snapshot_malformed_stat_is_no_go
+[[ "$(<"$tmpdir/process-snapshot.err")" == 'INFO process_snapshot stage=parsing state=failed' ]] || { printf 'FAIL parser failure stage was not reported\n' >&2; exit 1; }
+
+# Starttime and mount namespace are part of the caller's equality check.  A
+# reused PID or a changed namespace therefore cannot look stable.
+snapshot_reset
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 123456 'mnt:[4026532999]'
+before_snapshot="$(process_snapshot)"
+write_snapshot_fixture "$snapshot_proc_root" 4242 'normal' 654321 'mnt:[4026532999]'
+after_snapshot="$(process_snapshot)"
+[[ "$before_snapshot" != "$after_snapshot" ]] || { printf 'FAIL reused PID with changed starttime looked stable\n' >&2; exit 1; }
+printf 'PASS process_snapshot_pid_reuse_is_detected\n'
+rm "$snapshot_proc_root/4242/ns/mnt"
+ln -s 'mnt:[4026533000]' "$snapshot_proc_root/4242/ns/mnt"
+namespace_changed_snapshot="$(process_snapshot)"
+[[ "$after_snapshot" != "$namespace_changed_snapshot" ]] || { printf 'FAIL changed mount namespace looked stable\n' >&2; exit 1; }
+printf 'PASS process_snapshot_namespace_change_is_detected\n'
+
 # The metadata phase gate is extracted from the workflow. These fixtures model
 # only inspect responses; they never invoke Docker or touch host paths.
 declare -A metadata_fixture_value=() metadata_fixture_rc=()
