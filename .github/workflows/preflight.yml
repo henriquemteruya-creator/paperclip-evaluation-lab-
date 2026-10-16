@@ -652,7 +652,7 @@ jobs:
               return "rw"
             }
             function requires_option(path, option) {
-              # Docker/runc's verified mask representation in run #6 did not
+              # The verified Docker and runc mask representation in run #6 did not
               # carry these flags per mount.  This exception is limited to the
               # eight destinations and is paired with all mask predicates.
               if (is_verified_mask(path)) return 0
