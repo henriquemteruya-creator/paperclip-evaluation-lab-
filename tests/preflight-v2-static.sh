@@ -171,6 +171,15 @@ awk '
 [[ -s "$preflight_decision_helpers" ]] || { printf 'FAIL preflight decision helpers were not extracted from workflow\n' >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$preflight_decision_helpers"
+docker_managed_etc_metadata_phase="$tmpdir/docker-managed-etc-metadata-phase.sh"
+awk '
+  /DOCKER_MANAGED_ETC_METADATA_PHASE_BEGIN/ { in_program = 1; next }
+  /DOCKER_MANAGED_ETC_METADATA_PHASE_END/ { exit }
+  in_program { sub(/^            /, ""); print }
+' "$workflow" >"$docker_managed_etc_metadata_phase"
+[[ -s "$docker_managed_etc_metadata_phase" ]] || { printf 'FAIL Docker-managed /etc metadata phase logic was not extracted from workflow\n' >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$docker_managed_etc_metadata_phase"
 docker_managed_etc_runtime="$tmpdir/docker-managed-etc-runtime.sh"
 awk '
   /DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_BEGIN/ { in_program = 1; next }
@@ -180,6 +189,90 @@ awk '
 [[ -s "$docker_managed_etc_runtime" ]] || { printf 'FAIL Docker-managed /etc runtime diagnostic was not extracted from workflow\n' >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$docker_managed_etc_runtime"
+
+# The metadata phase gate is extracted from the workflow. These fixtures model
+# only inspect responses; they never invoke Docker or touch host paths.
+declare -A metadata_fixture_value=() metadata_fixture_rc=()
+metadata_fixture_phase=''
+metadata_log=''
+inspect_value() {
+  local template="$1" id key
+  case "$template" in
+    '{{.HostsPath}}') id=etc_hosts ;;
+    '{{.HostnamePath}}') id=etc_hostname ;;
+    '{{.ResolvConfPath}}') id=etc_resolv_conf ;;
+    *) return 2 ;;
+  esac
+  key="$metadata_fixture_phase:$id"
+  [[ "${metadata_fixture_rc[$key]:-0}" == 0 ]] || return 1
+  printf '%s' "${metadata_fixture_value[$key]:-}"
+}
+info() { metadata_log+="$1"$'\n'; }
+metadata_reset() {
+  docker_hosts_path_prestart=''; docker_hostname_path_prestart=''; docker_resolv_path_prestart=''
+  docker_hosts_path_runtime=''; docker_hostname_path_runtime=''; docker_resolv_path_runtime=''
+  metadata_prestart_etc_hosts_inspect_ok=false; metadata_prestart_etc_hosts_present=false
+  metadata_prestart_etc_hostname_inspect_ok=false; metadata_prestart_etc_hostname_present=false
+  metadata_prestart_etc_resolv_conf_inspect_ok=false; metadata_prestart_etc_resolv_conf_present=false
+  metadata_runtime_etc_hosts_inspect_ok=false; metadata_runtime_etc_hosts_present=false; metadata_runtime_etc_hosts_consistent=false
+  metadata_runtime_etc_hostname_inspect_ok=false; metadata_runtime_etc_hostname_present=false; metadata_runtime_etc_hostname_consistent=false
+  metadata_runtime_etc_resolv_conf_inspect_ok=false; metadata_runtime_etc_resolv_conf_present=false; metadata_runtime_etc_resolv_conf_consistent=false
+  metadata_fixture_value=(); metadata_fixture_rc=(); metadata_log=''; diagnostic_findings=(); hard_prestart_failures=()
+}
+metadata_fixture_set_all() {
+  local phase="$1" suffix="$2"
+  metadata_fixture_value["$phase:etc_hosts"]="/private/metadata/$suffix/hosts"
+  metadata_fixture_value["$phase:etc_hostname"]="/private/metadata/$suffix/hostname"
+  metadata_fixture_value["$phase:etc_resolv_conf"]="/private/metadata/$suffix/resolv"
+}
+metadata_reset
+metadata_fixture_phase=prestart
+collect_docker_managed_etc_metadata_phase prestart
+metadata_fixture_set_all runtime stable
+metadata_fixture_phase=runtime
+collect_docker_managed_etc_metadata_phase runtime
+set +e; runtime_docker_managed_etc_metadata_paths_available; rc=$?; set -e
+assert_rc 0 "$rc" runtime_metadata_prestart_empty_runtime_present_allows_collection
+[[ "$metadata_runtime_etc_hosts_consistent" == true && "$metadata_runtime_etc_hostname_consistent" == true && "$metadata_runtime_etc_resolv_conf_consistent" == true && -z "${diagnostic_findings[*]}" ]] || { printf 'FAIL lifecycle metadata availability was not recorded consistently\n' >&2; exit 1; }
+[[ "$metadata_log" == *'id=etc_hosts phase=prestart inspect_ok=true metadata_present=false'* && "$metadata_log" == *'id=etc_hosts phase=runtime inspect_ok=true metadata_present=true phase_consistent=true'* && "$metadata_log" != *'/private/metadata/'* ]] || { printf 'FAIL metadata phase diagnostics leaked a path or omitted a boolean\n' >&2; exit 1; }
+
+metadata_reset
+metadata_fixture_phase=prestart; collect_docker_managed_etc_metadata_phase prestart
+metadata_fixture_phase=runtime; collect_docker_managed_etc_metadata_phase runtime
+set +e; runtime_docker_managed_etc_metadata_paths_available; rc=$?; set -e
+assert_rc 1 "$rc" runtime_metadata_absent_in_both_phases_is_no_go
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" runtime_metadata_absent_preserves_final_no_go
+
+metadata_reset
+metadata_fixture_set_all prestart stable
+metadata_fixture_phase=prestart; collect_docker_managed_etc_metadata_phase prestart
+metadata_fixture_set_all runtime stable
+metadata_fixture_value['runtime:etc_hostname']=''
+metadata_fixture_phase=runtime; collect_docker_managed_etc_metadata_phase runtime
+set +e; runtime_docker_managed_etc_metadata_paths_available; rc=$?; set -e
+assert_rc 1 "$rc" runtime_metadata_partial_absence_is_no_go
+
+metadata_reset
+metadata_fixture_set_all prestart stable
+metadata_fixture_phase=prestart; collect_docker_managed_etc_metadata_phase prestart
+metadata_fixture_set_all runtime stable
+metadata_fixture_rc['runtime:etc_resolv_conf']=1
+metadata_fixture_phase=runtime; collect_docker_managed_etc_metadata_phase runtime
+set +e; runtime_docker_managed_etc_metadata_paths_available; rc=$?; set -e
+assert_rc 1 "$rc" runtime_metadata_inspect_error_is_no_go
+
+metadata_reset
+metadata_fixture_set_all prestart before
+metadata_fixture_phase=prestart; collect_docker_managed_etc_metadata_phase prestart
+metadata_fixture_set_all runtime after
+metadata_fixture_phase=runtime; collect_docker_managed_etc_metadata_phase runtime
+set +e; runtime_docker_managed_etc_metadata_paths_available; rc=$?; set -e
+assert_rc 0 "$rc" runtime_metadata_conflict_does_not_suppress_kernel_collection
+[[ "${diagnostic_findings[*]}" != *'/private/'* && "${diagnostic_findings[*]}" == *'metadata phase inconsistent: etc_hosts'* ]] || { printf 'FAIL metadata conflict was not sanitized and recorded\n' >&2; exit 1; }
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" runtime_metadata_conflict_preserves_final_no_go
+printf 'PASS runtime_metadata_phase_gate_is_extracted_and_fail_closed\n'
 
 # Exercise the mount-record helper extracted from the real workflow. The
 # optional fixture parameter is test-only; production supplies /proc/PID.
@@ -214,6 +307,9 @@ printf 'PASS mount_record_read_failure_is_no_go\n'
 docker_hosts_path='/private/docker/hosts'
 docker_hostname_path='/private/docker/hostname'
 docker_resolv_path='/private/docker/resolv'
+docker_hosts_path_runtime="$docker_hosts_path"
+docker_hostname_path_runtime="$docker_hostname_path"
+docker_resolv_path_runtime="$docker_resolv_path"
 
 # Extract the exact post-start inspect template.  The constrained offline
 # renderer intentionally accepts only the exact template grammar that the
