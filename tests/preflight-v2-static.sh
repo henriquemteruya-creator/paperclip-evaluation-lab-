@@ -550,11 +550,11 @@ printf 'PASS special_correlation_decision_is_fail_closed\n'
 # extracted from the workflow and accepts evidence only when every independent
 # predicate holds; callers must still record a final diagnostic NO-GO.
 etc_record_valid() {
-  validate_docker_managed_etc_record etc_hosts true true true true true true true true true true true true unavailable
+  validate_docker_managed_etc_record etc_hosts true true true true true true true true true true true true consistent
 }
 set +e; docker_etc_diagnostic="$(etc_record_valid)"; rc=$?; set -e
 assert_rc 0 "$rc" docker_managed_etc_complete_evidence_is_recognized
-[[ "$docker_etc_diagnostic" == *'id=etc_hosts'*'provenance_verified=true'*'identity_before=true'*'identity_after=true'*'reported_runtime_mount=unavailable'* ]] || {
+[[ "$docker_etc_diagnostic" == *'id=etc_hosts'*'provenance_verified=true'*'source_stable=true'*'identity_before=true'*'identity_after=true'*'reported_runtime_mount=consistent'* ]] || {
   printf 'FAIL complete Docker-managed /etc diagnostic is incomplete\n' >&2
   exit 1
 }
@@ -584,6 +584,7 @@ docker_etc_no_go docker_etc_identity_mismatch_is_no_go etc_hosts true true true 
 docker_etc_no_go docker_etc_identity_after_restat_mismatch_is_no_go etc_hosts true true true true false true true true false true true true unavailable
 docker_etc_no_go docker_etc_mount_ro_is_no_go etc_hosts true true true true true true true true true false true true unavailable
 docker_etc_no_go docker_etc_propagation_is_no_go etc_hosts true true true true true true true true true true true false unavailable
+docker_etc_no_go docker_etc_runtime_report_unavailable_is_no_go etc_hosts true true true true true true true true true true true true unavailable
 docker_etc_no_go docker_etc_runtime_report_inconsistent_is_no_go etc_hosts true true true true true true true true true true true true inconsistent
 docker_etc_no_go docker_etc_proc_access_failure_is_no_go etc_hosts true true true true false false false false false false false false unavailable
 set +e; validate_docker_managed_etc_record unknown_id true true true true true true true true true true true true unavailable >/dev/null; rc=$?; set -e
