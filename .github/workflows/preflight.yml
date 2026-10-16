@@ -37,6 +37,7 @@ jobs:
           diagnostic_findings=()
           container_id=''
           diagnostic_log=''
+          diagnostic_start_pid=''
           fail() { hard_prestart_failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
           diagnostic_no_go() { diagnostic_findings+=("$1"); printf 'DIAGNOSTIC-NO-GO %s\n' "$1"; }
           pass() { printf 'PASS %s\n' "$1"; }
@@ -46,6 +47,10 @@ jobs:
           final_verdict_is_go() { (( ${#hard_prestart_failures[@]} == 0 && ${#diagnostic_findings[@]} == 0 )); }
           # PREFLIGHT_DECISION_HELPERS_END
           cleanup() {
+            if [[ -n "$diagnostic_start_pid" ]]; then
+              kill "$diagnostic_start_pid" >/dev/null 2>&1 || true
+              wait "$diagnostic_start_pid" >/dev/null 2>&1 || true
+            fi
             if [[ -n "$container_id" ]]; then
               docker rm --force "$container_id" >/dev/null 2>&1 || true
             fi
@@ -406,6 +411,7 @@ jobs:
             # container is merely created.  An inconclusive result is recorded
             # as NO-GO, but does not override mandatory pre-start controls or
             # suppress runtime evidence collection.
+            docker_hosts_path=''; docker_hostname_path=''; docker_resolv_path=''
             if ! docker_special_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')" || \
                ! docker_hosts_path="$(inspect_value '{{.HostsPath}}')" || \
                ! docker_hostname_path="$(inspect_value '{{.HostnamePath}}')" || \
@@ -424,6 +430,118 @@ jobs:
             fi
           fi
 
+          # DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_BEGIN
+          # Observational only: this never changes the runtime mount allowlist.
+          # All raw Docker paths, process identifiers, namespace links, device
+          # numbers and inode values remain in local variables or private files.
+          # The runner observes /proc/PID directly; it does not nsenter or run a
+          # command with the container root as its filesystem root.
+          docker_managed_etc_ids=$'etc_hosts|/etc/hosts\netc_hostname|/etc/hostname\netc_resolv_conf|/etc/resolv.conf'
+          etc_runtime_records=''
+          process_snapshot() {
+            local sample pid starttime mountns identity
+            if ! sample="$(inspect_value '{{.State.Running}}|{{.State.Pid}}|{{.Id}}')"; then return 2; fi
+            IFS='|' read -r running pid identity <<<"$sample"
+            [[ "$running" == true && "$pid" =~ ^[1-9][0-9]*$ && "$identity" == "$container_id" ]] || return 1
+            [[ -r "/proc/$pid/stat" && -L "/proc/$pid/ns/mnt" && -d "/proc/$pid/root" ]] || return 1
+            if ! starttime="$(awk '{ sub(/^.*\\) /, ""); print $20 }' "/proc/$pid/stat" 2>/dev/null)" ||
+               ! mountns="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)"; then return 2; fi
+            [[ "$starttime" =~ ^[1-9][0-9]*$ && -n "$mountns" ]] || return 1
+            printf '%s|%s|%s\n' "$pid" "$starttime" "$mountns"
+          }
+          path_components_are_non_symlink() {
+            local candidate="$1" root="$2" relative part cursor
+            [[ "$candidate" == "$root"/* ]] || return 1
+            relative="${candidate#"$root"/}"; cursor="$root"
+            [[ ! -L "$cursor" ]] || return 1
+            IFS=/ read -r -a parts <<<"$relative"
+            for part in "${parts[@]}"; do
+              [[ -n "$part" ]] || return 1
+              cursor="$cursor/$part"
+              [[ ! -L "$cursor" ]] || return 1
+            done
+          }
+          mount_record_for_target() {
+            local pid="$1" target="$2"
+            awk -v wanted="$target" '
+              function has(options, flag, n, a, i) { n=split(options,a,","); for(i=1;i<=n;i++) if(a[i]==flag)return 1; return 0 }
+              $5 == wanted {
+                seen++
+                separator=0; for(i=7;i<=NF;i++) if($i=="-"){separator=i;break}
+                if (!separator || separator + 3 > NF) { malformed=1; next }
+                rw=(has($6,"rw") && !has($6,"ro"))
+                propagation_clear=1; for(i=7;i<separator;i++) if($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) propagation_clear=0
+              }
+              END { if (seen != 1 || malformed) exit 1; printf "%s|%s\\n", rw ? "true" : "false", propagation_clear ? "true" : "false" }
+            ' "/proc/$pid/mountinfo" 2>/dev/null
+          }
+          # A record is passed only after raw host and /proc observations were
+          # made.  It is deliberately strict and emits known IDs and booleans.
+          validate_docker_managed_etc_record() {
+            local id="$1" metadata_present="$2" source_regular="$3" source_nosymlink="$4" provenance="$5" target_regular="$6" target_nosymlink="$7" identity_before="$8" identity_after="$9" mount_rw="${10}" propagation_clear="${11}" pid_stable="${12}" reported_runtime_mount="${13}"
+            case "$id" in etc_hosts|etc_hostname|etc_resolv_conf) ;; *) return 2 ;; esac
+            case "$reported_runtime_mount" in consistent|unavailable) ;; *) return 1 ;; esac
+            local complete=true value
+            for value in "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable"; do
+              [[ "$value" == true ]] || complete=false
+            done
+            printf 'docker_managed_etc id=%s metadata_present=%s source_regular=%s source_not_symlink=%s provenance_verified=%s target_regular=%s target_not_symlink=%s identity_before=%s identity_after=%s mount_rw=%s propagation_clear=%s pid_stable=%s reported_runtime_mount=%s\n' \
+              "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount"
+            [[ "$complete" == true ]] || return 1
+          }
+          collect_docker_managed_etc_runtime() {
+            local docker_root canonical_docker_root before after pid starttime mountns id destination source canonical_source source_stat target_stat source_type target_type source_devino target_devino mount_flags report raw_report status
+            if ! docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)" ||
+               ! canonical_docker_root="$(readlink -f -- "$docker_root" 2>/dev/null)" ||
+               [[ -z "$docker_root" || "$docker_root" != "$canonical_docker_root" || -L "$docker_root" || ! -d "$docker_root" ]]; then
+              diagnostic_no_go 'docker-managed etc runtime diagnostic DockerRootDir unavailable'
+              return 2
+            fi
+            if ! before="$(process_snapshot)"; then
+              diagnostic_no_go 'docker-managed etc runtime diagnostic process snapshot unavailable'
+              return 2
+            fi
+            IFS='|' read -r pid starttime mountns <<<"$before"
+            if ! raw_report="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\\n" .Destination .Type .RW .Source}}{{end}}')"; then
+              diagnostic_no_go 'docker-managed etc runtime diagnostic runtime Mounts inspect failed'
+              return 2
+            fi
+            while IFS='|' read -r id destination; do
+              source=''; case "$id" in
+                etc_hosts) source="$docker_hosts_path" ;;
+                etc_hostname) source="$docker_hostname_path" ;;
+                etc_resolv_conf) source="$docker_resolv_path" ;;
+              esac
+              local metadata_present=false source_regular=false source_nosymlink=false provenance=false target_regular=false target_nosymlink=false identity_before=false identity_after=false mount_rw=false propagation_clear=false pid_stable=false reported_runtime_mount=unavailable
+              if [[ -n "$source" && -e "$source" && ! -L "$source" ]] && source_stat="$(stat -c '%F|%d|%i' "$source" 2>/dev/null)"; then
+                metadata_present=true; IFS='|' read -r source_type source_devino <<<"${source_stat%%|*}|${source_stat#*|}"
+                [[ "$source_type" == 'regular file' ]] && source_regular=true; source_nosymlink=true
+                if canonical_source="$(readlink -f -- "$source" 2>/dev/null)" &&
+                   [[ "$source" == "$canonical_source" && "$source" == "$docker_root"/* && "$source" == *"/$container_id/"* ]] &&
+                   path_components_are_non_symlink "$source" "$docker_root"; then provenance=true; fi
+              fi
+              if [[ -e "/proc/$pid/root$destination" && ! -L "/proc/$pid/root$destination" ]] && target_stat="$(stat -c '%F|%d|%i' "/proc/$pid/root$destination" 2>/dev/null)"; then
+                IFS='|' read -r target_type target_devino <<<"${target_stat%%|*}|${target_stat#*|}"
+                [[ "$target_type" == 'regular file' ]] && target_regular=true; target_nosymlink=true
+                [[ -n "${source_devino:-}" && "$source_devino" == "$target_devino" ]] && identity_before=true
+              fi
+              if mount_flags="$(mount_record_for_target "$pid" "$destination")"; then IFS='|' read -r mount_rw propagation_clear <<<"$mount_flags"; fi
+              if grep -Fq "$destination|bind|true|$source" <<<"$raw_report"; then reported_runtime_mount=consistent
+              elif [[ -n "$raw_report" ]]; then reported_runtime_mount=inconsistent; fi
+              if after="$(process_snapshot)" && [[ "$after" == "$before" ]]; then
+                pid_stable=true
+                if [[ -e "/proc/$pid/root$destination" && ! -L "/proc/$pid/root$destination" ]] && target_stat="$(stat -c '%F|%d|%i' "/proc/$pid/root$destination" 2>/dev/null)"; then
+                  IFS='|' read -r target_type target_devino <<<"${target_stat%%|*}|${target_stat#*|}"
+                  [[ -n "${source_devino:-}" && "$source_devino" == "$target_devino" ]] && identity_after=true
+                fi
+              fi
+              set +e; status="$(validate_docker_managed_etc_record "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount")"; local rc=$?; set -e
+              while IFS= read -r line; do [[ -n "$line" ]] && info "$line"; done <<<"$status"
+              (( rc == 0 )) || diagnostic_no_go "docker-managed etc runtime evidence incomplete: $id"
+            done <<<"$docker_managed_etc_ids"
+          }
+          # DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_END
+
           diagnostic_rc=99
           if runtime_collection_permitted; then
             if ! diagnostic_log="$(mktemp)"; then
@@ -433,13 +551,21 @@ jobs:
           if runtime_collection_permitted; then
             # The heredoc is trusted workflow text.  It is the only payload
             # executed inside the isolated container.
+            # It runs in the background solely so the trusted runner can read
+            # /proc/PID while the process is alive; no command is injected
+            # after start and no nsenter is used.
             set +e
-            docker start --attach --interactive "$container_id" >"$diagnostic_log" 2>&1 <<'DIAGNOSTIC'
+            docker start --attach --interactive "$container_id" >"$diagnostic_log" 2>&1 <<'DIAGNOSTIC' &
           set -Eeuo pipefail
           bad=0
           probe_pass() { printf 'PASS %s\n' "$1"; }
           probe_fail() { printf 'FAIL %s\n' "$1"; bad=1; }
           verify() { local name="$1"; shift; if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi; }
+
+          # Synchronization only.  This is not evidence and it gives the
+          # trusted runner a bounded observation window for /proc/PID.
+          printf '%s\n' PAPERCLIP_PREFLIGHT_RUNTIME_READY
+          sleep 12
 
           for tool in bash openssl curl nc getent ip awk grep find readlink timeout id cat stat; do
             command -v "$tool" >/dev/null 2>&1 || probe_fail "required_tool_missing_${tool}"
@@ -457,6 +583,19 @@ jobs:
             $5 == "/" { n=split($6, opts, ","); for (i=1; i<=n; i++) if (opts[i] == "ro") ok=1 }
             END { exit !ok }
           ' /proc/self/mountinfo
+          # These inspect access only; they never read content or attempt a
+          # write.  rw is a mount-level property checked by the runner, while
+          # user_writable is the effective permission of UID 10001.
+          for etc_item in 'etc_hosts|/etc/hosts' 'etc_hostname|/etc/hostname' 'etc_resolv_conf|/etc/resolv.conf'; do
+            IFS='|' read -r etc_id etc_path <<<"$etc_item"
+            etc_regular=false; etc_symlink=false; etc_readable=false; etc_user_writable=false
+            [[ -L "$etc_path" ]] && etc_symlink=true
+            [[ -f "$etc_path" && "$etc_symlink" == false ]] && etc_regular=true
+            [[ -r "$etc_path" ]] && etc_readable=true
+            [[ -w "$etc_path" ]] && etc_user_writable=true
+            printf 'runtime_etc_user_access id=%s object_regular=%s object_symlink=%s user_readable=%s user_writable=%s\n' "$etc_id" "$etc_regular" "$etc_symlink" "$etc_readable" "$etc_user_writable"
+            [[ "$etc_regular" == true && "$etc_symlink" == false && "$etc_readable" == true && "$etc_user_writable" == false ]] || probe_fail "runtime_etc_user_access_inconclusive_${etc_id}"
+          done
           verify tmpfs_tmp_is_writable bash -c 'touch /tmp/preflight-write-test && rm /tmp/preflight-write-test'
           verify cgroup_memory_lte_512MiB bash -c 'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -le 536870912 ]]'
           verify cgroup_pids_lte_128 bash -c 'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -le 128 ]]'
@@ -942,7 +1081,28 @@ jobs:
           (( bad == 0 )) || exit 86
           printf '%s\n' 'PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE'
           DIAGNOSTIC
+            diagnostic_start_pid=$!
+            runtime_ready=false
+            for _ in $(seq 1 48); do
+              if grep -Fqx 'PAPERCLIP_PREFLIGHT_RUNTIME_READY' "$diagnostic_log" 2>/dev/null; then
+                runtime_ready=true
+                break
+              fi
+              kill -0 "$diagnostic_start_pid" >/dev/null 2>&1 || break
+              sleep 0.25
+            done
+            if [[ "$runtime_ready" == true ]]; then
+              if [[ -n "$docker_hosts_path" && -n "$docker_hostname_path" && -n "$docker_resolv_path" ]]; then
+                collect_docker_managed_etc_runtime
+              else
+                diagnostic_no_go 'docker-managed etc runtime diagnostic metadata unavailable'
+              fi
+            else
+              diagnostic_no_go 'docker-managed etc runtime diagnostic readiness timeout or start failure'
+            fi
+            wait "$diagnostic_start_pid"
             start_rc=$?
+            diagnostic_start_pid=''
             set -e
             cat "$diagnostic_log"
             if ! diagnostic_rc="$(inspect_value '{{.State.ExitCode}}')"; then
