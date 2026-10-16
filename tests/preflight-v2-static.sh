@@ -214,6 +214,90 @@ printf 'PASS mount_record_read_failure_is_no_go\n'
 docker_hosts_path='/private/docker/hosts'
 docker_hostname_path='/private/docker/hostname'
 docker_resolv_path='/private/docker/resolv'
+
+# Extract the exact post-start inspect template.  The constrained offline
+# renderer intentionally accepts only the exact template grammar that the
+# workflow uses; it decodes the Go double-quoted printf format and produces
+# records that are then consumed by the extracted shell parser below.  This
+# validates the newline semantics without Docker or a Go toolchain.
+runtime_mounts_template="$(python3 - "$workflow" <<'PY'
+import re
+import sys
+
+source = open(sys.argv[1], encoding="utf-8").read()
+matches = re.findall(r'''raw_report="\$\(inspect_value '([^']+)'\)"''', source)
+if len(matches) != 1:
+    raise SystemExit(2)
+print(matches[0])
+PY
+)" || { printf 'FAIL runtime .Mounts template extraction failed\n' >&2; exit 1; }
+render_runtime_mounts_template() {
+  local records_json="$1"
+  RUNTIME_MOUNTS_TEMPLATE="$runtime_mounts_template" python3 - "$records_json" <<'PY'
+import json
+import os
+import re
+import sys
+
+template = os.environ["RUNTIME_MOUNTS_TEMPLATE"]
+expected = '{{range .Mounts}}{{printf "%s|%s|%t|%s\\n" .Destination .Type .RW .Source}}{{end}}'
+if template != expected:
+    raise SystemExit(2)
+# Decode the real Go string literal. The accepted grammar is intentionally
+# closed: any structural/template edit requires updating this test explicitly.
+format_match = re.fullmatch(r'\{\{range \.Mounts\}\}\{\{printf "(.*)" \.Destination \.Type \.RW \.Source\}\}\{\{end\}\}', template)
+if not format_match:
+    raise SystemExit(2)
+format_string = json.loads('"' + format_match.group(1) + '"')
+if format_string != '%s|%s|%t|%s\n':
+    raise SystemExit(2)
+records = json.loads(sys.argv[1])
+if not isinstance(records, list):
+    raise SystemExit(2)
+for record in records:
+    if set(record) != {"Destination", "Type", "RW", "Source"}:
+        raise SystemExit(2)
+    if not all(isinstance(record[key], str) for key in ("Destination", "Type", "Source")) or not isinstance(record["RW"], bool):
+        raise SystemExit(2)
+    # Go's %t has the same lower-case boolean rendering required here; Python
+    # has no %t, so translate only after the exact Go format was verified.
+    python_format = format_string.replace('%t', '%s')
+    sys.stdout.write(python_format % (record["Destination"], record["Type"], str(record["RW"]).lower(), record["Source"]))
+PY
+}
+
+render_runtime_mounts_template '[{"Destination":"/etc/hosts","Type":"bind","RW":true,"Source":"/private/docker/hosts"}]' >"$tmpdir/rendered-mounts-one"
+[[ "$(od -An -t x1 "$tmpdir/rendered-mounts-one" | tr -d '[:space:]')" == '2f6574632f686f7374737c62696e647c747275657c2f707269766174652f646f636b65722f686f7374730a' ]] || {
+  printf 'FAIL extracted .Mounts template did not render one real newline\n' >&2; exit 1;
+}
+rendered_mounts_one="$(cat "$tmpdir/rendered-mounts-one")"
+reported_mount_status="$(runtime_reported_etc_mount_status "$rendered_mounts_one" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == consistent ]] || { printf 'FAIL rendered single .Mounts record was not accepted\n' >&2; exit 1; }
+
+render_runtime_mounts_template '[{"Destination":"/etc/hosts","Type":"bind","RW":true,"Source":"/private/docker/hosts"},{"Destination":"/etc/hostname","Type":"bind","RW":true,"Source":"/private/docker/hostname"},{"Destination":"/etc/resolv.conf","Type":"bind","RW":true,"Source":"/private/docker/resolv"}]' >"$tmpdir/rendered-mounts-three"
+[[ "$(awk 'END { print NR }' "$tmpdir/rendered-mounts-three")" == 3 ]] || { printf 'FAIL extracted .Mounts template did not render three records\n' >&2; exit 1; }
+rendered_mounts_three="$(cat "$tmpdir/rendered-mounts-three")"
+reported_mount_status="$(runtime_reported_etc_mount_status "$rendered_mounts_three" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == consistent ]] || { printf 'FAIL rendered multi-record .Mounts report was not accepted\n' >&2; exit 1; }
+
+render_runtime_mounts_template '[{"Destination":"/etc/hosts","Type":"bind","RW":true,"Source":"/private/docker/hosts"},{"Destination":"/etc/hosts","Type":"bind","RW":true,"Source":"/private/docker/hosts"}]' >"$tmpdir/rendered-mounts-duplicate"
+reported_mount_status="$(runtime_reported_etc_mount_status "$(cat "$tmpdir/rendered-mounts-duplicate")" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == inconsistent ]] || { printf 'FAIL rendered duplicate .Mounts records were accepted\n' >&2; exit 1; }
+
+render_runtime_mounts_template '[{"Destination":"/etc/hosts","Type":"bind","RW":true,"Source":"/private/docker/hosts-other"}]' >"$tmpdir/rendered-mounts-mismatch"
+reported_mount_status="$(runtime_reported_etc_mount_status "$(cat "$tmpdir/rendered-mounts-mismatch")" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == inconsistent && "$reported_mount_status" != *private* ]] || { printf 'FAIL divergent rendered source was accepted or leaked\n' >&2; exit 1; }
+
+render_runtime_mounts_template '[{"Destination":"/etc/hosts","Type":"bind","RW":true,"Source":"/private/docker/hosts|malformed"}]' >"$tmpdir/rendered-mounts-malformed"
+reported_mount_status="$(runtime_reported_etc_mount_status "$(cat "$tmpdir/rendered-mounts-malformed")" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == inconsistent && "$reported_mount_status" != *malformed* ]] || { printf 'FAIL malformed rendered source was accepted or leaked\n' >&2; exit 1; }
+
+render_runtime_mounts_template '[]' >"$tmpdir/rendered-mounts-empty"
+[[ ! -s "$tmpdir/rendered-mounts-empty" ]] || { printf 'FAIL empty .Mounts template render was not empty\n' >&2; exit 1; }
+reported_mount_status="$(runtime_reported_etc_mount_status "$(cat "$tmpdir/rendered-mounts-empty")" etc_hosts /etc/hosts "$docker_hosts_path")"
+[[ "$reported_mount_status" == unavailable ]] || { printf 'FAIL empty rendered .Mounts report was not unavailable\n' >&2; exit 1; }
+printf 'PASS runtime_mounts_template_render_and_parser_regressions\n'
+
 reported_mounts_valid=$'/etc/hosts|bind|true|/private/docker/hosts\n/etc/hostname|bind|true|/private/docker/hostname\n/etc/resolv.conf|bind|true|/private/docker/resolv\n/tmp|tmpfs|true|tmpfs\n/run|tmpfs|true|tmpfs'
 reported_mount_status="$(runtime_reported_etc_mount_status "$reported_mounts_valid" etc_hosts /etc/hosts "$docker_hosts_path")"
 [[ "$reported_mount_status" == consistent ]] || { printf 'FAIL exact valid Docker .Mounts fixture was not accepted\n' >&2; exit 1; }
