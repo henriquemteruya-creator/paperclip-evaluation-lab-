@@ -523,8 +523,9 @@ jobs:
             [[ "$running" == true ]] || { process_snapshot_failure state_running; return 1; }
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { process_snapshot_failure pid; return 1; }
             [[ "$identity" == "$container_id" ]] || { process_snapshot_failure container_identity; return 1; }
-            [[ -r "$proc_root/$pid/stat" && -d "$proc_root/$pid/root" ]] || { process_snapshot_failure proc_access; return 1; }
-            [[ -L "$proc_root/$pid/ns/mnt" ]] || { process_snapshot_failure namespace; return 1; }
+            [[ -r "$proc_root/$pid/stat" ]] || { process_snapshot_failure proc_stat_access; return 1; }
+            [[ -d "$proc_root/$pid/root" ]] || { process_snapshot_failure proc_root_access; return 1; }
+            [[ -L "$proc_root/$pid/ns/mnt" ]] || { process_snapshot_failure namespace_link; return 1; }
             # /proc/PID/stat field 2 (comm) may contain spaces and ')' chars.
             # Strip through the final ") " and read field 20 of the remainder
             # (the original field 22, starttime).  A single escaped ')' is
@@ -533,10 +534,10 @@ jobs:
               process_snapshot_failure parsing; return 2
             fi
             if ! mountns="$(readlink "$proc_root/$pid/ns/mnt" 2>/dev/null)"; then
-              process_snapshot_failure namespace; return 2
+              process_snapshot_failure namespace_read; return 2
             fi
             [[ "$starttime" =~ ^[1-9][0-9]*$ ]] || { process_snapshot_failure parsing; return 1; }
-            [[ -n "$mountns" ]] || { process_snapshot_failure namespace; return 1; }
+            [[ -n "$mountns" ]] || { process_snapshot_failure namespace_read; return 1; }
             printf '%s|%s|%s\n' "$pid" "$starttime" "$mountns"
           }
           # PROCESS_SNAPSHOT_END
