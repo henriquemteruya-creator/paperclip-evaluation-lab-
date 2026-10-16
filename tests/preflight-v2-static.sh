@@ -36,6 +36,89 @@ awk '
   in_run { sub(/^          /, ""); print }
 ' "$workflow" >"$embedded_bash"
 bash -n "$embedded_bash"
+
+# The diagnostic is passed to `docker start` as a literal heredoc.  Parsing the
+# enclosing workflow step alone does not parse that payload as Bash, so extract
+# the exact YAML body and check it independently.
+diagnostic_heredoc="$tmpdir/diagnostic-heredoc.sh"
+set +e
+awk '
+  /docker start --attach --interactive/ && /DIAGNOSTIC/ { in_heredoc = 1; found = 1; next }
+  in_heredoc && /^[[:space:]]*DIAGNOSTIC[[:space:]]*$/ { complete = 1; exit }
+  in_heredoc { sub(/^          /, ""); print }
+  END { if (!found || !complete) exit 2 }
+' "$workflow" >"$diagnostic_heredoc"
+diagnostic_extract_rc=$?
+set -e
+assert_rc 0 "$diagnostic_extract_rc" diagnostic_heredoc_extracted_from_yaml
+[[ -s "$diagnostic_heredoc" ]] || { printf 'FAIL diagnostic heredoc was empty\n' >&2; exit 1; }
+rg -Fq 'MOUNTINFO_AWK_BEGIN' "$diagnostic_heredoc"
+rg -Fq 'RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN' "$diagnostic_heredoc"
+bash -n "$diagnostic_heredoc"
+printf 'PASS diagnostic_heredoc_bash_syntax\n'
+
+# Run the exact mountinfo AWK shell command after replacing only its input with
+# /dev/null.  This exercises the real Bash quote boundary as well as AWK's
+# parser, without starting Docker or evaluating the diagnostic payload.
+mountinfo_shell_command="$tmpdir/mountinfo-shell-command.sh"
+set +e
+awk '
+  /^[[:space:]]*awk/ { candidate = $0; awaiting_marker = 1; next }
+  awaiting_marker && /MOUNTINFO_AWK_BEGIN/ {
+    print candidate
+    print
+    collecting = 1
+    awaiting_marker = 0
+    next
+  }
+  collecting {
+    if (/\/proc\/self\/mountinfo/) {
+      sub(/\/proc\/self\/mountinfo/, "/dev/null")
+      print
+      complete = 1
+      exit
+    }
+    print
+  }
+  END { if (!complete) exit 2 }
+' "$diagnostic_heredoc" >"$mountinfo_shell_command"
+mountinfo_shell_extract_rc=$?
+set -e
+assert_rc 0 "$mountinfo_shell_extract_rc" mountinfo_awk_shell_command_extracted
+bash -n "$mountinfo_shell_command"
+set +e
+bash "$mountinfo_shell_command" >/dev/null 2>"$tmpdir/mountinfo-shell-command.err"
+mountinfo_shell_rc=$?
+set -e
+assert_rc 2 "$mountinfo_shell_rc" mountinfo_awk_real_bash_quoting_is_valid
+[[ ! -s "$tmpdir/mountinfo-shell-command.err" ]] || {
+  printf 'FAIL extracted mountinfo AWK emitted a parser error through Bash\n' >&2
+  exit 1
+}
+
+# A literal apostrophe inside the single-quoted AWK program must make the
+# extracted payload unparsable.  Build the negative fixture from the exact
+# heredoc so the regression cannot drift away from the workflow source.
+apostrophe_marker_line="$(grep -n -m1 'MOUNTINFO_AWK_BEGIN' "$diagnostic_heredoc" | cut -d: -f1)"
+[[ "$apostrophe_marker_line" =~ ^[1-9][0-9]*$ ]] || {
+  printf 'FAIL mountinfo AWK marker was not found in diagnostic heredoc\n' >&2
+  exit 1
+}
+apostrophe_fixture="$tmpdir/diagnostic-heredoc-unescaped-apostrophe.sh"
+{
+  sed -n "1,${apostrophe_marker_line}p" "$diagnostic_heredoc"
+  printf '%s\n' "              # runc's unescaped apostrophe regression sentinel"
+  sed -n "$((apostrophe_marker_line + 1)),\$p" "$diagnostic_heredoc"
+} >"$apostrophe_fixture"
+set +e
+bash -n "$apostrophe_fixture" >/dev/null 2>&1
+apostrophe_fixture_rc=$?
+set -e
+(( apostrophe_fixture_rc != 0 )) || {
+  printf 'FAIL an unescaped apostrophe inside AWK was accepted\n' >&2
+  exit 1
+}
+printf 'PASS unescaped_awk_apostrophe_is_rejected\n'
 tmpfs_validator="$tmpdir/tmpfs-validator.sh"
 awk '
   /TMPFS_VALIDATOR_BEGIN/ { in_program = 1; next }
