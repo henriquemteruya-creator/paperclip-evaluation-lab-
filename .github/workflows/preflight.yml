@@ -462,7 +462,10 @@ jobs:
             done
           }
           mount_record_for_target() {
-            local pid="$1" target="$2"
+            # The optional third argument exists solely for the offline suite;
+            # production always observes the selected process's mountinfo.
+            local pid target mountinfo_path
+            pid="$1"; target="$2"; mountinfo_path="${3:-/proc/$pid/mountinfo}"
             awk -v wanted="$target" '
               function has(options, flag, n, a, i) { n=split(options,a,","); for(i=1;i<=n;i++) if(a[i]==flag)return 1; return 0 }
               $5 == wanted {
@@ -472,25 +475,61 @@ jobs:
                 rw=(has($6,"rw") && !has($6,"ro"))
                 propagation_clear=1; for(i=7;i<separator;i++) if($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) propagation_clear=0
               }
-              END { if (seen != 1 || malformed) exit 1; printf "%s|%s\\n", rw ? "true" : "false", propagation_clear ? "true" : "false" }
-            ' "/proc/$pid/mountinfo" 2>/dev/null
+              END { if (seen != 1 || malformed) exit 1; printf "%s|%s\n", rw ? "true" : "false", propagation_clear ? "true" : "false" }
+            ' "$mountinfo_path" 2>/dev/null
+          }
+          runtime_reported_etc_mount_status() {
+            local entries="$1" wanted_id="$2" wanted_destination="$3" wanted_source="$4"
+            local destination mount_type mount_rw mount_source extra id expected_source seen=0 unexpected=0 malformed=0 match=false
+            [[ -n "$entries" ]] || { printf '%s\n' unavailable; return 0; }
+            while IFS='|' read -r destination mount_type mount_rw mount_source extra; do
+              [[ -z "$destination" && -z "$mount_type" && -z "$mount_rw" && -z "$mount_source" && -z "$extra" ]] && continue
+              if [[ -z "$destination" || -z "$mount_type" || -z "$mount_rw" || -z "$mount_source" || -n "$extra" ]]; then malformed=1; continue; fi
+              case "$destination" in
+                /etc/hosts) id=etc_hosts; expected_source="$docker_hosts_path" ;;
+                /etc/hostname) id=etc_hostname; expected_source="$docker_hostname_path" ;;
+                /etc/resolv.conf) id=etc_resolv_conf; expected_source="$docker_resolv_path" ;;
+                /tmp|/run) [[ "$mount_type" == tmpfs && "$mount_rw" == true ]] || unexpected=1; continue ;;
+                *) unexpected=1; continue ;;
+              esac
+              if [[ "$id" == "$wanted_id" ]]; then
+                (( ++seen ))
+                [[ "$destination" == "$wanted_destination" && "$mount_type" == bind && "$mount_rw" == true && "$mount_source" == "$wanted_source" && "$mount_source" == "$expected_source" ]] && match=true || match=false
+              elif [[ "$mount_type" != bind || "$mount_rw" != true || "$mount_source" != "$expected_source" ]]; then
+                unexpected=1
+              fi
+            done <<<"$entries"
+            if (( malformed == 0 && unexpected == 0 && seen == 1 )) && [[ "$match" == true ]]; then
+              printf '%s\n' consistent
+            else
+              printf '%s\n' inconsistent
+            fi
           }
           # A record is passed only after raw host and /proc observations were
           # made.  It is deliberately strict and emits known IDs and booleans.
           validate_docker_managed_etc_record() {
-            local id="$1" metadata_present="$2" source_regular="$3" source_nosymlink="$4" provenance="$5" target_regular="$6" target_nosymlink="$7" identity_before="$8" identity_after="$9" mount_rw="${10}" propagation_clear="${11}" pid_stable="${12}" reported_runtime_mount="${13}"
+            local id="$1" metadata_present="$2" source_regular="$3" source_nosymlink="$4" provenance="$5" source_stable="$6" target_regular="$7" target_nosymlink="$8" identity_before="$9" identity_after="${10}" mount_rw="${11}" propagation_clear="${12}" pid_stable="${13}" reported_runtime_mount="${14}"
             case "$id" in etc_hosts|etc_hostname|etc_resolv_conf) ;; *) return 2 ;; esac
             case "$reported_runtime_mount" in consistent|unavailable) ;; *) return 1 ;; esac
             local complete=true value
-            for value in "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable"; do
+            for value in "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable"; do
               [[ "$value" == true ]] || complete=false
             done
-            printf 'docker_managed_etc id=%s metadata_present=%s source_regular=%s source_not_symlink=%s provenance_verified=%s target_regular=%s target_not_symlink=%s identity_before=%s identity_after=%s mount_rw=%s propagation_clear=%s pid_stable=%s reported_runtime_mount=%s\n' \
-              "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount"
+            printf 'docker_managed_etc id=%s metadata_present=%s source_regular=%s source_not_symlink=%s provenance_verified=%s source_stable=%s target_regular=%s target_not_symlink=%s identity_before=%s identity_after=%s mount_rw=%s propagation_clear=%s pid_stable=%s reported_runtime_mount=%s\n' \
+              "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount"
             [[ "$complete" == true ]] || return 1
           }
+          docker_managed_etc_metadata_path() {
+            local id="$1"
+            case "$id" in
+              etc_hosts) inspect_value '{{.HostsPath}}' ;;
+              etc_hostname) inspect_value '{{.HostnamePath}}' ;;
+              etc_resolv_conf) inspect_value '{{.ResolvConfPath}}' ;;
+              *) return 2 ;;
+            esac
+          }
           collect_docker_managed_etc_runtime() {
-            local docker_root canonical_docker_root before after pid starttime mountns id destination source canonical_source source_stat target_stat source_type target_type source_devino target_devino mount_flags report raw_report status
+            local docker_root canonical_docker_root docker_root_after canonical_docker_root_after before after pid starttime mountns id destination source source_after canonical_source canonical_source_after source_stat source_stat_after target_stat source_type source_type_after target_type source_devino source_devino_after target_devino mount_flags raw_report status
             if ! docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)" ||
                ! canonical_docker_root="$(readlink -f -- "$docker_root" 2>/dev/null)" ||
                [[ -z "$docker_root" || "$docker_root" != "$canonical_docker_root" || -L "$docker_root" || ! -d "$docker_root" ]]; then
@@ -512,7 +551,7 @@ jobs:
                 etc_hostname) source="$docker_hostname_path" ;;
                 etc_resolv_conf) source="$docker_resolv_path" ;;
               esac
-              local metadata_present=false source_regular=false source_nosymlink=false provenance=false target_regular=false target_nosymlink=false identity_before=false identity_after=false mount_rw=false propagation_clear=false pid_stable=false reported_runtime_mount=unavailable
+              local metadata_present=false source_regular=false source_nosymlink=false provenance=false source_stable=false target_regular=false target_nosymlink=false identity_before=false identity_after=false mount_rw=false propagation_clear=false pid_stable=false reported_runtime_mount=unavailable
               if [[ -n "$source" && -e "$source" && ! -L "$source" ]] && source_stat="$(stat -c '%F|%d|%i' "$source" 2>/dev/null)"; then
                 metadata_present=true; IFS='|' read -r source_type source_devino <<<"${source_stat%%|*}|${source_stat#*|}"
                 [[ "$source_type" == 'regular file' ]] && source_regular=true; source_nosymlink=true
@@ -526,16 +565,30 @@ jobs:
                 [[ -n "${source_devino:-}" && "$source_devino" == "$target_devino" ]] && identity_before=true
               fi
               if mount_flags="$(mount_record_for_target "$pid" "$destination")"; then IFS='|' read -r mount_rw propagation_clear <<<"$mount_flags"; fi
-              if grep -Fq "$destination|bind|true|$source" <<<"$raw_report"; then reported_runtime_mount=consistent
-              elif [[ -n "$raw_report" ]]; then reported_runtime_mount=inconsistent; fi
+              reported_runtime_mount="$(runtime_reported_etc_mount_status "$raw_report" "$id" "$destination" "$source")"
               if after="$(process_snapshot)" && [[ "$after" == "$before" ]]; then
                 pid_stable=true
+                # Re-observe metadata and the backing file after collection.
+                # PID stability alone cannot establish source stability.
+                if source_after="$(docker_managed_etc_metadata_path "$id" 2>/dev/null)" &&
+                   docker_root_after="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)" &&
+                   canonical_docker_root_after="$(readlink -f -- "$docker_root_after" 2>/dev/null)" &&
+                   [[ "$source_after" == "$source" && "$docker_root_after" == "$docker_root" && "$canonical_docker_root_after" == "$canonical_docker_root" && -e "$source_after" && ! -L "$source_after" ]] &&
+                   source_stat_after="$(stat -c '%F|%d|%i' "$source_after" 2>/dev/null)"; then
+                  IFS='|' read -r source_type_after source_devino_after <<<"${source_stat_after%%|*}|${source_stat_after#*|}"
+                  if [[ "$source_type_after" == "$source_type" && "$source_devino_after" == "$source_devino" ]] &&
+                     canonical_source_after="$(readlink -f -- "$source_after" 2>/dev/null)" &&
+                     [[ "$canonical_source_after" == "$source_after" && "$source_after" == "$docker_root_after"/* && "$source_after" == *"/$container_id/"* ]] &&
+                     path_components_are_non_symlink "$source_after" "$docker_root_after"; then
+                    source_stable=true
+                  fi
+                fi
                 if [[ -e "/proc/$pid/root$destination" && ! -L "/proc/$pid/root$destination" ]] && target_stat="$(stat -c '%F|%d|%i' "/proc/$pid/root$destination" 2>/dev/null)"; then
                   IFS='|' read -r target_type target_devino <<<"${target_stat%%|*}|${target_stat#*|}"
-                  [[ -n "${source_devino:-}" && "$source_devino" == "$target_devino" ]] && identity_after=true
+                  [[ "$source_stable" == true && -n "${source_devino_after:-}" && "$source_devino_after" == "$target_devino" ]] && identity_after=true
                 fi
               fi
-              set +e; status="$(validate_docker_managed_etc_record "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount")"; local rc=$?; set -e
+              set +e; status="$(validate_docker_managed_etc_record "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount")"; local rc=$?; set -e
               while IFS= read -r line; do [[ -n "$line" ]] && info "$line"; done <<<"$status"
               (( rc == 0 )) || diagnostic_no_go "docker-managed etc runtime evidence incomplete: $id"
             done <<<"$docker_managed_etc_ids"
