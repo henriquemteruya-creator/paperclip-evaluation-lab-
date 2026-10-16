@@ -572,6 +572,17 @@ jobs:
                      path == "/proc/interrupts" || path == "/proc/kcore" || path == "/proc/keys" || \
                      path == "/proc/latency_stats" || path == "/proc/timer_list" || path == "/proc/timer_stats"
             }
+            # These are the only mask exceptions supported by run #6 evidence.
+            # They are deliberately destination-specific: no prefix, tmpfs or
+            # rw rule is accepted outside this closed set.
+            function is_verified_mask_directory(path) {
+              return path == "/proc/acpi" || path == "/proc/scsi" || path == "/sys/firmware"
+            }
+            function is_verified_mask_file(path) {
+              return path == "/proc/interrupts" || path == "/proc/kcore" || path == "/proc/keys" || \
+                     path == "/proc/latency_stats" || path == "/proc/timer_list"
+            }
+            function is_verified_mask(path) { return is_verified_mask_directory(path) || is_verified_mask_file(path) }
             function expected_path(path) {
               return path == "/" || path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || \
                      path == "/dev" || path == "/dev/pts" || path == "/dev/mqueue" || path == "/dev/shm" || \
@@ -636,10 +647,15 @@ jobs:
               return 0
             }
             function expected_access(path) {
+              if (is_verified_mask_file(path)) return "rw"
               if (path == "/" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return "ro"
               return "rw"
             }
             function requires_option(path, option) {
+              # Docker/runc's verified mask representation in run #6 did not
+              # carry these flags per mount.  This exception is limited to the
+              # eight destinations and is paired with all mask predicates.
+              if (is_verified_mask(path)) return 0
               if (option == "nosuid") return path != "/" && !(path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf")
               if (option == "nodev") return path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/dev/mqueue" || path == "/dev/shm" || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap"
               if (option == "noexec") return path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/dev/pts" || path == "/dev/mqueue" || path == "/dev/shm" || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || path == "/tmp" || path == "/run"
@@ -660,6 +676,19 @@ jobs:
               if (has_option(options, "rw")) return "rw"
               return "other"
             }
+            function propagation_clear(first, last, i) {
+              for (i = first; i <= last; i++)
+                if ($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) return 0
+              return 1
+            }
+            function mask_predicate_code(path, root, options, first, last) {
+              if (!is_verified_mask(path)) return "none"
+              if (is_verified_mask_directory(path) && root != "/") return "root_slash_required"
+              if (is_verified_mask_file(path) && root != "/null") return "root_null_required"
+              if ((is_verified_mask_directory(path) && !is_ro(options)) || (is_verified_mask_file(path) && !is_rw(options))) return "access_required"
+              if (!propagation_clear(first, last)) return "propagation_markers_forbidden"
+              return "none"
+            }
             function options_match(path, options) { return per_mount_option_code(path, options) == "none" }
             function report_rejection(reason, path, filesystem, source, options, super_options, id) {
               id = expected_path(path) ? destination_id(path) : "none"
@@ -667,7 +696,12 @@ jobs:
               if (id != "none") printf " destination_id=%s", id
               if (reason == "filesystem_or_source_incompatible") printf " fstype_category=%s source_category=%s", known_fstype_category(filesystem), known_source_category(source)
               if (reason == "mount_options_incompatible") printf " per_mount=%s superblock_access=%s", per_mount_option_code(path, options), superblock_access_category(super_options)
+              if (reason == "mask_predicate_incompatible") printf " mask_predicate=%s", mask_predicate_code(path, root, options, 7, separator - 1)
               printf "\n"
+              rejected++
+            }
+            function report_mask_submount(id) {
+              printf "INFO mountinfo_reject reason=mask_submount_unexpected destination_class=expected destination_id=%s\n", id
               rejected++
             }
             {
@@ -676,7 +710,7 @@ jobs:
               separator = 0
               for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
               if (!separator || separator + 3 > NF) { malformed = 1; report_rejection("format_invalid", "", "", "", "", ""); next }
-              target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2); super_options = $(separator + 3)
+              root = $4; target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2); super_options = $(separator + 3)
               if (seen[target]++) { forbidden = 1; report_rejection("duplicate_destination", target, filesystem, source, options, super_options) }
               if (!expected_path(target)) {
                 forbidden = 1
@@ -687,7 +721,13 @@ jobs:
               } else if (!options_match(target, options)) {
                 forbidden = 1
                 report_rejection("mount_options_incompatible", target, filesystem, source, options, super_options)
+              } else if (mask_predicate_code(target, root, options, 7, separator - 1) != "none") {
+                forbidden = 1
+                report_rejection("mask_predicate_incompatible", target, filesystem, source, options, super_options)
               }
+              if (target ~ /^\/proc\/acpi\//) mask_submount["proc_acpi"] = 1
+              if (target ~ /^\/proc\/scsi\//) mask_submount["proc_scsi"] = 1
+              if (target ~ /^\/sys\/firmware\//) mask_submount["sys_firmware"] = 1
               if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ || \
                   target ~ /^\/(home\/runner|__w|github)(\/|$)/ || \
                   source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) {
@@ -698,6 +738,9 @@ jobs:
             END {
               if (records == 0) { printf "%s\n", "INFO mountinfo_reject reason=empty destination_class=none"; exit 2 }
               if (malformed) exit 2
+              if (mask_submount["proc_acpi"]) { forbidden = 1; report_mask_submount("proc_acpi") }
+              if (mask_submount["proc_scsi"]) { forbidden = 1; report_mask_submount("proc_scsi") }
+              if (mask_submount["sys_firmware"]) { forbidden = 1; report_mask_submount("sys_firmware") }
               if (forbidden) exit 1
               exit 0
             }
@@ -711,9 +754,9 @@ jobs:
             *) probe_fail "mountinfo_inspection_error_rc_${mountinfo_rc}" ;;
           esac
 
-          # The following probes explain known runtime mask representations;
-          # they do not modify the closed mount allowlist above.  All raw
-          # mountinfo fields stay inside awk/shell variables.
+          # The following probes are mandatory companion predicates for the
+          # eight narrowly accepted runtime masks.  All raw mountinfo fields
+          # stay inside awk/shell variables.
           # RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN
           runtime_mask_diagnostic_awk='\
             BEGIN {
@@ -874,7 +917,7 @@ jobs:
             [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"
           done <<< "$runtime_mask_mount_diagnostic"
           case "$runtime_mask_mount_rc" in
-            0) printf '%s\n' 'INFO runtime_mask_mount_diagnostic_complete_not_authorization' ;;
+            0) probe_pass runtime_mask_mount_predicates_verified ;;
             1) probe_fail runtime_mask_mount_diagnostic_inconclusive_or_mismatch ;;
             *) probe_fail runtime_mask_mount_diagnostic_parser_error ;;
           esac
@@ -886,8 +929,8 @@ jobs:
           set -e
           while IFS= read -r runtime_mask_line; do [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"; done <<< "$runtime_mask_dir_diagnostic"
           while IFS= read -r runtime_mask_line; do [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"; done <<< "$runtime_mask_file_diagnostic"
-          case "$runtime_mask_dir_rc" in 0) printf '%s\n' 'INFO runtime_mask_directory_object_diagnostic_complete_not_authorization' ;; 1) probe_fail runtime_mask_directory_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_directory_object_diagnostic_parser_error ;; esac
-          case "$runtime_mask_file_rc" in 0) printf '%s\n' 'INFO runtime_mask_file_object_diagnostic_complete_not_authorization' ;; 1) probe_fail runtime_mask_file_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_file_object_diagnostic_parser_error ;; esac
+          case "$runtime_mask_dir_rc" in 0) probe_pass runtime_mask_directory_objects_verified ;; 1) probe_fail runtime_mask_directory_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_directory_object_diagnostic_parser_error ;; esac
+          case "$runtime_mask_file_rc" in 0) probe_pass runtime_mask_file_objects_verified ;; 1) probe_fail runtime_mask_file_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_file_object_diagnostic_parser_error ;; esac
 
           # --network none plus one loopback interface is primary evidence.
           # DNS, raw TCP and TLS/HTTPS attempts are independent negative probes.
