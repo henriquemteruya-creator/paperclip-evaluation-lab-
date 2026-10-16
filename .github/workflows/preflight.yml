@@ -503,17 +503,43 @@ jobs:
           # command with the container root as its filesystem root.
           docker_managed_etc_ids=$'etc_hosts|/etc/hosts\netc_hostname|/etc/hostname\netc_resolv_conf|/etc/resolv.conf'
           etc_runtime_records=''
+          # PROCESS_SNAPSHOT_BEGIN
+          # Prints only the private snapshot needed by the caller.  Failures
+          # are reported to stderr as sanitized stage IDs, so command
+          # substitution cannot mistake diagnostics for a valid snapshot.
+          process_snapshot_failure() {
+            local stage="$1"
+            printf 'INFO process_snapshot stage=%s state=failed\n' "$stage" >&2
+            return 1
+          }
           process_snapshot() {
-            local sample pid starttime mountns identity
-            if ! sample="$(inspect_value '{{.State.Running}}|{{.State.Pid}}|{{.Id}}')"; then return 2; fi
-            IFS='|' read -r running pid identity <<<"$sample"
-            [[ "$running" == true && "$pid" =~ ^[1-9][0-9]*$ && "$identity" == "$container_id" ]] || return 1
-            [[ -r "/proc/$pid/stat" && -L "/proc/$pid/ns/mnt" && -d "/proc/$pid/root" ]] || return 1
-            if ! starttime="$(awk '{ sub(/^.*\\) /, ""); print $20 }' "/proc/$pid/stat" 2>/dev/null)" ||
-               ! mountns="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)"; then return 2; fi
-            [[ "$starttime" =~ ^[1-9][0-9]*$ && -n "$mountns" ]] || return 1
+            local sample running pid identity extra starttime mountns proc_root
+            proc_root="${PREFLIGHT_PROC_ROOT:-/proc}"
+            if ! sample="$(inspect_value '{{.State.Running}}|{{.State.Pid}}|{{.Id}}')"; then
+              process_snapshot_failure docker_inspect; return 2
+            fi
+            IFS='|' read -r running pid identity extra <<<"$sample"
+            [[ -z "$extra" ]] || { process_snapshot_failure docker_inspect; return 2; }
+            [[ "$running" == true ]] || { process_snapshot_failure state_running; return 1; }
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { process_snapshot_failure pid; return 1; }
+            [[ "$identity" == "$container_id" ]] || { process_snapshot_failure container_identity; return 1; }
+            [[ -r "$proc_root/$pid/stat" && -d "$proc_root/$pid/root" ]] || { process_snapshot_failure proc_access; return 1; }
+            [[ -L "$proc_root/$pid/ns/mnt" ]] || { process_snapshot_failure namespace; return 1; }
+            # /proc/PID/stat field 2 (comm) may contain spaces and ')' chars.
+            # Strip through the final ") " and read field 20 of the remainder
+            # (the original field 22, starttime).  A single escaped ')' is
+            # required by AWK; a double backslash matches a literal slash.
+            if ! starttime="$(awk '{ if (!sub(/^.*\) /, "")) exit 2; if (NF != 50) exit 2; print $20 }' "$proc_root/$pid/stat" 2>/dev/null)"; then
+              process_snapshot_failure parsing; return 2
+            fi
+            if ! mountns="$(readlink "$proc_root/$pid/ns/mnt" 2>/dev/null)"; then
+              process_snapshot_failure namespace; return 2
+            fi
+            [[ "$starttime" =~ ^[1-9][0-9]*$ ]] || { process_snapshot_failure parsing; return 1; }
+            [[ -n "$mountns" ]] || { process_snapshot_failure namespace; return 1; }
             printf '%s|%s|%s\n' "$pid" "$starttime" "$mountns"
           }
+          # PROCESS_SNAPSHOT_END
           path_components_are_non_symlink() {
             local candidate="$1" root="$2" relative part cursor
             [[ "$candidate" == "$root"/* ]] || return 1
