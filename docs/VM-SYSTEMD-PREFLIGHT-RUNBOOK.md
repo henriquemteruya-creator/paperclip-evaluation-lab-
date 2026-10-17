@@ -42,6 +42,13 @@ trusted runner shell as root-owned, mode `0555` files:
 - trusted controller: `/usr/local/sbin/ti0093-vm-preflight-controller`;
 - benign probe: `/usr/local/libexec/ti0093-vm-preflight-probe`.
 
+Before creating anything, the controller rejects collisions in its directories,
+sentinel, dedicated identity and both unit names. The workflow likewise rejects
+preexisting staging or installed-script paths. Ownership flags are set only
+after successful creation; cleanup stops or removes only flagged resources and
+requires the transient unit's run-specific description tag to match. Partial
+creation failures remain NO-GO while cleanup still attempts every owned item.
+
 The controller creates a dedicated system UID/GID, private root-owned output
 directory under `/run`, one explicitly writable work directory under
 `/var/lib`, and a synthetic world-readable sentinel under `/home/runner/work`.
@@ -51,8 +58,10 @@ the file mode alone.
 
 A second directory under `/var/lib` is deliberately owned by the service UID
 but omitted from `ReadWritePaths`. A denied write therefore exercises the
-systemd filesystem namespace rather than ordinary ownership. `/tmp` and
-`/var/tmp` are also required to be read-only inside the service.
+systemd filesystem namespace rather than ordinary ownership. `/tmp`,
+`/var/tmp` and `/dev/shm` are required to be read-only inside the service.
+`/run` is replaced by a 1 MiB read-only `tmpfs` with
+`nosuid,nodev,noexec`; it is not the host runtime directory.
 
 ## Required transient-service profile
 
@@ -66,8 +75,8 @@ The controller invokes the system manager explicitly with
 - `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
   `PrivateDevices=yes`, protected kernel/control-group paths and restricted
   namespace creation;
-- only the work directory in `ReadWritePaths`; `/tmp` and `/var/tmp` explicitly
-  read-only;
+- only the work directory in `ReadWritePaths`; `/tmp`, `/var/tmp` and
+  `/dev/shm` explicitly read-only, plus a private read-only `/run`;
 - known host-control paths masked with `InaccessiblePaths`, including Docker,
   the private systemd manager socket, system D-Bus, containerd, snapd and udev;
 - `MemoryMax=256M`, `CPUQuota=50%`, `TasksMax=64` and
@@ -87,14 +96,18 @@ The benign service checks effective behavior, not only declared properties:
 2. zero inheritable, permitted, effective, bounding and ambient capabilities;
 3. `NoNewPrivs: 1` in `/proc/self/status`;
 4. absence of privilege tools and sensitive/unexpected environment names;
-5. no inherited socket or runner-control descriptors;
+5. exactly descriptors 0, 1, 2 and Bash's script descriptor 255, with verified
+   types and identities; any extra or inconclusive descriptor is rejected;
 6. successful write only in the allowed work directory;
-7. denied writes in an otherwise UID-owned directory, `/tmp` and `/var/tmp`;
+7. denied writes in an otherwise UID-owned directory, `/tmp`, `/var/tmp` and
+   `/dev/shm`;
 8. inability to read/list the synthetic runner workspace sentinel;
 9. inability to observe the controller directory and known host-control
-   sockets;
-10. loopback-only interfaces, no IPv4/IPv6 routes, and failed DNS, direct TCP
-    and HTTPS probes;
+   sockets, plus a fail-closed filesystem scan for pathname AF_UNIX sockets
+   below the service's `/run`, `/dev`, `/tmp` and `/var/tmp`;
+10. loopback-only interfaces and no IPv4/IPv6 routes; DNS, direct TCP and HTTPS
+    results are separately classified as blocked, connected or inconclusive.
+    Missing tools, timeouts and unrecognized failures are NO-GO, not PASS;
 11. exact `memory.max` and `pids.max`, plus semantic 50% `cpu.max`, read from
     the service's cgroup v2 path.
 
@@ -108,14 +121,15 @@ The service may emit only these closed forms to the private file:
 
 ```text
 RESULT id=<known_id> status=PASS code=ok
-READY status=PASS records=22
-FINAL status=PASS records=22
+READY status=PASS records=23
+FINAL status=PASS records=23
 ```
 
 The controller rejects unknown/duplicate/missing IDs, failures, malformed
 records, control characters, workflow-command syntax, oversized output,
 missing final newline, symlinked logs, unexpected ownership/mode or absent
-markers. It never echoes a rejected line. The GitHub step summary is generated
+markers. Results must precede READY; FINAL must follow READY and be the final
+record. It never echoes a rejected line. The GitHub step summary is generated
 from controller-owned literals and aggregate counts only.
 
 ## Timeout and cleanup canary
@@ -127,8 +141,10 @@ with the same profile and `RuntimeMaxSec=3s`. Approval requires:
 - `MainPID=0` after termination;
 - the service cgroup has no processes;
 - no process remains under the dedicated UID after both units are stopped;
-- controller trap removes units, UID/GID, sentinels, scripts and private
-  directories on every exit path.
+- controller cleanup removes only units, UID/GID, sentinel and directories
+  proven to have been created by this execution; the trusted workflow step
+  removes only its installed scripts and staging directory and verifies their
+  absence. Preexisting resources are never stopped, overwritten or removed.
 
 ## Objective verdict
 
@@ -139,10 +155,11 @@ GO requires all of the following:
 - repository visibility is reported as public and workflow SHA is valid;
 - system manager and cgroup v2 are available;
 - every manager-property comparison passes;
-- all 22 runtime records pass and both markers parse exactly;
+- all 23 runtime records pass and both markers parse in exact order;
 - mount and network namespaces differ from the controller;
 - main service exits zero with `Result=success` and an empty cgroup;
-- timeout canary and cleanup checks pass;
+- timeout canary passes, every owned resource is removed and post-cleanup
+  absence checks pass;
 - private log and sanitized summary checks pass.
 
 Anything absent, incompatible, failed or inconclusive is NO-GO with exit 86.
@@ -185,9 +202,12 @@ This is defense in depth inside a GitHub-hosted VM, not an independently
 attested sandbox. It cannot prove the GitHub/Azure hypervisor, runner image,
 guest kernel or systemd implementation safe. The trusted controller remains
 root in the guest. A kernel or systemd vulnerability could bypass the tested
-boundary. Path-based socket masking covers a closed set of relevant sockets,
-not every possible future host service. Negative probes demonstrate the tested
-paths and moment, not mathematical absence of all communication channels.
+boundary. A private `/run`, explicit masks and pathname-socket scan cover the
+inspected filesystem namespace at one moment; they do not prove absence of
+every kernel communication channel. Network failures are accepted only when
+their return code is consistent with the independently observed empty route
+table and direct unreachable result. Negative probes remain point-in-time
+evidence, not mathematical proof of non-connectivity.
 
 The service shares the guest kernel and its UID exists in the host user
 namespace; no separate user namespace is claimed. The design also does not yet
