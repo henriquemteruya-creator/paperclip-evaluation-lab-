@@ -27,7 +27,9 @@ duration; the benign service, systemd and every workflow command remained
 unexecuted.
 
 Commit `c8a3012df2dd9e31ead4da7955157a1ca4dcaf48` split staging and execution into
-three `run` blocks below the platform limit. Publishing that correction did not
+three `run` blocks below the platform limit. The current revision uses four
+bounded blocks so that the expanded controller remains below the same limit.
+Publishing the original correction did not
 create another run, consistent with the valid manual-only trigger. The offline
 suite now calculates every real block length and rejects a regression at or
 above 21,000 characters. The three failed validation records remain evidence
@@ -102,13 +104,19 @@ The benign service checks effective behavior, not only declared properties:
 7. denied writes in an otherwise UID-owned directory, `/tmp`, `/var/tmp` and
    `/dev/shm`;
 8. inability to read/list the synthetic runner workspace sentinel;
-9. inability to observe the controller directory and known host-control
+9. a unique `/run` tmpfs mount with expected identity, filesystem, mount-level
+   `ro,nosuid,nodev,noexec`, no propagation/submount and an observable 1 MiB
+   size; the controller also requires a distinct device from the host `/run`
+   and validates the system manager's effective `TemporaryFileSystem` value;
+10. inability to observe the controller directory and known host-control
    sockets, plus a fail-closed filesystem scan for pathname AF_UNIX sockets
    below the service's `/run`, `/dev`, `/tmp` and `/var/tmp`;
-10. loopback-only interfaces and no IPv4/IPv6 routes; DNS, direct TCP and HTTPS
+11. synchronously enumerated loopback-only interfaces and no IPv4/IPv6 routes;
+    producer/sorter errors, partial output and stderr are inconclusive NO-GO;
+    DNS, direct TCP and HTTPS
     results are separately classified as blocked, connected or inconclusive.
     Missing tools, timeouts and unrecognized failures are NO-GO, not PASS;
-11. exact `memory.max` and `pids.max`, plus semantic 50% `cpu.max`, read from
+12. exact `memory.max` and `pids.max`, plus semantic 50% `cpu.max`, read from
     the service's cgroup v2 path.
 
 While the probe is alive, the controller independently queries the system
@@ -121,8 +129,8 @@ The service may emit only these closed forms to the private file:
 
 ```text
 RESULT id=<known_id> status=PASS code=ok
-READY status=PASS records=23
-FINAL status=PASS records=23
+READY status=PASS records=24
+FINAL status=PASS records=24
 ```
 
 The controller rejects unknown/duplicate/missing IDs, failures, malformed
@@ -155,8 +163,9 @@ GO requires all of the following:
 - repository visibility is reported as public and workflow SHA is valid;
 - system manager and cgroup v2 are available;
 - every manager-property comparison passes;
-- all 23 runtime records pass and both markers parse in exact order;
+- all 24 runtime records pass and both markers parse in exact order;
 - mount and network namespaces differ from the controller;
+- `/run` mountinfo, device separation and effective systemd property all pass;
 - main service exits zero with `Result=success` and an empty cgroup;
 - timeout canary passes, every owned resource is removed and post-cleanup
   absence checks pass;
