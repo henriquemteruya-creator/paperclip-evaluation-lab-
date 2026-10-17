@@ -32,7 +32,9 @@ extract_marker_block() {
 }
 
 [[ -s "$workflow" ]] || test_fail workflow_missing
-extract_heredoc CONTROLLER "$tmp/controller.sh"
+extract_heredoc CONTROLLER_A "$tmp/controller-a.sh"
+extract_heredoc CONTROLLER_B "$tmp/controller-b.sh"
+cat "$tmp/controller-a.sh" "$tmp/controller-b.sh" >"$tmp/controller.sh"
 extract_heredoc PROBE "$tmp/probe.sh"
 bash -n "$tmp/controller.sh"
 bash -n "$tmp/probe.sh"
@@ -74,7 +76,7 @@ for index, line in enumerate(lines):
         block.append(candidate[trim:])
     lengths.append(len("".join(block)))
 
-if len(lengths) != 3 or any(length >= 21000 for length in lengths):
+if len(lengths) != 4 or any(length >= 21000 for length in lengths):
     raise SystemExit(1)
 PY
 test_pass run_expression_limits
@@ -104,7 +106,7 @@ test_pass socket_policy
 # Source the real parser function without installing the controller's EXIT trap.
 extract_marker_block PROBE_LOG_PARSER_BEGIN PROBE_LOG_PARSER_END "$tmp/controller.sh" "$tmp/parser.sh"
 MAX_LOG_BYTES=16384
-EXPECTED_RECORDS=23
+EXPECTED_RECORDS=24
 # shellcheck disable=SC1090
 source "$tmp/parser.sh"
 
@@ -114,13 +116,13 @@ make_valid_log() {
   local ids=(
     identity groups privilege_tools capabilities nonewprivs environment
     descriptors workdir_write outside_write_denied tmp_write_denied
-    vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden
+    vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount
     network_interfaces routes dns_blocked tcp_blocked https_blocked
     cgroup_memory cgroup_pids cgroup_cpu
   )
   for id in "${ids[@]}"; do printf 'RESULT id=%s status=PASS code=ok\n' "$id" >>"$output"; done
-  printf 'READY status=PASS records=23\n' >>"$output"
-  [[ "$phase" == final ]] && printf 'FINAL status=PASS records=23\n' >>"$output"
+  printf 'READY status=PASS records=24\n' >>"$output"
+  [[ "$phase" == final ]] && printf 'FINAL status=PASS records=24\n' >>"$output"
   chmod 0600 "$output"
 }
 
@@ -187,7 +189,7 @@ PY
 expect_reject "$tmp/final-before-ready.log" final final_before_ready
 
 cp "$valid_ready" "$tmp/ready-early.log"
-sed -i '1iREADY status=PASS records=23' "$tmp/ready-early.log"
+sed -i '1iREADY status=PASS records=24' "$tmp/ready-early.log"
 expect_reject "$tmp/ready-early.log" ready ready_before_results
 
 cp "$valid_ready" "$tmp/result-after-ready.log"
@@ -195,7 +197,7 @@ sed -n '1p' "$valid_ready" >>"$tmp/result-after-ready.log"
 expect_reject "$tmp/result-after-ready.log" ready result_after_ready
 
 cp "$valid_final" "$tmp/after-final.log"
-printf '%s\n' 'READY status=PASS records=23' >>"$tmp/after-final.log"
+printf '%s\n' 'READY status=PASS records=24' >>"$tmp/after-final.log"
 expect_reject "$tmp/after-final.log" final record_after_final
 test_pass parser_marker_order
 
@@ -235,6 +237,91 @@ set +e; classify_https_result 7 false true; rc=$?; set -e; [[ "$rc" == 2 ]] || t
 set +e; classify_https_result 35 true true; rc=$?; set -e; [[ "$rc" == 1 ]] || test_fail tls_reachability_not_rejected
 set +e; classify_https_result 28 true true; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail https_timeout_not_inconclusive
 test_pass network_result_classification
+
+# The actual synchronous enumerator must preserve producer and sorter failures.
+extract_marker_block INTERFACE_ENUMERATOR_BEGIN INTERFACE_ENUMERATOR_END "$tmp/probe.sh" "$tmp/interfaces.sh"
+source "$tmp/interfaces.sh"
+mkdir "$tmp/net-root" "$tmp/net-scratch"
+make_tool() {
+  local path="$1" body="$2"
+  { printf '%s\n' '#!/usr/bin/env bash' 'set -u'; printf '%s\n' "$body"; } >"$path"
+  chmod 0700 "$path"
+}
+make_tool "$tmp/find-valid" "printf 'lo\\n'"
+make_tool "$tmp/find-extra" "printf 'lo\\neth0\\n'"
+make_tool "$tmp/find-partial" "printf 'lo\\n'; exit 1"
+make_tool "$tmp/find-empty" "exit 0"
+make_tool "$tmp/find-error" "exit 2"
+make_tool "$tmp/find-stderr" "printf 'lo\\n'; printf 'diagnostic\\n' >&2"
+make_tool "$tmp/sort-fail" "cat >/dev/null; exit 1"
+make_tool "$tmp/sort-stderr" "cat; printf 'diagnostic\\n' >&2"
+enumerate_network_interfaces "$tmp/net-root" "$tmp/net-scratch" "$tmp/find-valid" /usr/bin/sort || test_fail interface_valid_rejected
+set +e; enumerate_network_interfaces "$tmp/net-root" "$tmp/net-scratch" "$tmp/find-extra" /usr/bin/sort; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail interface_extra_not_rejected
+for fixture in find-partial find-empty find-error find-stderr; do
+  set +e; enumerate_network_interfaces "$tmp/net-root" "$tmp/net-scratch" "$tmp/$fixture" /usr/bin/sort; rc=$?; set -e
+  [[ "$rc" == 2 ]] || test_fail "interface_${fixture}_not_inconclusive"
+done
+set +e; enumerate_network_interfaces "$tmp/net-root" "$tmp/net-scratch" "$tmp/find-valid" "$tmp/sort-fail"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail interface_sort_failure_not_inconclusive
+set +e; enumerate_network_interfaces "$tmp/net-root" "$tmp/net-scratch" "$tmp/find-valid" "$tmp/sort-stderr"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail interface_sort_stderr_not_inconclusive
+test_pass interface_enumeration_fail_closed
+
+# Parse the effective /run mount using the exact function embedded in the probe.
+extract_marker_block RUN_MOUNT_VALIDATOR_BEGIN RUN_MOUNT_VALIDATOR_END "$tmp/probe.sh" "$tmp/run-mount.sh"
+source "$tmp/run-mount.sh"
+make_mountinfo() {
+  local output="$1" run_line="$2"
+  printf '%s\n' '24 1 0:20 / / rw,relatime - overlay overlay rw' "$run_line" >"$output"
+}
+valid_run='25 24 0:45 / /run ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=1024k,inode64'
+make_mountinfo "$tmp/mount-valid" "$valid_run"
+[[ "$(validate_run_mountinfo "$tmp/mount-valid")" == 0:45 ]] || test_fail run_mount_valid_rejected
+for pair in \
+  'missing_ro|25 24 0:45 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k' \
+  'missing_nosuid|25 24 0:45 / /run ro,nodev,noexec - tmpfs tmpfs rw,size=1024k' \
+  'unexpected_fstype|25 24 8:1 / /run ro,nosuid,nodev,noexec - ext4 host rw,size=1024k' \
+  'propagation|25 24 0:45 / /run ro,nosuid,nodev,noexec shared:7 - tmpfs tmpfs rw,size=1024k' \
+  'oversize|25 24 0:45 / /run ro,nosuid,nodev,noexec - tmpfs tmpfs rw,size=2048k'; do
+  label="${pair%%|*}"; line="${pair#*|}"; make_mountinfo "$tmp/mount-$label" "$line"
+  if validate_run_mountinfo "$tmp/mount-$label" >/dev/null 2>&1; then test_fail "run_mount_accepted_$label"; fi
+done
+make_mountinfo "$tmp/mount-duplicate" "$valid_run"
+printf '%s\n' '26 24 0:46 / /run ro,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k' >>"$tmp/mount-duplicate"
+if validate_run_mountinfo "$tmp/mount-duplicate" >/dev/null 2>&1; then test_fail run_mount_accepted_duplicate; fi
+make_mountinfo "$tmp/mount-submount" "$valid_run"
+printf '%s\n' '26 25 0:46 / /run/unexpected ro,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k' >>"$tmp/mount-submount"
+if validate_run_mountinfo "$tmp/mount-submount" >/dev/null 2>&1; then test_fail run_mount_accepted_submount; fi
+printf '%s\n' 'malformed' >"$tmp/mount-malformed"
+set +e; validate_run_mountinfo "$tmp/mount-malformed" >/dev/null; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail run_mount_malformed_not_inconclusive
+set +e; validate_run_mountinfo "$tmp/missing-mountinfo" >/dev/null; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail run_mount_unavailable_not_inconclusive
+test_pass run_mountinfo_closed_validation
+
+# Validate the system-manager representation semantically and fail closed.
+extract_marker_block RUN_PROPERTY_VALIDATOR_BEGIN RUN_PROPERTY_VALIDATOR_END "$tmp/controller.sh" "$tmp/run-property.sh"
+source "$tmp/run-property.sh"
+validate_run_tmpfs_property '/run:ro,nosuid,nodev,noexec,size=1M' || test_fail run_property_valid_rejected
+validate_run_tmpfs_property '/run:size=1024K,noexec,nodev,nosuid,ro' || test_fail run_property_equivalent_rejected
+set +e; validate_run_tmpfs_property '/run:ro,nodev,noexec,size=1M'; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail run_property_missing_option_not_rejected
+set +e; validate_run_tmpfs_property ''; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail run_property_unavailable_not_inconclusive
+set +e; validate_run_tmpfs_property '/run:ro,nosuid,nodev,noexec,size=1M,unknown'; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail run_property_extra_not_rejected
+grep -Fq "show_value \"\$MAIN_UNIT\" TemporaryFileSystem" "$tmp/controller.sh" || test_fail run_property_not_queried
+test_pass run_systemd_property_validation
+
+extract_marker_block RUN_IDENTITY_VALIDATOR_BEGIN RUN_IDENTITY_VALIDATOR_END "$tmp/controller.sh" "$tmp/run-identity.sh"
+source "$tmp/run-identity.sh"
+[[ "$(run_mount_device "$tmp/mount-valid")" == 0:45 ]] || test_fail run_identity_valid_rejected
+set +e; run_mount_device "$tmp/mount-duplicate" >/dev/null; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail run_identity_duplicate_not_rejected
+grep -Fq 'host_device" != "$service_device' "$tmp/run-identity.sh" || test_fail run_identity_distinct_missing
+grep -Fq 'current_pid" == "$pid' "$tmp/run-identity.sh" || test_fail run_identity_pid_stability_missing
+test_pass run_mount_identity_validation
 
 extract_marker_block SOCKET_SCAN_VALIDATOR_BEGIN SOCKET_SCAN_VALIDATOR_END "$tmp/probe.sh" "$tmp/socket-validator.sh"
 source "$tmp/socket-validator.sh"
