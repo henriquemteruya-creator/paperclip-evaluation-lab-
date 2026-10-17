@@ -346,6 +346,8 @@ jobs:
           [[ "$(<"$owner_marker")" == "$expected_owner" ]] || exit 86
           stage_owned=true
 
+          chmod 0600 "$controller_stage"
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):600" ]] || exit 86
           cat >>"$controller_stage" <<'CONTROLLER_B'
           build_service_args() {
             local log_file="$1" runtime="$2"
@@ -651,7 +653,9 @@ jobs:
           CONTROLLER_B
           # CONTROLLER_HEREDOC_END
 
+          bash -n "$controller_stage"
           chmod 0500 "$controller_stage"
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):500" ]] || exit 86
           trap - EXIT
 
       - name: Stage benign probe and install reviewed scripts
