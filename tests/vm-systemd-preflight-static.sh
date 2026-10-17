@@ -40,6 +40,62 @@ bash -n "$tmp/controller.sh"
 bash -n "$tmp/probe.sh"
 test_pass embedded_scripts_parse
 
+# Exercise the installation and partial-cleanup helpers extracted directly from
+# the workflow.  The mock installer is intentionally local to this offline
+# test: it permits testing a missing parent, collisions and symlinks without
+# writing below /usr/local or requiring root.
+extract_marker_block INSTALL_HELPER_BEGIN INSTALL_HELPER_END "$workflow" "$tmp/install-helper.sh"
+extract_marker_block PARTIAL_INSTALL_CLEANUP_BEGIN PARTIAL_INSTALL_CLEANUP_END "$workflow" "$tmp/install-cleanup.sh"
+source "$tmp/install-helper.sh"
+source "$tmp/install-cleanup.sh"
+sudo() { "$@"; }
+install() {
+  local source_path="${@: -2:1}" target_path="${@: -1}"
+  cp -- "$source_path" "$target_path"
+  chmod 0555 -- "$target_path"
+}
+install_root="$tmp/install-root"
+source_file="$tmp/reviewed-probe.sh"
+printf '%s\n' '#!/usr/bin/env bash' >"$source_file"
+chmod 0500 "$source_file"
+
+# This is the #4 failure mode: install must reject a missing libexec parent
+# before invoking an installer, rather than creating directories implicitly.
+missing_target="$install_root/usr/local/libexec/ti0093-vm-preflight-probe"
+set +e; install_root_owned_script "$source_file" "$missing_target"; rc=$?; set -e
+[[ "$rc" == 2 && ! -e "$missing_target" && ! -e "$install_root/usr/local/libexec" ]] || test_fail install_missing_parent_fail_closed
+
+install_dir="$install_root/usr/local/sbin"
+mkdir -p -- "$install_dir"
+controller_target="$install_dir/ti0093-vm-preflight-controller"
+probe_target="$install_dir/ti0093-vm-preflight-probe"
+install_root_owned_script "$source_file" "$controller_target" || test_fail install_controller_existing_dir
+install_root_owned_script "$source_file" "$probe_target" || test_fail install_probe_existing_dir
+[[ -f "$probe_target" && ! -L "$probe_target" && "$(stat -Lc '%a' "$probe_target")" == 555 ]] || test_fail install_probe_mode
+
+printf '%s\n' preexisting >"$install_dir/collision"
+set +e; install_root_owned_script "$source_file" "$install_dir/collision"; rc=$?; set -e
+[[ "$rc" == 1 && "$(<"$install_dir/collision")" == preexisting ]] || test_fail install_collision_preserved
+symlink_target="$tmp/install-symlink-target"
+printf '%s\n' target >"$symlink_target"
+ln -s "$symlink_target" "$install_dir/symlink"
+set +e; install_root_owned_script "$source_file" "$install_dir/symlink"; rc=$?; set -e
+[[ "$rc" == 1 && -L "$install_dir/symlink" && "$(<"$symlink_target")" == target ]] || test_fail install_symlink_preserved
+
+# Simulate the EXIT trap after the controller install succeeded but the probe
+# install failed.  Only the execution-owned controller is removed.
+controller_installed="$controller_target"
+probe_installed="$probe_target"
+controller_installed_by_run=true
+probe_installed_by_run=false
+set +e
+( trap cleanup_partial_install EXIT; false )
+rc=$?
+set -e
+[[ "$rc" == 1 && ! -e "$controller_target" && -f "$probe_target" ]] || test_fail partial_install_cleanup
+unset -f sudo install install_root_owned_script cleanup_partial_install
+test_pass reviewed_script_installation_and_partial_cleanup
+
 # Exercise the two workflow staging blocks as the owning, non-root user when a
 # normal test user is available.  This deliberately uses the extracted
 # controller fragments rather than a duplicate fixture: the append is
@@ -532,6 +588,11 @@ line_of() { grep -nF -- "$1" "$2" | head -1 | cut -d: -f1; }
 (( $(line_of "main_unit_name_collision" "$tmp/controller.sh") < $(line_of 'systemd-run --system --quiet --unit="$MAIN_UNIT"' "$tmp/controller.sh") )) || test_fail unit_collision_order
 grep -Fq '[[ ! -e "$controller_installed" && ! -L "$controller_installed" ]] || exit 86' "$workflow" || test_fail controller_binary_collision
 grep -Fq '[[ ! -e "$probe_installed" && ! -L "$probe_installed" ]] || exit 86' "$workflow" || test_fail probe_binary_collision
+grep -Fq "readonly PROBE_PATH='/usr/local/sbin/ti0093-vm-preflight-probe'" "$workflow" || test_fail probe_path_controller_mismatch
+grep -Fq "probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'" "$workflow" || test_fail probe_install_path_controller_mismatch
+! grep -Fq '/usr/local/libexec/ti0093-vm-preflight-probe' "$workflow" || test_fail obsolete_probe_path_present
+grep -Fq '[[ -d "$target_dir" && ! -L "$target_dir" ]] || return 2' "$workflow" || test_fail probe_parent_directory_gate
+grep -Fq 'install_root_owned_script "$probe_stage" "$probe_installed" || exit 86' "$workflow" || test_fail probe_guarded_install
 grep -Fq 'RUN_OWNER_TAG="ti0093-${GITHUB_RUN_ID:-invalid}-${GITHUB_RUN_ATTEMPT:-invalid}-${GITHUB_SHA:-invalid}"' "$workflow" || test_fail unit_owner_tag
 test_pass collision_gates
 

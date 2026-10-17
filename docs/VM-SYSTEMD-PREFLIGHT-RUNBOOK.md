@@ -3,7 +3,8 @@
 ## Status and scope
 
 - Implementation status: prepared for independent review
-- Execution status: not executed
+- Execution status: execution #4 stopped during trusted-script installation;
+  controller and transient service were not started
 - Paperclip status: not downloaded, installed, or executed
 - P01/P02/P04 status: `planned` / NO-GO
 - Cost target: R$0 incremental, conditional on a public repository and the
@@ -42,7 +43,19 @@ repository. Its two embedded, repository-owned scripts are installed by the
 trusted runner shell as root-owned, mode `0555` files:
 
 - trusted controller: `/usr/local/sbin/ti0093-vm-preflight-controller`;
-- benign probe: `/usr/local/libexec/ti0093-vm-preflight-probe`.
+- benign probe: `/usr/local/sbin/ti0093-vm-preflight-probe`.
+
+Execution #4 (run `39075677975`, SHA
+`45b70744fd7771e5a82c17e881cce62b343aafcb`) failed before the controller ran:
+the GitHub-hosted image had no `/usr/local/libexec` directory, so the second
+`install` could not create the old probe path. The controller installation in
+`/usr/local/sbin` had already succeeded; no `systemd-run`, Docker, Paperclip,
+or dynamic isolation check was reached. The PR branch now uses the distinct
+probe path under that same existing directory and checks the destination
+directory, path collision and symlink state before installation. The workflow
+registered on `main` through PR #3 remains the earlier audited blob and does
+not include this compatibility correction; any future branch execution must
+use the newly reviewed PR #2 SHA.
 
 Before creating anything, the controller rejects collisions in its directories,
 sentinel, dedicated identity and both unit names. The workflow likewise rejects

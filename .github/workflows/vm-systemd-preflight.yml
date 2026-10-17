@@ -50,7 +50,7 @@ jobs:
           readonly LAB_WORK='/var/lib/ti0093-vm-preflight/work'
           readonly LAB_OUTSIDE='/var/lib/ti0093-vm-preflight/outside-writable-by-uid'
           readonly PRIVATE_ROOT='/run/ti0093-vm-preflight'
-          readonly PROBE_PATH='/usr/local/libexec/ti0093-vm-preflight-probe'
+          readonly PROBE_PATH='/usr/local/sbin/ti0093-vm-preflight-probe'
           readonly HOST_SENTINEL='/home/runner/work/.ti0093-vm-preflight-sentinel'
           readonly RELEASE_FILE='/var/lib/ti0093-vm-preflight/work/.release'
           readonly MAIN_UNIT='ti0093-vm-preflight.service'
@@ -668,9 +668,22 @@ jobs:
           controller_stage="$stage/controller.sh"
           probe_stage="$stage/probe.sh"
           controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
-          probe_installed='/usr/local/libexec/ti0093-vm-preflight-probe'
+          probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'
           controller_installed_by_run=false
           probe_installed_by_run=false
+          # INSTALL_HELPER_BEGIN
+          install_root_owned_script() {
+            local source_path="$1" target_path="$2" target_dir
+            target_dir="${target_path%/*}"
+            [[ -f "$source_path" && ! -L "$source_path" ]] || return 2
+            [[ -d "$target_dir" && ! -L "$target_dir" ]] || return 2
+            [[ ! -e "$target_path" && ! -L "$target_path" ]] || return 1
+            sudo install -o root -g root -m 0555 "$source_path" "$target_path"
+          }
+          # INSTALL_HELPER_END
+          [[ "$controller_installed" == '/usr/local/sbin/ti0093-vm-preflight-controller' ]] || exit 86
+          [[ "$probe_installed" == '/usr/local/sbin/ti0093-vm-preflight-probe' ]] || exit 86
+          # PARTIAL_INSTALL_CLEANUP_BEGIN
           cleanup_partial_install() {
             local rc=$? cleanup_rc=0
             if (( rc != 0 )); then
@@ -686,6 +699,7 @@ jobs:
             if (( cleanup_rc != 0 )); then trap - EXIT; exit 86; fi
             return "$rc"
           }
+          # PARTIAL_INSTALL_CLEANUP_END
           trap cleanup_partial_install EXIT
           [[ -f "$controller_stage" && ! -L "$controller_stage" ]] || exit 86
           [[ ! -e "$controller_installed" && ! -L "$controller_installed" ]] || exit 86
@@ -988,9 +1002,9 @@ jobs:
           chmod 0500 "$probe_stage"
           bash -n "$controller_stage"
           bash -n "$probe_stage"
-          sudo install -o root -g root -m 0555 "$controller_stage" "$controller_installed"
+          install_root_owned_script "$controller_stage" "$controller_installed" || exit 86
           controller_installed_by_run=true
-          sudo install -o root -g root -m 0555 "$probe_stage" "$probe_installed"
+          install_root_owned_script "$probe_stage" "$probe_installed" || exit 86
           probe_installed_by_run=true
           trap - EXIT
 
@@ -1002,7 +1016,7 @@ jobs:
 
           stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
           controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
-          probe_installed='/usr/local/libexec/ti0093-vm-preflight-probe'
+          probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'
           controller_owned=true
           probe_owned=true
           stage_owned=true
