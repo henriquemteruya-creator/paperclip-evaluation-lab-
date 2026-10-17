@@ -47,6 +47,31 @@ grep -Fq 'REPOSITORY_IS_PRIVATE="${{ github.event.repository.private }}"' "$work
 ! grep -Eqi 'paperclipai|pnpm|npm |apt(-get)? |git clone|git fetch|docker[[:space:]]' "$workflow" || test_fail prohibited_acquisition_or_docker
 test_pass workflow_surface
 
+python3 - "$workflow" <<'PY'
+import pathlib
+import re
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines(keepends=True)
+lengths = []
+for index, line in enumerate(lines):
+    match = re.match(r"^(\s*)run:\s*\|\s*$", line.rstrip("\n"))
+    if not match:
+        continue
+    parent_indent = len(match.group(1))
+    block = []
+    for candidate in lines[index + 1:]:
+        if candidate.strip() and len(candidate) - len(candidate.lstrip(" ")) <= parent_indent:
+            break
+        trim = min(len(candidate) - len(candidate.lstrip(" ")), parent_indent + 2)
+        block.append(candidate[trim:])
+    lengths.append(len("".join(block)))
+
+if len(lengths) != 3 or any(length >= 21000 for length in lengths):
+    raise SystemExit(1)
+PY
+test_pass run_expression_limits
+
 for required in \
   "--property='NoNewPrivileges=yes'" \
   "--property='PrivateNetwork=yes'" \
