@@ -45,6 +45,19 @@ trusted runner shell as root-owned, mode `0555` files:
 - trusted controller: `/usr/local/sbin/ti0093-vm-preflight-controller`;
 - benign probe: `/usr/local/sbin/ti0093-vm-preflight-probe`.
 
+Installation is transactional. Before reserving a temporary name, the runner
+requires the installation directory to be a non-symlink `root:root` mode `0755`
+directory. It creates a root-owned private temporary file in that directory,
+records its device/inode identity, and installs the script there. Only after
+the temporary file still has the recorded identity is the final, previously
+absent path published using an atomic hard link. The final path must then be a
+root-owned mode `0555` regular file with the same identity. On an installation
+failure, cleanup removes only a temporary or final path whose recorded identity
+is still present; an identity mismatch is a fail-closed error and is never
+deleted. This prevents a partial `install` failure from being mistaken for a
+preexisting resource while also preventing cleanup from removing an unproven
+path.
+
 Execution #4 (run `39075677975`, SHA
 `45b70744fd7771e5a82c17e881cce62b343aafcb`) failed before the controller ran:
 the GitHub-hosted image had no `/usr/local/libexec` directory, so the second

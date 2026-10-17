@@ -671,30 +671,96 @@ jobs:
           probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'
           controller_installed_by_run=false
           probe_installed_by_run=false
+          controller_installed_identity=''
+          probe_installed_identity=''
+          install_temp_path=''
+          install_temp_identity=''
+          install_temp_owned=false
           # INSTALL_HELPER_BEGIN
+          installation_dir_is_trusted() {
+            local target_dir="$1" metadata
+            [[ -d "$target_dir" && ! -L "$target_dir" ]] || return 1
+            metadata="$(stat -Lc '%u:%g:%a:%F' -- "$target_dir" 2>/dev/null)" || return 1
+            [[ "$metadata" == '0:0:755:directory' ]]
+          }
+
+          installation_temp_is_owned() {
+            local target_dir="$1" temp_path="$2" expected_identity="$3" metadata
+            [[ -n "$expected_identity" && "$temp_path" == "$target_dir"/.ti0093-vm-preflight-* ]] || return 1
+            installation_dir_is_trusted "$target_dir" || return 1
+            [[ -f "$temp_path" && ! -L "$temp_path" ]] || return 1
+            metadata="$(stat -Lc '%d:%i' -- "$temp_path" 2>/dev/null)" || return 1
+            [[ "$metadata" == "$expected_identity" ]]
+          }
+
           install_root_owned_script() {
-            local source_path="$1" target_path="$2" target_dir
+            local source_path="$1" target_path="$2" owned_flag_name="$3" identity_name="$4"
+            local target_dir target_name temp_template temp_metadata target_metadata
             target_dir="${target_path%/*}"
+            target_name="${target_path##*/}"
             [[ -f "$source_path" && ! -L "$source_path" ]] || return 2
-            [[ -d "$target_dir" && ! -L "$target_dir" ]] || return 2
+            installation_dir_is_trusted "$target_dir" || return 2
             [[ ! -e "$target_path" && ! -L "$target_path" ]] || return 1
-            sudo install -o root -g root -m 0555 "$source_path" "$target_path"
+            case "$owned_flag_name:$identity_name:$target_name" in
+              controller_installed_by_run:controller_installed_identity:ti0093-vm-preflight-controller|probe_installed_by_run:probe_installed_identity:ti0093-vm-preflight-probe) ;;
+              *) return 2 ;;
+            esac
+            printf -v "$owned_flag_name" '%s' false
+            printf -v "$identity_name" '%s' ''
+            install_temp_path=''
+            install_temp_identity=''
+            install_temp_owned=false
+            temp_template="$target_dir/.ti0093-vm-preflight-${target_name}.XXXXXXXXXX"
+            install_temp_path="$(sudo mktemp "$temp_template")" || return 2
+            [[ "$install_temp_path" == "$target_dir"/.ti0093-vm-preflight-"$target_name".* ]] || return 2
+            temp_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$install_temp_path" 2>/dev/null)" || return 2
+            [[ "$temp_metadata" =~ ^([0-9]+:[0-9]+):0:0:600:regular(\ empty)?\ file$ ]] || return 2
+            install_temp_identity="${BASH_REMATCH[1]}"
+            install_temp_owned=true
+            sudo install -o root -g root -m 0555 "$source_path" "$install_temp_path" || return 1
+            installation_temp_is_owned "$target_dir" "$install_temp_path" "$install_temp_identity" || return 2
+            [[ ! -e "$target_path" && ! -L "$target_path" ]] || return 1
+            sudo ln -- "$install_temp_path" "$target_path" || return 1
+            target_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$target_path" 2>/dev/null)" || return 2
+            [[ "$target_metadata" == "$install_temp_identity:0:0:555:regular file" ]] || return 2
+            printf -v "$owned_flag_name" '%s' true
+            printf -v "$identity_name" '%s' "$install_temp_identity"
+            sudo rm -f -- "$install_temp_path" || return 2
+            [[ ! -e "$install_temp_path" && ! -L "$install_temp_path" ]] || return 2
+            install_temp_path=''
+            install_temp_identity=''
+            install_temp_owned=false
           }
           # INSTALL_HELPER_END
           [[ "$controller_installed" == '/usr/local/sbin/ti0093-vm-preflight-controller' ]] || exit 86
           [[ "$probe_installed" == '/usr/local/sbin/ti0093-vm-preflight-probe' ]] || exit 86
           # PARTIAL_INSTALL_CLEANUP_BEGIN
+          remove_execution_owned_install() {
+            local target_path="$1" owned_flag_name="$2" identity_name="$3" expected_identity metadata
+            [[ "${!owned_flag_name}" == true ]] || return 0
+            expected_identity="${!identity_name}"
+            [[ -n "$expected_identity" && -f "$target_path" && ! -L "$target_path" ]] || return 1
+            metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$target_path" 2>/dev/null)" || return 1
+            [[ "$metadata" == "$expected_identity:0:0:555:regular file" ]] || return 1
+            sudo rm -f -- "$target_path" || return 1
+            [[ ! -e "$target_path" && ! -L "$target_path" ]] || return 1
+            printf -v "$owned_flag_name" '%s' false
+            printf -v "$identity_name" '%s' ''
+          }
+
           cleanup_partial_install() {
             local rc=$? cleanup_rc=0
             if (( rc != 0 )); then
-              if [[ "$probe_installed_by_run" == true ]]; then
-                sudo rm -f -- "$probe_installed" >/dev/null 2>&1 || cleanup_rc=1
-                [[ ! -e "$probe_installed" && ! -L "$probe_installed" ]] || cleanup_rc=1
+              if [[ "$install_temp_owned" == true ]]; then
+                if installation_temp_is_owned "${install_temp_path%/*}" "$install_temp_path" "$install_temp_identity"; then
+                  sudo rm -f -- "$install_temp_path" >/dev/null 2>&1 || cleanup_rc=1
+                  [[ ! -e "$install_temp_path" && ! -L "$install_temp_path" ]] || cleanup_rc=1
+                else
+                  cleanup_rc=1
+                fi
               fi
-              if [[ "$controller_installed_by_run" == true ]]; then
-                sudo rm -f -- "$controller_installed" >/dev/null 2>&1 || cleanup_rc=1
-                [[ ! -e "$controller_installed" && ! -L "$controller_installed" ]] || cleanup_rc=1
-              fi
+              remove_execution_owned_install "$probe_installed" probe_installed_by_run probe_installed_identity || cleanup_rc=1
+              remove_execution_owned_install "$controller_installed" controller_installed_by_run controller_installed_identity || cleanup_rc=1
             fi
             if (( cleanup_rc != 0 )); then trap - EXIT; exit 86; fi
             return "$rc"
@@ -1002,10 +1068,8 @@ jobs:
           chmod 0500 "$probe_stage"
           bash -n "$controller_stage"
           bash -n "$probe_stage"
-          install_root_owned_script "$controller_stage" "$controller_installed" || exit 86
-          controller_installed_by_run=true
-          install_root_owned_script "$probe_stage" "$probe_installed" || exit 86
-          probe_installed_by_run=true
+          install_root_owned_script "$controller_stage" "$controller_installed" controller_installed_by_run controller_installed_identity || exit 86
+          install_root_owned_script "$probe_stage" "$probe_installed" probe_installed_by_run probe_installed_identity || exit 86
           trap - EXIT
 
       - name: Run trusted controller with a benign transient service
