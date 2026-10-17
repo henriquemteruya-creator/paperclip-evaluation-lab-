@@ -690,6 +690,132 @@ jobs:
           }
           # DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_END
 
+          # DOCKER_MANAGED_HOST_SOURCE_GATE_BEGIN
+          # Stage 1 only: determine whether the unprivileged runner process can
+          # observe stable Docker-managed backing files.  This does not compare
+          # them with container-side objects and cannot authorize any mount.
+          host_gate_timeout() {
+            timeout "${HOST_GATE_TIMEOUT_SECONDS:-2}" "$@"
+          }
+          host_gate_docker_root_metadata() {
+            host_gate_timeout docker info --format '{{.DockerRootDir}}' 2>/dev/null
+          }
+          host_gate_source_metadata() {
+            local template
+            case "$1" in
+              etc_hosts) template='{{.HostsPath}}' ;;
+              etc_hostname) template='{{.HostnamePath}}' ;;
+              etc_resolv_conf) template='{{.ResolvConfPath}}' ;;
+              *) return 2 ;;
+            esac
+            host_gate_timeout docker inspect --format "$template" "$container_id" 2>/dev/null
+          }
+          host_gate_expected_basename() {
+            case "$1" in
+              etc_hosts) printf '%s\n' hosts ;;
+              etc_hostname) printf '%s\n' hostname ;;
+              etc_resolv_conf) printf '%s\n' resolv.conf ;;
+              *) return 2 ;;
+            esac
+          }
+          host_gate_canonical_path() {
+            host_gate_timeout readlink -f -- "$1" 2>/dev/null
+          }
+          host_gate_lstat_type() {
+            LC_ALL=C host_gate_timeout stat -c '%F' -- "$1" 2>/dev/null
+          }
+          host_gate_stat_record() {
+            LC_ALL=C host_gate_timeout stat -Lc '%F|%d|%i' -- "$1" 2>/dev/null
+          }
+          host_gate_path_components_safe() {
+            local candidate="$1" component cursor='' kind
+            [[ "$candidate" == /* && "$candidate" != *//* && "$candidate" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+            IFS=/ read -r -a host_gate_components <<<"${candidate#/}"
+            for component in "${host_gate_components[@]}"; do
+              [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+              cursor="$cursor/$component"
+              kind="$(host_gate_lstat_type "$cursor")" || return $?
+              [[ "$kind" != 'symbolic link' ]] || return 1
+            done
+          }
+          host_gate_root_snapshot() {
+            local root canonical kind rc
+            root="$(host_gate_docker_root_metadata)" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|docker_root_inspect'; return 1; }
+            [[ -n "$root" ]] || { printf '%s\n' 'error|docker_root_unavailable'; return 1; }
+            canonical="$(host_gate_canonical_path "$root")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|canonicalization_failed'; return 1; }
+            [[ "$root" == "$canonical" ]] || { printf '%s\n' 'error|symlink_or_noncanonical'; return 1; }
+            kind="$(host_gate_lstat_type "$root")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|docker_root_inaccessible'; return 1; }
+            [[ "$kind" == directory ]] || { printf '%s\n' 'error|docker_root_invalid_type'; return 1; }
+            host_gate_path_components_safe "$root" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|symlink_or_inaccessible_component'; return 1; }
+            printf 'ok|%s\n' "$root"
+          }
+          host_gate_source_snapshot() {
+            local id="$1" root="$2" source expected canonical kind record parent rc
+            expected="$(host_gate_expected_basename "$id")" || { printf '%s\n' 'error|unknown_id'; return 2; }
+            source="$(host_gate_source_metadata "$id")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|metadata_inspect'; return 1; }
+            [[ -n "$source" ]] || { printf '%s\n' 'error|metadata_unavailable'; return 1; }
+            [[ "$source" == "$root"/* && "${source##*/}" == "$expected" ]] || { printf '%s\n' 'error|provenance_invalid'; return 1; }
+            parent="${source%/*}"
+            [[ "${parent##*/}" == "$container_id" && "$container_id" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'error|container_identity_invalid'; return 1; }
+            host_gate_path_components_safe "$source" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|symlink_or_inaccessible_component'; return 1; }
+            canonical="$(host_gate_canonical_path "$source")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|canonicalization_failed'; return 1; }
+            [[ "$source" == "$canonical" ]] || { printf '%s\n' 'error|symlink_or_noncanonical'; return 1; }
+            kind="$(host_gate_lstat_type "$source")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|source_inaccessible'; return 1; }
+            [[ "$kind" == 'regular file' ]] || { printf '%s\n' 'error|source_invalid_type'; return 1; }
+            record="$(host_gate_stat_record "$source")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|source_inaccessible'; return 1; }
+            [[ "$record" =~ ^regular\ file\|[0-9]+\|[0-9]+$ ]] || { printf '%s\n' 'error|stat_malformed'; return 1; }
+            # Private return value: the caller compares it but never logs it.
+            printf 'ok|%s|%s\n' "$source" "$record"
+          }
+          run_docker_managed_host_source_gate() {
+            local sample id root_record root_status root_path source_record rc all_pass=true code
+            local root_first='' root_second=''
+            declare -A first_record=() second_record=() first_code=() second_code=()
+            for sample in 1 2; do
+              HOST_GATE_SAMPLE="$sample"
+              set +e; root_record="$(host_gate_root_snapshot)"; rc=$?; set -e
+              if (( rc == 0 )) && [[ "$root_record" == ok\|* ]]; then
+                root_status=none; root_path="${root_record#ok|}"
+                [[ "$sample" == 1 ]] && root_first="$root_path" || root_second="$root_path"
+              else
+                root_status="${root_record#error|}"
+                case "$root_status" in timeout|docker_root_inspect|docker_root_unavailable|canonicalization_failed|symlink_or_noncanonical|docker_root_inaccessible|docker_root_invalid_type|symlink_or_inaccessible_component) ;; *) root_status=inspection_failed ;; esac
+                root_path=''
+              fi
+              for id in etc_hosts etc_hostname etc_resolv_conf; do
+                if [[ "$root_status" != none ]]; then
+                  source_record=''; code="$root_status"
+                else
+                  set +e; source_record="$(host_gate_source_snapshot "$id" "$root_path")"; rc=$?; set -e
+                  if (( rc == 0 )) && [[ "$source_record" == ok\|* ]]; then code=none; else
+                    code="${source_record#error|}"
+                    case "$code" in timeout|metadata_inspect|metadata_unavailable|provenance_invalid|container_identity_invalid|symlink_or_inaccessible_component|canonicalization_failed|symlink_or_noncanonical|source_inaccessible|source_invalid_type|stat_malformed) ;; *) code=inspection_failed ;; esac
+                  fi
+                fi
+                if [[ "$sample" == 1 ]]; then first_record[$id]="$source_record"; first_code[$id]="$code"; else second_record[$id]="$source_record"; second_code[$id]="$code"; fi
+              done
+            done
+            for id in etc_hosts etc_hostname etc_resolv_conf; do
+              local accessible=false provenance_verified=false stable=false inspection_error=none
+              if [[ "${first_code[$id]}" == none && "${second_code[$id]}" == none ]]; then
+                accessible=true; provenance_verified=true
+                if [[ -n "$root_first" && "$root_first" == "$root_second" && "${first_record[$id]}" == "${second_record[$id]}" ]]; then
+                  stable=true
+                else
+                  inspection_error=sample_changed; all_pass=false
+                fi
+              else
+                inspection_error="${first_code[$id]}"
+                [[ "$inspection_error" != none ]] || inspection_error="${second_code[$id]}"
+                all_pass=false
+              fi
+              printf 'docker_managed_host_source_gate id=%s accessible=%s provenance_verified=%s stable=%s inspection_error=%s\n' \
+                "$id" "$accessible" "$provenance_verified" "$stable" "$inspection_error"
+            done
+            [[ "$all_pass" == true ]]
+          }
+          # DOCKER_MANAGED_HOST_SOURCE_GATE_END
+
           diagnostic_rc=99
           if runtime_collection_permitted; then
             if ! diagnostic_log="$(mktemp)"; then
@@ -1242,7 +1368,21 @@ jobs:
             if [[ "$runtime_ready" == true ]]; then
               collect_docker_managed_etc_metadata_phase runtime
               if runtime_docker_managed_etc_metadata_paths_available; then
-                collect_docker_managed_etc_runtime
+                set +e
+                host_source_gate_diagnostic="$(run_docker_managed_host_source_gate)"
+                host_source_gate_rc=$?
+                set -e
+                while IFS= read -r host_source_gate_line; do
+                  [[ -n "$host_source_gate_line" ]] && info "$host_source_gate_line"
+                done <<<"$host_source_gate_diagnostic"
+                if (( host_source_gate_rc == 0 )); then
+                  pass 'docker-managed host source viability gate passed; diagnostic only'
+                else
+                  diagnostic_no_go 'docker-managed host source viability gate inconclusive'
+                fi
+                # Stage 1 can never authorize the three mounts.  The private
+                # container-to-runner evidence protocol is intentionally absent.
+                diagnostic_no_go 'docker-managed host source viability gate is diagnostic-only'
               fi
             else
               diagnostic_no_go 'docker-managed etc runtime diagnostic readiness timeout or start failure'
