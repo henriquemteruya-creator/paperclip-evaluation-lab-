@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Run trusted controller with a benign transient service
+      - name: Stage trusted controller source
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -25,15 +25,6 @@ jobs:
 
           stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
           controller_stage="$stage/controller.sh"
-          probe_stage="$stage/probe.sh"
-          controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
-          probe_installed='/usr/local/libexec/ti0093-vm-preflight-probe'
-
-          cleanup_stage() {
-            sudo rm -f -- "$controller_installed" "$probe_installed" >/dev/null 2>&1 || true
-            rm -rf -- "$stage" >/dev/null 2>&1 || true
-          }
-          trap cleanup_stage EXIT
           mkdir -m 0700 -- "$stage"
 
           # CONTROLLER_HEREDOC_BEGIN
@@ -440,6 +431,21 @@ jobs:
           CONTROLLER
           # CONTROLLER_HEREDOC_END
 
+          chmod 0500 "$controller_stage"
+
+      - name: Stage benign probe and install reviewed scripts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
+          controller_stage="$stage/controller.sh"
+          probe_stage="$stage/probe.sh"
+          controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
+          probe_installed='/usr/local/libexec/ti0093-vm-preflight-probe'
+          [[ -f "$controller_stage" && ! -L "$controller_stage" ]] || exit 86
+
           # PROBE_HEREDOC_BEGIN
           cat >"$probe_stage" <<'PROBE'
           #!/usr/bin/env bash
@@ -586,11 +592,27 @@ jobs:
           PROBE
           # PROBE_HEREDOC_END
 
-          chmod 0500 "$controller_stage" "$probe_stage"
+          chmod 0500 "$probe_stage"
           bash -n "$controller_stage"
           bash -n "$probe_stage"
           sudo install -o root -g root -m 0555 "$controller_stage" "$controller_installed"
           sudo install -o root -g root -m 0555 "$probe_stage" "$probe_installed"
+
+      - name: Run trusted controller with a benign transient service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
+          controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
+          probe_installed='/usr/local/libexec/ti0093-vm-preflight-probe'
+          cleanup_stage() {
+            sudo rm -f -- "$controller_installed" "$probe_installed" >/dev/null 2>&1 || true
+            rm -rf -- "$stage" >/dev/null 2>&1 || true
+          }
+          trap cleanup_stage EXIT
+          [[ -x "$controller_installed" && -x "$probe_installed" ]] || exit 86
 
           set +e
           sudo env -i \
