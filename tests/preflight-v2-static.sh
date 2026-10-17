@@ -1161,4 +1161,37 @@ chmod 700 "$fake_ip"
 set +e; route_verdict "$fake_ip" 6; rc=$?; set -e
 assert_rc 0 "$rc" ipv6_no_route_passes
 
+# Documentary closure contract. These assertions prevent future edits from
+# converting the ambiguous #13 timeout into an unsupported access finding or
+# silently reopening Paperclip execution without an architecture decision.
+closure_doc="$root_dir/docs/ETC-MOUNT-CORRELATION-PENDING.md"
+isolation_doc="$root_dir/docs/ISOLATION-LIMITS.md"
+[[ -f "$closure_doc" && -f "$isolation_doc" ]] || { printf 'FAIL closure documentation missing\n' >&2; exit 1; }
+for required in \
+  'host_source_viability=unproven' \
+  'host_sources_proven_inaccessible=false' \
+  'limitation_class=timeout_ambiguous_stage' \
+  'private_protocol_status=blocked' \
+  'evidence_complete=false' \
+  'paperclip_tests=P01,P02,P04:NO-GO' \
+  'rerun_14=not_authorized' \
+  '39050285747' \
+  '92fb8aa0838b5205334a0f462c8b0e91df21646d'; do
+  rg -Fq "$required" "$closure_doc" || { printf 'FAIL closure marker missing: %s\n' "$required" >&2; exit 1; }
+done
+for mask_id in proc_acpi proc_scsi sys_firmware proc_interrupts proc_kcore proc_keys proc_latency_stats proc_timer_list; do
+  rg -Fq "$mask_id" "$closure_doc" || { printf 'FAIL masked-mount evidence missing: %s\n' "$mask_id" >&2; exit 1; }
+done
+rg -Fq '.Mounts=unavailable' "$closure_doc"
+rg -Fq 'rootful Docker' "$closure_doc"
+rg -Fq 'user namespace' "$closure_doc"
+rg -Fq 'new, explicit architecture decision' "$closure_doc"
+rg -Fq 'host_source_viability=unproven' "$isolation_doc"
+rg -Fq 'timeout or privilege and rerunning the same design is not authorized.' "$isolation_doc"
+if rg -qi 'host_sources_proven_inaccessible=true|host_source_viability=proved|private_protocol_status=(approved|ready)|paperclip_tests=P01,P02,P04:GO|rerun_14=authorized' "$closure_doc" "$isolation_doc"; then
+  printf 'FAIL closure documentation contains an unsupported GO or access claim\n' >&2
+  exit 1
+fi
+printf 'PASS host_source_viability_closure_is_documented_fail_closed\n'
+
 printf '%s\n' 'PASS preflight_v2_static_complete'
