@@ -38,6 +38,13 @@ bash -n "$tmp/controller.sh"
 bash -n "$tmp/probe.sh"
 test_pass embedded_scripts_parse
 
+python3 - "$workflow" <<'PY'
+import pathlib, sys, yaml
+document = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert isinstance(document, dict) and "jobs" in document
+PY
+test_pass yaml_valid
+
 [[ "$(grep -Ec '^[[:space:]]*workflow_dispatch:' "$workflow")" == 1 ]] || test_fail dispatch_trigger
 ! grep -Eq '^[[:space:]]*(push|pull_request|schedule|workflow_call):' "$workflow" || test_fail automatic_trigger
 grep -Fxq 'permissions: {}' "$workflow" || test_fail permissions
@@ -73,15 +80,15 @@ PY
 test_pass run_expression_limits
 
 for required in \
-  "--property='NoNewPrivileges=yes'" \
-  "--property='PrivateNetwork=yes'" \
-  "--property='ProtectSystem=strict'" \
-  "--property='ProtectHome=yes'" \
-  "--property='MemoryMax=256M'" \
-  "--property='CPUQuota=50%'" \
-  "--property='TasksMax=64'" \
-  "--property='CapabilityBoundingSet='" \
-  "--property='AmbientCapabilities='" \
+  "-p 'NoNewPrivileges=yes'" \
+  "-p 'PrivateNetwork=yes'" \
+  "-p 'ProtectSystem=strict'" \
+  "-p 'ProtectHome=yes'" \
+  "-p 'MemoryMax=256M'" \
+  "-p 'CPUQuota=50%'" \
+  "-p 'TasksMax=64'" \
+  "-p 'CapabilityBoundingSet='" \
+  "-p 'AmbientCapabilities='" \
   "systemd-run --system"; do
   grep -Fq -- "$required" "$tmp/controller.sh" || test_fail "missing_control_${required//[^a-zA-Z0-9]/_}"
 done
@@ -97,7 +104,7 @@ test_pass socket_policy
 # Source the real parser function without installing the controller's EXIT trap.
 extract_marker_block PROBE_LOG_PARSER_BEGIN PROBE_LOG_PARSER_END "$tmp/controller.sh" "$tmp/parser.sh"
 MAX_LOG_BYTES=16384
-EXPECTED_RECORDS=22
+EXPECTED_RECORDS=23
 # shellcheck disable=SC1090
 source "$tmp/parser.sh"
 
@@ -107,13 +114,13 @@ make_valid_log() {
   local ids=(
     identity groups privilege_tools capabilities nonewprivs environment
     descriptors workdir_write outside_write_denied tmp_write_denied
-    vartmp_write_denied workspace_hidden controller_hidden sockets_hidden
+    vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden
     network_interfaces routes dns_blocked tcp_blocked https_blocked
     cgroup_memory cgroup_pids cgroup_cpu
   )
   for id in "${ids[@]}"; do printf 'RESULT id=%s status=PASS code=ok\n' "$id" >>"$output"; done
-  printf 'READY status=PASS records=22\n' >>"$output"
-  [[ "$phase" == final ]] && printf 'FINAL status=PASS records=22\n' >>"$output"
+  printf 'READY status=PASS records=23\n' >>"$output"
+  [[ "$phase" == final ]] && printf 'FINAL status=PASS records=23\n' >>"$output"
   chmod 0600 "$output"
 }
 
@@ -169,6 +176,99 @@ captured="$(parse_probe_log "$tmp/sanitization.log" ready 2>&1 || true)"
 [[ "$captured" != *"$secret"* && "$captured" != *'/home/runner'* && "$captured" != *'abc123'* ]] || test_fail parser_leak
 test_pass parser_sanitization
 
+cp "$valid_final" "$tmp/final-before-ready.log"
+python3 - "$tmp/final-before-ready.log" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); lines=p.read_text().splitlines()
+lines[-2], lines[-1] = lines[-1], lines[-2]
+p.write_text("\n".join(lines)+"\n")
+PY
+expect_reject "$tmp/final-before-ready.log" final final_before_ready
+
+cp "$valid_ready" "$tmp/ready-early.log"
+sed -i '1iREADY status=PASS records=23' "$tmp/ready-early.log"
+expect_reject "$tmp/ready-early.log" ready ready_before_results
+
+cp "$valid_ready" "$tmp/result-after-ready.log"
+sed -n '1p' "$valid_ready" >>"$tmp/result-after-ready.log"
+expect_reject "$tmp/result-after-ready.log" ready result_after_ready
+
+cp "$valid_final" "$tmp/after-final.log"
+printf '%s\n' 'READY status=PASS records=23' >>"$tmp/after-final.log"
+expect_reject "$tmp/after-final.log" final record_after_final
+test_pass parser_marker_order
+
+# Exercise the closed FD validator extracted from the actual embedded probe.
+extract_marker_block FD_VALIDATOR_BEGIN FD_VALIDATOR_END "$tmp/probe.sh" "$tmp/fd-validator.sh"
+source "$tmp/fd-validator.sh"
+mkdir "$tmp/fds"
+: >"$tmp/probe-fixture"; : >"$tmp/fd-output"
+ln -s /dev/null "$tmp/fds/0"
+ln -s "$tmp/fd-output" "$tmp/fds/1"
+ln -s "$tmp/fd-output" "$tmp/fds/2"
+ln -s "$tmp/probe-fixture" "$tmp/fds/255"
+validate_descriptor_snapshot "$tmp/fds" "$tmp/probe-fixture" || test_fail fd_clean_rejected
+ln -s /etc/passwd "$tmp/fds/9"
+if validate_descriptor_snapshot "$tmp/fds" "$tmp/probe-fixture"; then test_fail fd_extra_accepted; fi
+rm "$tmp/fds/9"
+set +e
+validate_descriptor_snapshot /missing "$tmp/probe-fixture"
+fd_missing_rc=$?
+set -e
+[[ "$fd_missing_rc" == 2 ]] || test_fail fd_inspection_not_inconclusive
+test_pass descriptor_closed_allowlist
+
+# Pure classifiers are the same functions used by the runtime checks.
+extract_marker_block NETWORK_CLASSIFIERS_BEGIN NETWORK_CLASSIFIERS_END "$tmp/probe.sh" "$tmp/network.sh"
+source "$tmp/network.sh"
+classify_dns_result 2 || test_fail dns_blocked_rejected
+set +e; classify_dns_result 0; rc=$?; set -e; [[ "$rc" == 1 ]] || test_fail dns_connected_not_rejected
+set +e; classify_dns_result 124; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail dns_timeout_not_inconclusive
+printf '%s\n' 'bash: connect: Network is unreachable' >"$tmp/tcp.err"
+classify_tcp_result 1 "$tmp/tcp.err" || test_fail tcp_blocked_rejected
+: >"$tmp/tcp.err"
+set +e; classify_tcp_result 1 "$tmp/tcp.err"; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail tcp_tool_error_not_inconclusive
+set +e; classify_tcp_result 0 "$tmp/tcp.err"; rc=$?; set -e; [[ "$rc" == 1 ]] || test_fail tcp_connected_not_rejected
+classify_https_result 7 true true || test_fail https_blocked_rejected
+set +e; classify_https_result 7 false true; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail https_ambiguous_not_inconclusive
+set +e; classify_https_result 35 true true; rc=$?; set -e; [[ "$rc" == 1 ]] || test_fail tls_reachability_not_rejected
+set +e; classify_https_result 28 true true; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail https_timeout_not_inconclusive
+test_pass network_result_classification
+
+extract_marker_block SOCKET_SCAN_VALIDATOR_BEGIN SOCKET_SCAN_VALIDATOR_END "$tmp/probe.sh" "$tmp/socket-validator.sh"
+source "$tmp/socket-validator.sh"
+validate_socket_scan 0 '' || test_fail empty_socket_scan_rejected
+set +e; validate_socket_scan 0 synthetic_socket; rc=$?; set -e; [[ "$rc" == 1 ]] || test_fail socket_not_rejected
+set +e; validate_socket_scan 1 ''; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail socket_scan_error_not_inconclusive
+test_pass socket_scan_fail_closed
+
+# Simulate ownership flags against the exact cleanup function from the controller.
+extract_marker_block OWNED_CLEANUP_BEGIN OWNED_CLEANUP_END "$tmp/controller.sh" "$tmp/cleanup.sh"
+source "$tmp/cleanup.sh"
+declare -a cleanup_calls=()
+stop_owned_unit() { cleanup_calls+=("unit:$1"); [[ "${STOP_FAIL:-false}" != true ]]; }
+userdel() { cleanup_calls+=("user:$1"); return 0; }
+groupdel() { cleanup_calls+=("group:$1"); return 0; }
+getent() { return 1; }
+rm() { cleanup_calls+=("path:${*: -1}"); return 0; }
+MAIN_UNIT=main.service TIMEOUT_UNIT=timeout.service LAB_USER=lab LAB_GROUP=lab
+HOST_SENTINEL=/home/runner/work/.ti0093-vm-preflight-sentinel
+PRIVATE_ROOT=/run/ti0093-vm-preflight LAB_ROOT=/var/lib/ti0093-vm-preflight
+main_owned=false timeout_owned=false user_owned=false sentinel_owned=false private_root_created=false lab_root_created=false
+cleanup_owned_resources || test_fail empty_cleanup_failed
+(( ${#cleanup_calls[@]} == 0 )) || test_fail preexisting_resources_touched
+main_owned=true private_root_created=true user_owned=true
+cleanup_owned_resources || test_fail partial_owned_cleanup_failed
+[[ " ${cleanup_calls[*]} " == *' unit:main.service '* && " ${cleanup_calls[*]} " == *' user:lab '* && " ${cleanup_calls[*]} " == *' path:/run/ti0093-vm-preflight '* ]] || test_fail partial_cleanup_missing
+[[ " ${cleanup_calls[*]} " != *'timeout.service'* && " ${cleanup_calls[*]} " != *'/var/lib/ti0093-vm-preflight'* ]] || test_fail unowned_resource_touched
+cleanup_calls=(); main_owned=true lab_root_created=true STOP_FAIL=true
+set +e; cleanup_owned_resources; rc=$?; set -e
+[[ "$rc" == 1 && " ${cleanup_calls[*]} " == *' unit:main.service '* && " ${cleanup_calls[*]} " == *' path:/var/lib/ti0093-vm-preflight '* ]] || test_fail cleanup_failure_not_preserved
+unset STOP_FAIL
+unset -f stop_owned_unit userdel groupdel getent rm
+test_pass owned_cleanup_collision_and_partial_failure
+
 grep -Fq "StandardOutput=append:\$log_file" "$tmp/controller.sh" || test_fail private_output
 grep -Fq "StandardError=append:\$log_file" "$tmp/controller.sh" || test_fail private_error
 ! grep -Fq 'systemd-run --pipe' "$tmp/controller.sh" || test_fail pipe_streaming
@@ -191,11 +291,24 @@ grep -Fq '/proc/self/status' "$tmp/probe.sh" || test_fail runtime_status_probe
 grep -Fq '/proc/self/cgroup' "$tmp/probe.sh" || test_fail runtime_cgroup_probe
 test_pass effective_runtime_probes
 
-grep -Fq "install -o root -g root -m 0444 /dev/null \"\$HOST_SENTINEL\"" "$tmp/controller.sh" || test_fail readable_workspace_sentinel
-grep -Fq "install -d -o \"\$LAB_USER\" -g \"\$LAB_GROUP\" -m 0700 \"\$LAB_WORK\" \"\$LAB_OUTSIDE\"" "$tmp/controller.sh" || test_fail uid_owned_outside_fixture
+grep -Fq "sentinel_owned=true" "$tmp/controller.sh" || test_fail readable_workspace_sentinel
+grep -Fq 'mkdir -m 0700 -- "$LAB_WORK" "$LAB_OUTSIDE"' "$tmp/controller.sh" || test_fail uid_owned_outside_fixture
 grep -Fq "ReadWritePaths=\$LAB_WORK" "$tmp/controller.sh" || test_fail closed_write_allowlist
-grep -Fq "ReadOnlyPaths=/tmp /var/tmp" "$tmp/controller.sh" || test_fail private_tmp_readonly
+grep -Fq "ReadOnlyPaths=/tmp /var/tmp /dev/shm" "$tmp/controller.sh" || test_fail temporary_paths_readonly
+grep -Fq "TemporaryFileSystem=/run:ro,nosuid,nodev,noexec,size=1M" "$tmp/controller.sh" || test_fail run_private_readonly
+grep -Fq '/dev/shm/ti0093-denied' "$tmp/probe.sh" || test_fail devshm_write_probe
+grep -Fq 'find -L "$root" -xdev -type s' "$tmp/probe.sh" || test_fail filesystem_socket_scan
 test_pass filesystem_fixture_design
+
+# Collision checks must precede creators, and every destructive cleanup path is ownership-gated.
+line_of() { grep -nF -- "$1" "$2" | head -1 | cut -d: -f1; }
+(( $(line_of "lab_root_preexisting" "$tmp/controller.sh") < $(line_of 'mkdir -m 0755 -- "$LAB_ROOT"' "$tmp/controller.sh") )) || test_fail lab_collision_order
+(( $(line_of "host_sentinel_preexisting" "$tmp/controller.sh") < $(line_of 'sentinel_owned=true' "$tmp/controller.sh") )) || test_fail sentinel_collision_order
+(( $(line_of "main_unit_name_collision" "$tmp/controller.sh") < $(line_of 'systemd-run --system --quiet --unit="$MAIN_UNIT"' "$tmp/controller.sh") )) || test_fail unit_collision_order
+grep -Fq '[[ ! -e "$controller_installed" && ! -L "$controller_installed" ]] || exit 86' "$workflow" || test_fail controller_binary_collision
+grep -Fq '[[ ! -e "$probe_installed" && ! -L "$probe_installed" ]] || exit 86' "$workflow" || test_fail probe_binary_collision
+grep -Fq 'RUN_OWNER_TAG="ti0093-${GITHUB_RUN_ID:-invalid}-${GITHUB_RUN_ATTEMPT:-invalid}-${GITHUB_SHA:-invalid}"' "$workflow" || test_fail unit_owner_tag
+test_pass collision_gates
 
 grep -Fq "REPOSITORY_IS_PRIVATE:-}" "$tmp/controller.sh" || test_fail repository_visibility_consumed
 grep -Fq "WORKFLOW_SHA:-}" "$tmp/controller.sh" || test_fail immutable_sha_gate
