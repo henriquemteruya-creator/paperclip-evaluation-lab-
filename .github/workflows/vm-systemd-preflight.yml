@@ -1,0 +1,604 @@
+name: Paperclip TI-0093 - benign VM systemd preflight
+
+# CONTROL-ONLY. This workflow does not download, install, or execute Paperclip.
+# A passing run is evidence for this sandbox profile only and is not permission
+# to run P01, P02, P04, merge, deploy, or acquire third-party dependencies.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: paperclip-ti-0093-vm-systemd-preflight
+  cancel-in-progress: false
+
+jobs:
+  benign-vm-systemd-preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Run trusted controller with a benign transient service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
+          controller_stage="$stage/controller.sh"
+          probe_stage="$stage/probe.sh"
+          controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
+          probe_installed='/usr/local/libexec/ti0093-vm-preflight-probe'
+
+          cleanup_stage() {
+            sudo rm -f -- "$controller_installed" "$probe_installed" >/dev/null 2>&1 || true
+            rm -rf -- "$stage" >/dev/null 2>&1 || true
+          }
+          trap cleanup_stage EXIT
+          mkdir -m 0700 -- "$stage"
+
+          # CONTROLLER_HEREDOC_BEGIN
+          cat >"$controller_stage" <<'CONTROLLER'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          umask 077
+
+          readonly LAB_USER='ti0093probe'
+          readonly LAB_GROUP='ti0093probe'
+          readonly LAB_ROOT='/var/lib/ti0093-vm-preflight'
+          readonly LAB_WORK='/var/lib/ti0093-vm-preflight/work'
+          readonly LAB_OUTSIDE='/var/lib/ti0093-vm-preflight/outside-writable-by-uid'
+          readonly PRIVATE_ROOT='/run/ti0093-vm-preflight'
+          readonly PROBE_PATH='/usr/local/libexec/ti0093-vm-preflight-probe'
+          readonly HOST_SENTINEL='/home/runner/work/.ti0093-vm-preflight-sentinel'
+          readonly RELEASE_FILE='/var/lib/ti0093-vm-preflight/work/.release'
+          readonly MAIN_UNIT='ti0093-vm-preflight.service'
+          readonly TIMEOUT_UNIT='ti0093-vm-timeout-canary.service'
+          readonly MAX_LOG_BYTES=16384
+          readonly EXPECTED_RECORDS=22
+
+          failures=()
+          main_log=''
+          timeout_log=''
+          main_pid=''
+          service_user_created=false
+
+          pass() { printf 'PASS %s\n' "$1"; }
+          fail() { failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
+          info() { printf 'INFO %s\n' "$1"; }
+
+          command_required() {
+            command -v "$1" >/dev/null 2>&1 || fail "missing_program_$1"
+          }
+
+          unit_stop() {
+            local unit="$1"
+            systemctl --system stop "$unit" >/dev/null 2>&1 || true
+            systemctl --system kill --kill-whom=all "$unit" >/dev/null 2>&1 || true
+            systemctl --system reset-failed "$unit" >/dev/null 2>&1 || true
+          }
+
+          cleanup() {
+            set +e
+            unit_stop "$MAIN_UNIT"
+            unit_stop "$TIMEOUT_UNIT"
+            if [[ "$service_user_created" == true ]]; then
+              userdel "$LAB_USER" >/dev/null 2>&1 || true
+              groupdel "$LAB_GROUP" >/dev/null 2>&1 || true
+            fi
+            rm -f -- "$HOST_SENTINEL" "$PROBE_PATH"
+            rm -rf -- "$PRIVATE_ROOT" "$LAB_ROOT"
+          }
+          trap cleanup EXIT
+
+          show_value() {
+            local unit="$1" property="$2"
+            timeout 3 systemctl --system show "$unit" --property="$property" --value 2>/dev/null
+          }
+
+          show_exact() {
+            local unit="$1" property="$2" expected="$3" id="$4" actual
+            if ! actual="$(show_value "$unit" "$property")"; then
+              fail "${id}_query_error"
+            elif [[ "$actual" != "$expected" ]]; then
+              fail "${id}_mismatch"
+            else
+              pass "$id"
+            fi
+          }
+
+          wait_for_log_marker() {
+            local file="$1" marker="$2" attempts=0
+            while (( attempts < 150 )); do
+              [[ -f "$file" ]] && grep -Fxq -- "$marker" "$file" 2>/dev/null && return 0
+              sleep 0.1
+              (( ++attempts ))
+            done
+            return 1
+          }
+
+          wait_for_unit_terminal() {
+            local unit="$1" attempts=0 state
+            while (( attempts < 150 )); do
+              if ! state="$(show_value "$unit" ActiveState)"; then
+                return 2
+              fi
+              case "$state" in
+                inactive|failed) return 0 ;;
+                activating|active|deactivating|reloading) ;;
+                *) return 2 ;;
+              esac
+              sleep 0.1
+              (( ++attempts ))
+            done
+            return 1
+          }
+
+          log_file_is_private() {
+            local file="$1" metadata
+            [[ -f "$file" && ! -L "$file" ]] || return 1
+            metadata="$(stat -Lc '%u:%g:%a:%F' -- "$file" 2>/dev/null)" || return 1
+            [[ "$metadata" == '0:0:600:regular file' ]]
+          }
+
+          # PROBE_LOG_PARSER_BEGIN
+          parse_probe_log() {
+            local file="$1" phase="$2" line id status code extra
+            local ready_count=0 final_count=0 result_count=0 parser_error=0
+            local ready_status='' final_status=''
+            local -A expected=() seen=()
+            local expected_ids=(
+              identity groups privilege_tools capabilities nonewprivs environment
+              descriptors workdir_write outside_write_denied tmp_write_denied
+              vartmp_write_denied workspace_hidden controller_hidden sockets_hidden
+              network_interfaces routes dns_blocked tcp_blocked https_blocked
+              cgroup_memory cgroup_pids cgroup_cpu
+            )
+
+            [[ "$phase" == ready || "$phase" == final ]] || return 2
+            [[ -f "$file" && ! -L "$file" ]] || return 2
+            [[ "$(stat -Lc '%s' -- "$file" 2>/dev/null)" =~ ^[0-9]+$ ]] || return 2
+            (( $(stat -Lc '%s' -- "$file") <= MAX_LOG_BYTES )) || return 2
+            LC_ALL=C grep -q '[^[:print:][:space:]]' "$file" && return 2
+            grep -Fq '::' "$file" && return 2
+            [[ -s "$file" ]] || return 2
+            [[ "$(tail -c 1 -- "$file" | wc -l)" == 1 ]] || return 2
+
+            for id in "${expected_ids[@]}"; do expected["$id"]=1; done
+
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^RESULT\ id=([a-z0-9_]+)\ status=(PASS|FAIL)\ code=([a-z0-9_]+)$ ]]; then
+                id="${BASH_REMATCH[1]}"; status="${BASH_REMATCH[2]}"; code="${BASH_REMATCH[3]}"
+                [[ -n "${expected[$id]+x}" ]] || { parser_error=1; continue; }
+                [[ -z "${seen[$id]+x}" ]] || { parser_error=1; continue; }
+                seen["$id"]=1
+                (( ++result_count ))
+                [[ "$status" == PASS && "$code" == ok ]] || parser_error=1
+              elif [[ "$line" =~ ^READY\ status=(PASS|FAIL)\ records=([0-9]+)$ ]]; then
+                (( ++ready_count )); ready_status="${BASH_REMATCH[1]}"
+                [[ "${BASH_REMATCH[2]}" == "$EXPECTED_RECORDS" ]] || parser_error=1
+              elif [[ "$line" =~ ^FINAL\ status=(PASS|FAIL)\ records=([0-9]+)$ ]]; then
+                (( ++final_count )); final_status="${BASH_REMATCH[1]}"
+                [[ "${BASH_REMATCH[2]}" == "$EXPECTED_RECORDS" ]] || parser_error=1
+              else
+                parser_error=1
+              fi
+            done <"$file"
+
+            (( result_count == EXPECTED_RECORDS && ready_count == 1 )) || parser_error=1
+            for id in "${expected_ids[@]}"; do [[ -n "${seen[$id]+x}" ]] || parser_error=1; done
+            [[ "$ready_status" == PASS ]] || parser_error=1
+            if [[ "$phase" == ready ]]; then
+              (( final_count == 0 )) || parser_error=1
+            else
+              (( final_count == 1 )) || parser_error=1
+              [[ "$final_status" == PASS ]] || parser_error=1
+            fi
+            (( parser_error == 0 )) || return 1
+            return 0
+          }
+          # PROBE_LOG_PARSER_END
+
+          build_service_args() {
+            local log_file="$1" runtime="$2"
+            SERVICE_ARGS=(
+              --property="User=$LAB_USER"
+              --property="Group=$LAB_GROUP"
+              --property='SupplementaryGroups='
+              --property='CapabilityBoundingSet='
+              --property='AmbientCapabilities='
+              --property='NoNewPrivileges=yes'
+              --property='PrivateNetwork=yes'
+              --property='PrivateTmp=yes'
+              --property='PrivateDevices=yes'
+              --property='ProtectSystem=strict'
+              --property='ProtectHome=yes'
+              --property='ProtectControlGroups=yes'
+              --property='ProtectKernelTunables=yes'
+              --property='ProtectKernelModules=yes'
+              --property='ProtectKernelLogs=yes'
+              --property='ProtectHostname=yes'
+              --property='ProtectClock=yes'
+              --property='ProtectProc=invisible'
+              --property='ProcSubset=pid'
+              --property='RestrictNamespaces=yes'
+              --property='RestrictSUIDSGID=yes'
+              --property='RestrictRealtime=yes'
+              --property='LockPersonality=yes'
+              --property='RemoveIPC=yes'
+              --property='MemoryDenyWriteExecute=yes'
+              --property='MemoryPressureWatch=no'
+              --property='SetLoginEnvironment=no'
+              --property='SystemCallArchitectures=native'
+              --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'
+              --property="WorkingDirectory=$LAB_WORK"
+              --property="ReadWritePaths=$LAB_WORK"
+              --property='ReadOnlyPaths=/tmp /var/tmp'
+              --property="InaccessiblePaths=-$PRIVATE_ROOT -/run/docker.sock -/var/run/docker.sock -/run/systemd/private -/var/run/systemd/private -/run/dbus/system_bus_socket -/var/run/dbus/system_bus_socket -/run/containerd/containerd.sock -/run/snapd.socket -/run/udev/control -/usr/bin/sudo -/bin/sudo -/usr/bin/su -/bin/su -/usr/bin/pkexec -/usr/bin/doas -/bin/doas"
+              --property='MemoryMax=256M'
+              --property='CPUQuota=50%'
+              --property='TasksMax=64'
+              --property="RuntimeMaxSec=$runtime"
+              --property='UMask=0077'
+              --property='StandardInput=null'
+              --property="StandardOutput=append:$log_file"
+              --property="StandardError=append:$log_file"
+              --property='UnsetEnvironment=GITHUB_TOKEN GH_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN GITHUB_ENV GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_PATH HOME HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS OPENAI_API_KEY ANTHROPIC_API_KEY'
+              --setenv='PATH=/usr/sbin:/usr/bin:/sbin:/bin'
+              --setenv='LANG=C'
+              --setenv='LC_ALL=C'
+            )
+          }
+
+          verify_runtime_namespaces() {
+            local pid="$1" host_net service_net host_mnt service_mnt
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+            host_net="$(readlink /proc/self/ns/net 2>/dev/null)" || return 2
+            service_net="$(readlink "/proc/$pid/ns/net" 2>/dev/null)" || return 2
+            host_mnt="$(readlink /proc/self/ns/mnt 2>/dev/null)" || return 2
+            service_mnt="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)" || return 2
+            [[ "$host_net" != "$service_net" && "$host_mnt" != "$service_mnt" ]]
+          }
+
+          verify_unit_cgroup_empty() {
+            local unit="$1" cgroup
+            cgroup="$(show_value "$unit" ControlGroup)" || return 2
+            [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
+            if [[ -e "/sys/fs/cgroup$cgroup/cgroup.procs" ]]; then
+              [[ ! -s "/sys/fs/cgroup$cgroup/cgroup.procs" ]]
+            else
+              return 0
+            fi
+          }
+
+          write_summary() {
+            local verdict="$1" summary_path="${SUMMARY_PATH:-}"
+            [[ -n "$summary_path" && "$summary_path" == /home/runner/work/_temp/* ]] || return 1
+            {
+              printf '%s\n' '## Paperclip TI-0093 — benign VM/systemd preflight'
+              printf '\n- Verdict: **%s**\n' "$verdict"
+              printf '%s\n' '- Scope: control-only; Paperclip not downloaded, installed, or executed'
+              printf '%s\n' '- Runner: standard `ubuntu-24.04`'
+              printf '%s\n' '- Service profile: dedicated UID/GID, system manager, private network, protected filesystem, cgroup limits'
+              printf '%s\n' '- Raw service output: private, parsed locally, not published'
+              printf '%s\n' '- Authorization: this result never authorizes P01/P02/P04, merge, or deploy'
+              printf '\nSanitized control failures: `%s`\n' "${#failures[@]}"
+            } >>"$summary_path"
+          }
+
+          main() {
+            [[ "${EUID:-$(id -u)}" == 0 ]] || { printf '%s\n' 'NO-GO controller_not_root'; exit 86; }
+
+            [[ "${REPOSITORY_IS_PRIVATE:-}" == false ]] || fail 'repository_not_public'
+            [[ "${WORKFLOW_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || fail 'workflow_sha_invalid'
+            [[ -n "${SUMMARY_PATH:-}" ]] || fail 'summary_path_missing'
+
+            local program
+            for program in bash systemctl systemd-run useradd userdel groupdel getent install stat timeout grep awk readlink ip curl env find sort tail wc pgrep sleep chmod rm; do
+              command_required "$program"
+            done
+            [[ -d /run/systemd/system ]] || fail 'system_manager_absent'
+            [[ -f /sys/fs/cgroup/cgroup.controllers ]] || fail 'cgroup_v2_absent'
+            local manager_version
+            if ! manager_version="$(timeout 3 systemctl --system show --property=Version --value 2>/dev/null)" || [[ -z "$manager_version" ]]; then
+              fail 'system_manager_query_failed'
+            else
+              pass 'system_manager_available'
+            fi
+
+            if (( ${#failures[@]} != 0 )); then
+              write_summary 'NO-GO' || true
+              exit 86
+            fi
+
+            [[ ! -e "$LAB_ROOT" && ! -e "$PRIVATE_ROOT" ]] || { fail 'lab_path_preexisting'; write_summary 'NO-GO' || true; exit 86; }
+            [[ -x "$PROBE_PATH" && ! -L "$PROBE_PATH" ]] || { fail 'probe_integrity_missing'; write_summary 'NO-GO' || true; exit 86; }
+            [[ "$(stat -Lc '%u:%g:%a:%F' "$PROBE_PATH")" == '0:0:555:regular file' ]] || { fail 'probe_integrity_invalid'; write_summary 'NO-GO' || true; exit 86; }
+
+            if getent passwd "$LAB_USER" >/dev/null 2>&1 || getent group "$LAB_GROUP" >/dev/null 2>&1; then
+              fail 'dedicated_identity_preexisting'
+              write_summary 'NO-GO' || true
+              exit 86
+            fi
+            useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$LAB_USER" >/dev/null 2>&1 || { fail 'dedicated_identity_create_failed'; write_summary 'NO-GO' || true; exit 86; }
+            service_user_created=true
+            local lab_uid lab_gid
+            lab_uid="$(id -u "$LAB_USER")"; lab_gid="$(id -g "$LAB_USER")"
+            [[ "$lab_uid" != 0 && "$lab_gid" != 0 ]] || fail 'dedicated_identity_is_root'
+            [[ "$(id -G "$LAB_USER" | wc -w)" == 1 ]] || fail 'dedicated_identity_has_supplementary_groups'
+
+            install -d -o root -g root -m 0755 "$LAB_ROOT"
+            install -d -o "$LAB_USER" -g "$LAB_GROUP" -m 0700 "$LAB_WORK" "$LAB_OUTSIDE"
+            install -d -o root -g root -m 0700 "$PRIVATE_ROOT"
+            main_log="$PRIVATE_ROOT/main.log"
+            timeout_log="$PRIVATE_ROOT/timeout.log"
+            install -o root -g root -m 0600 /dev/null "$main_log"
+            install -o root -g root -m 0600 /dev/null "$timeout_log"
+            install -o root -g root -m 0444 /dev/null "$HOST_SENTINEL"
+            printf '%s\n' 'synthetic-public-sentinel' >"$HOST_SENTINEL"
+            chmod 0444 "$HOST_SENTINEL"
+
+            log_file_is_private "$main_log" || fail 'main_log_not_private'
+            log_file_is_private "$timeout_log" || fail 'timeout_log_not_private'
+
+            build_service_args "$main_log" 45s
+            local start_rc=0
+            systemd-run --system --quiet --unit="$MAIN_UNIT" --service-type=exec "${SERVICE_ARGS[@]}" "$PROBE_PATH" "$RELEASE_FILE" >"$PRIVATE_ROOT/controller-start.out" 2>&1 || start_rc=$?
+            if (( start_rc != 0 )); then
+              fail 'main_unit_start_failed'
+              write_summary 'NO-GO' || true
+              exit 86
+            fi
+
+            if ! wait_for_log_marker "$main_log" "READY status=PASS records=$EXPECTED_RECORDS"; then
+              fail 'probe_ready_missing'
+            fi
+
+            main_pid="$(show_value "$MAIN_UNIT" MainPID 2>/dev/null || true)"
+            if ! verify_runtime_namespaces "$main_pid"; then
+              fail 'runtime_namespace_verification_failed'
+            else
+              pass 'runtime_namespaces_distinct'
+            fi
+
+            show_exact "$MAIN_UNIT" User "$LAB_USER" 'unit_user_effective'
+            show_exact "$MAIN_UNIT" Group "$LAB_GROUP" 'unit_group_effective'
+            show_exact "$MAIN_UNIT" NoNewPrivileges yes 'unit_nonewprivs_effective'
+            show_exact "$MAIN_UNIT" PrivateNetwork yes 'unit_private_network_effective'
+            show_exact "$MAIN_UNIT" PrivateTmp yes 'unit_private_tmp_effective'
+            show_exact "$MAIN_UNIT" PrivateDevices yes 'unit_private_devices_effective'
+            show_exact "$MAIN_UNIT" ProtectSystem strict 'unit_protect_system_effective'
+            show_exact "$MAIN_UNIT" ProtectHome yes 'unit_protect_home_effective'
+            show_exact "$MAIN_UNIT" ProtectControlGroups yes 'unit_protect_cgroups_effective'
+            show_exact "$MAIN_UNIT" RestrictNamespaces yes 'unit_restrict_namespaces_effective'
+            show_exact "$MAIN_UNIT" MemoryMax 268435456 'unit_memory_limit_effective'
+            show_exact "$MAIN_UNIT" TasksMax 64 'unit_tasks_limit_effective'
+            show_exact "$MAIN_UNIT" CPUQuotaPerSecUSec 500ms 'unit_cpu_limit_effective'
+            show_exact "$MAIN_UNIT" RuntimeMaxUSec 45s 'unit_runtime_limit_effective'
+            show_exact "$MAIN_UNIT" CapabilityBoundingSet '' 'unit_capability_bound_empty'
+            show_exact "$MAIN_UNIT" AmbientCapabilities '' 'unit_ambient_capabilities_empty'
+            show_exact "$MAIN_UNIT" WorkingDirectory "$LAB_WORK" 'unit_workdir_effective'
+
+            case "$(parse_probe_log "$main_log" ready; printf '%s' "$?")" in
+              0) pass 'probe_ready_log_valid' ;;
+              1) fail 'probe_ready_reported_failure' ;;
+              *) fail 'probe_ready_parser_error' ;;
+            esac
+
+            install -o "$LAB_USER" -g "$LAB_GROUP" -m 0600 /dev/null "$RELEASE_FILE"
+            local main_wait_rc=0
+            wait_for_unit_terminal "$MAIN_UNIT" || main_wait_rc=$?
+            case "$main_wait_rc" in
+              0) ;;
+              1) fail 'main_unit_completion_timeout' ;;
+              *) fail 'main_unit_state_query_error' ;;
+            esac
+            show_exact "$MAIN_UNIT" Result success 'main_unit_result_success'
+            show_exact "$MAIN_UNIT" ExecMainStatus 0 'main_unit_exit_zero'
+            if verify_unit_cgroup_empty "$MAIN_UNIT"; then pass 'main_unit_cgroup_empty'; else fail 'main_unit_cgroup_not_empty'; fi
+            case "$(parse_probe_log "$main_log" final; printf '%s' "$?")" in
+              0) pass 'probe_final_log_valid' ;;
+              1) fail 'probe_final_reported_failure' ;;
+              *) fail 'probe_final_parser_error' ;;
+            esac
+
+            build_service_args "$timeout_log" 3s
+            local timeout_start_rc=0 timeout_wait_rc=0
+            systemd-run --system --quiet --unit="$TIMEOUT_UNIT" --service-type=exec "${SERVICE_ARGS[@]}" /usr/bin/sleep 30 >"$PRIVATE_ROOT/controller-timeout-start.out" 2>&1 || timeout_start_rc=$?
+            if (( timeout_start_rc != 0 )); then
+              fail 'timeout_canary_start_failed'
+            else
+              wait_for_unit_terminal "$TIMEOUT_UNIT" || timeout_wait_rc=$?
+              case "$timeout_wait_rc" in
+                0) ;;
+                1) fail 'timeout_canary_did_not_stop' ;;
+                *) fail 'timeout_canary_state_query_error' ;;
+              esac
+              show_exact "$TIMEOUT_UNIT" Result timeout 'timeout_canary_result'
+              show_exact "$TIMEOUT_UNIT" MainPID 0 'timeout_canary_no_main_pid'
+              if verify_unit_cgroup_empty "$TIMEOUT_UNIT"; then pass 'timeout_canary_cgroup_empty'; else fail 'timeout_canary_cgroup_not_empty'; fi
+            fi
+
+            unit_stop "$MAIN_UNIT"
+            unit_stop "$TIMEOUT_UNIT"
+            if pgrep -u "$lab_uid" >/dev/null 2>&1; then
+              fail 'cleanup_left_processes'
+            else
+              pass 'cleanup_no_processes'
+            fi
+
+            local verdict='GO'
+            (( ${#failures[@]} == 0 )) || verdict='NO-GO'
+            write_summary "$verdict" || { fail 'summary_write_failed'; verdict='NO-GO'; }
+            info "verdict_$verdict"
+            info "sanitized_failure_count_${#failures[@]}"
+            [[ "$verdict" == GO ]] || exit 86
+          }
+
+          if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+            main "$@"
+          fi
+          CONTROLLER
+          # CONTROLLER_HEREDOC_END
+
+          # PROBE_HEREDOC_BEGIN
+          cat >"$probe_stage" <<'PROBE'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          umask 077
+
+          readonly EXPECTED_USER='ti0093probe'
+          readonly EXPECTED_GROUP='ti0093probe'
+          readonly WORK='/var/lib/ti0093-vm-preflight/work'
+          readonly OUTSIDE='/var/lib/ti0093-vm-preflight/outside-writable-by-uid'
+          readonly HOST_SENTINEL='/home/runner/work/.ti0093-vm-preflight-sentinel'
+          readonly PRIVATE_ROOT='/run/ti0093-vm-preflight'
+          readonly EXPECTED_RECORDS=22
+          release_file="${1:-}"
+          records=0
+          failures=0
+
+          emit() {
+            local id="$1" status="$2" code="$3"
+            [[ "$id" =~ ^[a-z0-9_]+$ && "$status" =~ ^(PASS|FAIL)$ && "$code" =~ ^[a-z0-9_]+$ ]] || exit 90
+            printf 'RESULT id=%s status=%s code=%s\n' "$id" "$status" "$code"
+            (( ++records ))
+            [[ "$status" == PASS ]] || (( ++failures ))
+          }
+          ok() { emit "$1" PASS ok; }
+          bad() { emit "$1" FAIL "$2"; }
+
+          check_identity() {
+            [[ "$(id -u)" != 0 && "$(id -un)" == "$EXPECTED_USER" && "$(id -gn)" == "$EXPECTED_GROUP" ]] && ok identity || bad identity mismatch
+          }
+          check_groups() {
+            local groups
+            groups="$(id -Gn 2>/dev/null)" || { bad groups query_error; return; }
+            [[ "$(wc -w <<<"$groups")" == 1 && "$groups" == "$EXPECTED_GROUP" ]] && ok groups || bad groups unexpected
+          }
+          check_privilege_tools() {
+            if ! command -v sudo >/dev/null 2>&1 && ! command -v su >/dev/null 2>&1 && ! command -v pkexec >/dev/null 2>&1 && ! command -v doas >/dev/null 2>&1; then ok privilege_tools; else bad privilege_tools visible; fi
+          }
+          check_capabilities() {
+            local value key
+            for key in CapInh CapPrm CapEff CapBnd CapAmb; do
+              value="$(awk -v k="$key:" '$1==k {print $2}' /proc/self/status 2>/dev/null)" || { bad capabilities read_error; return; }
+              [[ "$value" == 0000000000000000 ]] || { bad capabilities nonzero; return; }
+            done
+            ok capabilities
+          }
+          check_nonewprivs() {
+            [[ "$(awk '$1=="NoNewPrivs:" {print $2}' /proc/self/status 2>/dev/null)" == 1 ]] && ok nonewprivs || bad nonewprivs disabled
+          }
+          check_environment() {
+            local name line unknown=0 sensitive=0 count=0
+            while IFS= read -r line; do
+              name="${line%%=*}"; (( ++count ))
+              case "$name" in PATH|LANG|LC_ALL|USER|LOGNAME|SHELL|INVOCATION_ID|SYSTEMD_EXEC_PID|PWD|SHLVL|_) ;;
+                *) unknown=1 ;;
+              esac
+              [[ "$name" =~ (GITHUB|ACTIONS|TOKEN|SECRET|CREDENTIAL|PASSWORD|PROXY|AWS|AZURE|GOOGLE|OPENAI|ANTHROPIC) ]] && sensitive=1
+            done < <(env)
+            if (( sensitive == 0 && unknown == 0 && count <= 11 )); then ok environment; else bad environment unexpected; fi
+          }
+          check_descriptors() {
+            local fd target escaped=0
+            for fd in /proc/self/fd/[0-9]*; do
+              [[ -e "$fd" ]] || continue
+              case "${fd##*/}" in 0|1|2|255) continue ;; esac
+              target="$(readlink "$fd" 2>/dev/null || true)"
+              case "$target" in socket:*|/home/*|/run/systemd/*|/run/docker.sock|/var/run/docker.sock) escaped=1 ;; esac
+            done
+            (( escaped == 0 )) && ok descriptors || bad descriptors escaped
+          }
+          check_filesystem() {
+            if printf x >"$WORK/allowed" 2>/dev/null && rm -f "$WORK/allowed"; then ok workdir_write; else bad workdir_write denied; fi
+            if ( printf x >"$OUTSIDE/denied" ) 2>/dev/null; then rm -f "$OUTSIDE/denied"; bad outside_write_denied writable; else ok outside_write_denied; fi
+            if ( printf x >/tmp/ti0093-denied ) 2>/dev/null; then rm -f /tmp/ti0093-denied; bad tmp_write_denied writable; else ok tmp_write_denied; fi
+            if ( printf x >/var/tmp/ti0093-denied ) 2>/dev/null; then rm -f /var/tmp/ti0093-denied; bad vartmp_write_denied writable; else ok vartmp_write_denied; fi
+            if [[ ! -r "$HOST_SENTINEL" ]] && ! ls /home/runner/work >/dev/null 2>&1; then ok workspace_hidden; else bad workspace_hidden visible; fi
+            if [[ ! -e "$PRIVATE_ROOT" ]] && ! ls "$PRIVATE_ROOT" >/dev/null 2>&1; then ok controller_hidden; else bad controller_hidden visible; fi
+          }
+          check_sockets() {
+            local socket_path
+            local paths=(/run/docker.sock /var/run/docker.sock /run/systemd/private /var/run/systemd/private /run/dbus/system_bus_socket /var/run/dbus/system_bus_socket /run/containerd/containerd.sock /run/snapd.socket /run/udev/control)
+            for socket_path in "${paths[@]}"; do
+              if [[ -e "$socket_path" || -S "$socket_path" ]]; then bad sockets_hidden visible; return; fi
+            done
+            ok sockets_hidden
+          }
+          check_network() {
+            local interfaces routes4 routes6
+            mapfile -t interfaces < <(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort)
+            if (( ${#interfaces[@]} == 1 )) && [[ "${interfaces[0]}" == lo ]]; then ok network_interfaces; else bad network_interfaces unexpected; fi
+            if ! routes4="$(ip -4 route show 2>/dev/null)" || ! routes6="$(ip -6 route show 2>/dev/null)"; then
+              bad routes query_error
+            elif [[ -z "$routes4" && -z "$routes6" ]]; then ok routes; else bad routes external; fi
+            if timeout 3 getent ahosts example.com >/dev/null 2>&1; then bad dns_blocked resolved; else ok dns_blocked; fi
+            if timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1; then bad tcp_blocked connected; else ok tcp_blocked; fi
+            if timeout 3 curl --fail --silent --show-error --max-time 2 https://example.com >/dev/null 2>&1; then bad https_blocked connected; else ok https_blocked; fi
+          }
+          check_cgroups() {
+            local line rel base memory pids quota period
+            line="$(awk -F: '$1=="0" && $2=="" {print; count++} END {if (count != 1) exit 1}' /proc/self/cgroup 2>/dev/null)" || {
+              bad cgroup_memory query_error; bad cgroup_pids query_error; bad cgroup_cpu query_error; return;
+            }
+            rel="${line#0::}"
+            [[ "$rel" == /* && "$rel" != *'..'* ]] || { bad cgroup_memory malformed; bad cgroup_pids malformed; bad cgroup_cpu malformed; return; }
+            base="/sys/fs/cgroup$rel"
+            memory="$(<"$base/memory.max")" 2>/dev/null || memory=''
+            pids="$(<"$base/pids.max")" 2>/dev/null || pids=''
+            read -r quota period <"$base/cpu.max" 2>/dev/null || { quota=''; period=''; }
+            [[ "$memory" == 268435456 ]] && ok cgroup_memory || bad cgroup_memory mismatch
+            [[ "$pids" == 64 ]] && ok cgroup_pids || bad cgroup_pids mismatch
+            if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( quota * 2 == period )); then ok cgroup_cpu; else bad cgroup_cpu mismatch; fi
+          }
+
+          check_identity
+          check_groups
+          check_privilege_tools
+          check_capabilities
+          check_nonewprivs
+          check_environment
+          check_descriptors
+          check_filesystem
+          check_sockets
+          check_network
+          check_cgroups
+
+          [[ "$records" == "$EXPECTED_RECORDS" ]] || exit 91
+          if (( failures == 0 )); then
+            printf 'READY status=PASS records=%s\n' "$records"
+          else
+            printf 'READY status=FAIL records=%s\n' "$records"
+            exit 92
+          fi
+
+          release_wait=0
+          while [[ ! -e "$release_file" && "$release_wait" -lt 200 ]]; do
+            sleep 0.1
+            (( ++release_wait ))
+          done
+          if [[ ! -e "$release_file" ]]; then
+            printf 'FINAL status=FAIL records=%s\n' "$records"
+            exit 93
+          fi
+          printf 'FINAL status=PASS records=%s\n' "$records"
+          PROBE
+          # PROBE_HEREDOC_END
+
+          chmod 0500 "$controller_stage" "$probe_stage"
+          bash -n "$controller_stage"
+          bash -n "$probe_stage"
+          sudo install -o root -g root -m 0555 "$controller_stage" "$controller_installed"
+          sudo install -o root -g root -m 0555 "$probe_stage" "$probe_installed"
+
+          set +e
+          sudo env -i \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            REPOSITORY_IS_PRIVATE="${{ github.event.repository.private }}" \
+            WORKFLOW_SHA="${GITHUB_SHA:-}" \
+            SUMMARY_PATH="${GITHUB_STEP_SUMMARY:-}" \
+            "$controller_installed"
+          controller_rc=$?
+          set -e
+          exit "$controller_rc"
