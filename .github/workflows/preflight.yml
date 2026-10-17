@@ -1,211 +1,1429 @@
-name: Paperclip TI-0093 - isolation diagnostic only
+name: Paperclip TI-0093 - isolation preflight v2
 
-# DIAGNOSTIC ONLY. Never downloads, installs or executes Paperclip.
-# PASS of this diagnostic is NOT permission to run Paperclip P01/P02/P04.
-# A later execution workflow requires a separate review, immutable image,
-# offline dependencies, isolated filesystem and explicit approval.
+# DIAGNOSTIC ONLY.  This workflow never downloads, installs or executes
+# Paperclip.  It has no automatic trigger and deliberately uses no actions.
 on:
   workflow_dispatch:
 
+# No repository-content, issue, package, deployment or OIDC permission.
+# GitHub may still report its unavoidable Metadata: read capability.
 permissions: {}
 
 concurrency:
-  group: paperclip-ti-0093-diagnostic
+  group: paperclip-ti-0093-preflight-v2
   cancel-in-progress: false
 
 jobs:
-  isolation-diagnostic:
+  isolation-preflight:
+    # No jobs.container: Actions injects docker.sock and runner bind mounts
+    # into job containers before steps begin.  This trusted host script creates
+    # the diagnostic container itself with no --mount or --volume arguments.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    container:
-      # Mutable tag intentionally acceptable ONLY for a diagnostic without
-      # executing third-party code. Never use this image reference for P01/2/4.
-      image: ubuntu:24.04
-      options: >-
-        --cap-drop=ALL
-        --security-opt=no-new-privileges
-        --pids-limit=256
-        --memory=2g
-        --cpus=1
+
     steps:
-      - name: Fail-closed isolation diagnostic (no third-party code)
+      - name: Fail-closed Docker isolation diagnostic (no Paperclip)
         shell: bash
         run: |
           set -Eeuo pipefail
           umask 077
-          failures=()
-          fail() { failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
+
+          # This shell runs on the GitHub-hosted runner and is trusted only as
+          # infrastructure.  No third-party source or script is invoked here.
+          # Mandatory controls gate container start.  Diagnostic findings are
+          # fail-closed for the final verdict, but may be collected at runtime
+          # when all mandatory pre-start controls have passed.
+          hard_prestart_failures=()
+          diagnostic_findings=()
+          container_id=''
+          diagnostic_log=''
+          diagnostic_start_pid=''
+          fail() { hard_prestart_failures+=("$1"); printf 'NO-GO %s\n' "$1"; }
+          diagnostic_no_go() { diagnostic_findings+=("$1"); printf 'DIAGNOSTIC-NO-GO %s\n' "$1"; }
           pass() { printf 'PASS %s\n' "$1"; }
           info() { printf 'INFO %s\n' "$1"; }
+          # PREFLIGHT_DECISION_HELPERS_BEGIN
+          runtime_collection_permitted() { (( ${#hard_prestart_failures[@]} == 0 )); }
+          final_verdict_is_go() { (( ${#hard_prestart_failures[@]} == 0 && ${#diagnostic_findings[@]} == 0 )); }
+          # PREFLIGHT_DECISION_HELPERS_END
+          cleanup() {
+            if [[ -n "$diagnostic_start_pid" ]]; then
+              kill "$diagnostic_start_pid" >/dev/null 2>&1 || true
+              wait "$diagnostic_start_pid" >/dev/null 2>&1 || true
+            fi
+            if [[ -n "$container_id" ]]; then
+              docker rm --force "$container_id" >/dev/null 2>&1 || true
+            fi
+            [[ -z "$diagnostic_log" ]] || rm -f "$diagnostic_log"
+          }
+          trap cleanup EXIT
 
-          # Fail rather than printing credentials or full environment.
+          # Never print the environment.  A value here is a hard failure;
+          # nothing from this host environment is passed to docker run/create.
           for name in GITHUB_TOKEN GH_TOKEN GH_PAT CI_TOKEN \
                       ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
                       AWS_ACCESS_KEY_ID GOOGLE_APPLICATION_CREDENTIALS \
                       AZURE_CLIENT_SECRET OPENAI_API_KEY ANTHROPIC_API_KEY; do
-            if [[ -n "${!name:-}" ]]; then fail "credential variable present: $name"; fi
+            [[ -z "${!name:-}" ]] || fail "credential-like host environment variable present: $name"
           done
 
-          ws="${GITHUB_WORKSPACE:-/github/workspace}"
-          if [[ -e "$ws/.git" || -e "$ws/package.json" || -e "$ws/pnpm-lock.yaml" ]]; then
+          # No checkout action is used.  A populated workspace would be an
+          # unexpected source exposure and blocks this diagnostic.
+          workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be defined}"
+          if [[ -e "$workspace/.git" || -e "$workspace/package.json" || -e "$workspace/pnpm-lock.yaml" ]]; then
             fail 'workspace is not source-free'
           else
-            pass 'no checked-out source detected at workspace root'
+            pass 'workspace has no checked-out source'
           fi
 
-          for command in bash setpriv unshare getent openssl awk grep readlink \
-                         timeout id cat sort wc tee find; do
-            if ! command -v "$command" >/dev/null 2>&1; then
-              fail "required diagnostic program unavailable: $command"
-            fi
-          done
+          command -v docker >/dev/null 2>&1 || fail 'Docker client unavailable on runner'
+          if runtime_collection_permitted; then
+            docker version --format '{{.Server.APIVersion}}' >/dev/null 2>&1 || fail 'Docker daemon unavailable on runner'
+          fi
 
-          if (( ${#failures[@]} == 0 )); then
-            # The inherited container process may start privileged. No
-            # third-party code is ever invoked in that context.
+          # Digest copied from the publisher’s GHCR package page.  It is a
+          # public diagnostic image; it is not Paperclip and carries no user
+          # data.  Its Dockerfile includes bash, openssl, curl, iproute2 and nc.
+          image='ghcr.io/nicolaka/netshoot:v0.16@sha256:147f2c4cb0aa7a741151bce2bfef71d9e1a04631636e24665ee2a5ed799feb47'
+          expected_digest="${image##*@}"
+
+          if runtime_collection_permitted; then
+            # Image acquisition is the only intentional runner egress.  It is
+            # completed before the isolated diagnostic starts.
+            docker pull "$image" >/dev/null 2>&1 || fail 'cannot pull pinned public diagnostic image'
+          fi
+          if runtime_collection_permitted; then
+            docker image inspect "$image" --format '{{join .RepoDigests "\n"}}' | \
+              grep -Fq "@$expected_digest" || fail 'pulled image does not retain expected digest'
+          fi
+
+          if runtime_collection_permitted; then
+            # No --mount, --volume, --env-file, --privileged, --pid=host,
+            # --ipc=host or --userns=host.  The two tmpfs mounts are explicit,
+            # bounded scratch space; the root filesystem is read-only.
             set +e
-            setpriv \
-              --reuid=10001 --regid=10001 --clear-groups \
-              --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
-              --no-new-privs bash -s <<'REDUCED'
+            container_id="$(docker create \
+              --network none \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+              --tmpfs /run:rw,noexec,nosuid,size=8m \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --pids-limit 128 \
+              --memory 512m \
+              --cpus 1 \
+              --user 10001:10001 \
+              --interactive \
+              --workdir /tmp \
+              --entrypoint /bin/bash \
+              "$image" -s 2>/dev/null)"
+            create_rc=$?
+            set -e
+            if (( create_rc != 0 )) || [[ -z "$container_id" ]]; then
+              fail 'Docker could not create the isolated diagnostic container'
+            fi
+          fi
+
+          if [[ -n "$container_id" ]]; then
+            # Every inspect failure is a NO-GO; never interpret a missing value
+            # as a secure default.
+            inspect_value() { docker inspect --format "$1" "$container_id"; }
+            inspect_exact() {
+              local label="$1" expected="$2" template="$3" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" != "$expected" ]]; then
+                fail "$label has unexpected value: $actual"
+              fi
+            }
+            inspect_empty_collection() {
+              local label="$1" template="$2" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" != 'null' && "$actual" != '[]' && "$actual" != '{}' && "$actual" != '<no value>' ]]; then
+                fail "$label is unexpectedly populated"
+              fi
+            }
+            inspect_not_host() {
+              local label="$1" template="$2" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" == host ]]; then
+                fail "$label is host"
+              fi
+            }
+            inspect_contains() {
+              local label="$1" needle="$2" template="$3" actual
+              if ! actual="$(inspect_value "$template")"; then
+                fail "docker inspect failed for $label"
+              elif [[ "$actual" != *"$needle"* ]]; then
+                fail "$label does not contain required value"
+              fi
+            }
+
+            # TMPFS_VALIDATOR_BEGIN
+            normalize_tmpfs_size() {
+              local raw="${1,,}" expected_bytes="$2" number unit expected_value
+              if [[ ! "$raw" =~ ^([0-9]+)(b|k|kb|ki|kib|m|mb|mi|mib)?$ ]]; then
+                return 2
+              fi
+              number="${BASH_REMATCH[1]}"
+              unit="${BASH_REMATCH[2]:-b}"
+              case "$unit" in
+                b) expected_value="$expected_bytes" ;;
+                k|kb|ki|kib) expected_value="$(( expected_bytes / 1024 ))" ;;
+                m|mb|mi|mib) expected_value="$(( expected_bytes / 1048576 ))" ;;
+                *) return 2 ;;
+              esac
+              [[ "$number" == "$expected_value" ]] || return 1
+              printf '%s\n' "$expected_bytes"
+            }
+
+            validate_tmpfs_config() {
+              local entries="$1" path options extra expected_bytes token size_raw size_bytes tmpfs_key
+              local tmp_seen=0 run_seen=0 unexpected_keys=0 invalid=0 parse_error=0
+              local rw_seen=0 noexec_seen=0 nosuid_seen=0 size_seen=0
+              while IFS='|' read -r path options extra; do
+                [[ -z "$path" && -z "$options" && -z "$extra" ]] && continue
+                if [[ -z "$path" || -z "$options" || -n "$extra" ]]; then
+                  parse_error=1
+                  continue
+                fi
+                case "$path" in
+                  /tmp) expected_bytes=67108864; tmpfs_key=tmp; (( ++tmp_seen )) ;;
+                  /run) expected_bytes=8388608; tmpfs_key=run; (( ++run_seen )) ;;
+                  *) expected_bytes=''; tmpfs_key=unexpected; (( ++unexpected_keys )) ;;
+                esac
+                if [[ "$options" == *, || "$options" == *',,'* ]]; then
+                  parse_error=1
+                  printf 'tmpfs_key=%s state=invalid\n' "$tmpfs_key"
+                  continue
+                fi
+                [[ "$tmpfs_key" != unexpected ]] || continue
+                if (( tmp_seen > 1 || run_seen > 1 )); then
+                  invalid=1
+                  continue
+                fi
+                rw_seen=0; noexec_seen=0; nosuid_seen=0; size_seen=0; size_bytes=''
+                IFS=',' read -r -a tmpfs_tokens <<< "$options"
+                for token in "${tmpfs_tokens[@]}"; do
+                  case "$token" in
+                    rw) (( ++rw_seen )) ;;
+                    noexec) (( ++noexec_seen )) ;;
+                    nosuid) (( ++nosuid_seen )) ;;
+                    size=*)
+                      (( ++size_seen ))
+                      size_raw="${token#size=}"
+                      if ! size_bytes="$(normalize_tmpfs_size "$size_raw" "$expected_bytes")"; then
+                        invalid=1
+                      fi
+                      ;;
+                    *) invalid=1 ;;
+                  esac
+                done
+                if (( rw_seen != 1 || noexec_seen != 1 || nosuid_seen != 1 || size_seen != 1 )); then
+                  invalid=1
+                fi
+                # Only sanitized, expected keys and normalized sizes are emitted.
+                if [[ -n "$size_bytes" && "$size_bytes" == "$expected_bytes" && "$rw_seen" == 1 && "$noexec_seen" == 1 && "$nosuid_seen" == 1 ]]; then
+                  printf 'tmpfs_key=%s flags=rw,noexec,nosuid size_bytes=%s\n' "$path" "$size_bytes"
+                else
+                  printf 'tmpfs_key=%s state=invalid\n' "$path"
+                fi
+              done <<< "$entries"
+              (( tmp_seen != 0 )) || printf '%s\n' 'tmpfs_key=/tmp state=missing'
+              (( run_seen != 0 )) || printf '%s\n' 'tmpfs_key=/run state=missing'
+              printf 'tmpfs_unexpected_key_count=%s\n' "$unexpected_keys"
+              if (( parse_error != 0 )); then
+                printf '%s\n' 'tmpfs_parser_error'
+                return 2
+              fi
+              (( tmp_seen == 1 && run_seen == 1 && unexpected_keys == 0 && invalid == 0 )) || return 1
+              return 0
+            }
+
+            validate_inspected_tmpfs() {
+              local entries
+              if ! entries="$(inspect_value '{{range $k,$v := .HostConfig.Tmpfs}}{{printf "%s|%s\n" $k $v}}{{end}}')"; then
+                printf '%s\n' 'tmpfs_inspect_error'
+                return 2
+              fi
+              validate_tmpfs_config "$entries"
+            }
+            # TMPFS_VALIDATOR_END
+
+            # Validate Docker’s effective configuration before starting it.
+            inspect_exact network_mode none '{{.HostConfig.NetworkMode}}'
+            inspect_exact readonly_rootfs true '{{.HostConfig.ReadonlyRootfs}}'
+            inspect_exact container_user 10001:10001 '{{.Config.User}}'
+            inspect_exact open_stdin true '{{.Config.OpenStdin}}'
+            inspect_exact privileged false '{{.HostConfig.Privileged}}'
+            inspect_exact memory_bytes 536870912 '{{.HostConfig.Memory}}'
+            inspect_exact pids_limit 128 '{{.HostConfig.PidsLimit}}'
+            inspect_exact nano_cpus 1000000000 '{{.HostConfig.NanoCpus}}'
+            inspect_not_host pid_mode '{{.HostConfig.PidMode}}'
+            inspect_not_host ipc_mode '{{.HostConfig.IpcMode}}'
+            inspect_not_host uts_mode '{{.HostConfig.UTSMode}}'
+            inspect_empty_collection host_binds '{{json .HostConfig.Binds}}'
+            inspect_empty_collection volumes_from '{{json .HostConfig.VolumesFrom}}'
+            inspect_empty_collection host_mounts '{{json .HostConfig.Mounts}}'
+            inspect_empty_collection image_declared_volumes '{{json .Config.Volumes}}'
+            inspect_contains cap_drop ALL '{{json .HostConfig.CapDrop}}'
+            inspect_contains security_opt no-new-privileges '{{json .HostConfig.SecurityOpt}}'
+
+            set +e
+            tmpfs_diagnostic="$(validate_inspected_tmpfs)"
+            tmpfs_rc=$?
+            set -e
+            while IFS= read -r tmpfs_line; do
+              [[ -n "$tmpfs_line" ]] && info "$tmpfs_line"
+            done <<< "$tmpfs_diagnostic"
+            case "$tmpfs_rc" in
+              0) pass 'tmpfs configuration matches semantic closed allowlist' ;;
+              1) fail 'tmpfs configuration violates semantic closed allowlist' ;;
+              *) fail 'docker inspect or tmpfs parser failed' ;;
+            esac
+
+            # Docker's .Mounts is a report, not the declared configuration, and
+            # its entries vary by Docker version and lifecycle state.  Check it
+            # independently without assuming a fixed count; the closed runtime
+            # allowlist below remains the authoritative observation.
+            # DOCKER_REPORTED_MOUNTS_VALIDATOR_BEGIN
+            validate_docker_reported_mounts() {
+              local entries="$1" mount_type mount_destination mount_rw extra
+              local unexpected=0 parse_error=0
+              while IFS='|' read -r mount_type mount_destination mount_rw extra; do
+                [[ -z "$mount_type" && -z "$mount_destination" && -z "$mount_rw" && -z "$extra" ]] && continue
+                if [[ -z "$mount_type" || -z "$mount_destination" || -z "$mount_rw" || -n "$extra" ]]; then
+                  parse_error=1
+                  continue
+                fi
+                case "$mount_type|$mount_destination|$mount_rw" in
+                  'tmpfs|/tmp|true'|'tmpfs|/run|true'|\
+                  'bind|/etc/hosts|true'|'bind|/etc/hostname|true'|'bind|/etc/resolv.conf|true') ;;
+                  *) (( ++unexpected )) ;;
+                esac
+              done <<< "$entries"
+              printf 'docker_reported_mount_unexpected_count=%s\n' "$unexpected"
+              if (( parse_error != 0 )); then
+                printf '%s\n' 'docker_reported_mount_parser_error'
+                return 2
+              fi
+              (( unexpected == 0 )) || return 1
+              return 0
+            }
+            # DOCKER_REPORTED_MOUNTS_VALIDATOR_END
+            # DOCKER_SPECIAL_FILES_DIAGNOSTIC_BEGIN
+            # This is diagnostic evidence only.  It does not relax the
+            # independent Docker configuration or runtime mount allowlists.
+            # Raw paths and sources remain in local shell variables and are
+            # never written to the public workflow log.
+            # DOCKER_SPECIAL_CORRELATION_RESULT_BEGIN
+            record_docker_special_correlation_result() {
+              case "$1" in
+                inspect_error) diagnostic_no_go 'docker special-file diagnostic inspect inconclusive' ;;
+                0) info 'docker special-file correlation diagnostic complete; not a runtime authorization' ;;
+                1) diagnostic_no_go 'docker special-file correlation incomplete or unexpected' ;;
+                *) diagnostic_no_go 'docker special-file diagnostic parser inconclusive' ;;
+              esac
+            }
+            # DOCKER_SPECIAL_CORRELATION_RESULT_END
+            diagnose_docker_special_files() {
+              local entries="$1" hosts_path="$2" hostname_path="$3" resolv_path="$4" readonly_rootfs="$5"
+              local destination mount_type mount_rw mount_source extra expected_source id
+              local hosts_seen=0 hostname_seen=0 resolv_seen=0 unexpected=0 malformed=0 invalid=0
+              local hosts_type=false hosts_present=false hosts_match=false hosts_rw=unknown
+              local hostname_type=false hostname_present=false hostname_match=false hostname_rw=unknown
+              local resolv_type=false resolv_present=false resolv_match=false resolv_rw=unknown
+              # The template is expected to produce a boolean.  Do not log or
+              # trust another value as secure metadata.
+              if [[ "$readonly_rootfs" != true && "$readonly_rootfs" != false ]]; then
+                printf '%s\n' 'docker_special_file_parser_error'
+                return 2
+              fi
+              while IFS='|' read -r destination mount_type mount_rw mount_source extra; do
+                [[ -z "$destination" && -z "$mount_type" && -z "$mount_rw" && -z "$mount_source" && -z "$extra" ]] && continue
+                if [[ -z "$destination" || -z "$mount_type" || -z "$mount_rw" || -z "$mount_source" || -n "$extra" ]]; then
+                  malformed=1
+                  continue
+                fi
+                case "$destination" in
+                  /etc/hosts) id=etc_hosts; expected_source="$hosts_path"; (( ++hosts_seen )) ;;
+                  /etc/hostname) id=etc_hostname; expected_source="$hostname_path"; (( ++hostname_seen )) ;;
+                  /etc/resolv.conf) id=etc_resolv_conf; expected_source="$resolv_path"; (( ++resolv_seen )) ;;
+                  /tmp|/run) continue ;;
+                  *) (( ++unexpected )); continue ;;
+                esac
+                if [[ "$mount_rw" != true && "$mount_rw" != false ]]; then
+                  malformed=1
+                  continue
+                fi
+                local type_bind=false metadata_present=false metadata_source_match=false
+                [[ "$mount_type" == bind ]] && type_bind=true
+                [[ -n "$expected_source" ]] && metadata_present=true
+                [[ "$metadata_present" == true && "$mount_source" == "$expected_source" ]] && metadata_source_match=true
+                [[ "$type_bind" == true && "$metadata_source_match" == true ]] || invalid=1
+                case "$id" in
+                  etc_hosts) hosts_type="$type_bind"; hosts_present="$metadata_present"; hosts_match="$metadata_source_match"; hosts_rw="$mount_rw" ;;
+                  etc_hostname) hostname_type="$type_bind"; hostname_present="$metadata_present"; hostname_match="$metadata_source_match"; hostname_rw="$mount_rw" ;;
+                  etc_resolv_conf) resolv_type="$type_bind"; resolv_present="$metadata_present"; resolv_match="$metadata_source_match"; resolv_rw="$mount_rw" ;;
+                esac
+              done <<< "$entries"
+              (( hosts_seen == 1 && hostname_seen == 1 && resolv_seen == 1 )) || invalid=1
+              (( hosts_seen <= 1 && hostname_seen <= 1 && resolv_seen <= 1 )) || invalid=1
+              # readonly_rootfs is deliberately reported but is not used to
+              # infer bind-mount writability.
+              printf 'docker_special_file id=etc_hosts cardinality_one=%s type_bind=%s metadata_present=%s metadata_source_match=%s mount_rw=%s readonly_rootfs=%s\n' \
+                "$([[ "$hosts_seen" == 1 ]] && printf true || printf false)" "$hosts_type" "$hosts_present" "$hosts_match" "$hosts_rw" "$readonly_rootfs"
+              printf 'docker_special_file id=etc_hostname cardinality_one=%s type_bind=%s metadata_present=%s metadata_source_match=%s mount_rw=%s readonly_rootfs=%s\n' \
+                "$([[ "$hostname_seen" == 1 ]] && printf true || printf false)" "$hostname_type" "$hostname_present" "$hostname_match" "$hostname_rw" "$readonly_rootfs"
+              printf 'docker_special_file id=etc_resolv_conf cardinality_one=%s type_bind=%s metadata_present=%s metadata_source_match=%s mount_rw=%s readonly_rootfs=%s\n' \
+                "$([[ "$resolv_seen" == 1 ]] && printf true || printf false)" "$resolv_type" "$resolv_present" "$resolv_match" "$resolv_rw" "$readonly_rootfs"
+              printf 'docker_special_file_unexpected_count=%s\n' "$unexpected"
+              if (( malformed != 0 )); then
+                printf '%s\n' 'docker_special_file_parser_error'
+                return 2
+              fi
+              (( unexpected == 0 && invalid == 0 )) || return 1
+              return 0
+            }
+            # DOCKER_SPECIAL_FILES_DIAGNOSTIC_END
+            if ! docker_reported_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t\n" .Type .Destination .RW}}{{end}}')"; then
+              fail 'docker inspect failed for reported mounts'
+            else
+              set +e
+              docker_reported_mount_diagnostic="$(validate_docker_reported_mounts "$docker_reported_mounts")"
+              docker_reported_mount_rc=$?
+              set -e
+              while IFS= read -r docker_reported_mount_line; do
+                [[ -n "$docker_reported_mount_line" ]] && info "$docker_reported_mount_line"
+              done <<< "$docker_reported_mount_diagnostic"
+              case "$docker_reported_mount_rc" in
+                0) pass 'docker reported mounts match closed allowlist' ;;
+                1) fail 'docker reported unexpected mount' ;;
+                *) fail 'docker reported mounts parser failed' ;;
+              esac
+            fi
+            # Keep sources private. These Docker-managed values may be
+            # lifecycle-dependent, so pre-start availability never gates the
+            # later runtime /proc collection.
+            docker_hosts_path_prestart=''; docker_hostname_path_prestart=''; docker_resolv_path_prestart=''
+            docker_hosts_path_runtime=''; docker_hostname_path_runtime=''; docker_resolv_path_runtime=''
+            metadata_prestart_etc_hosts_inspect_ok=false; metadata_prestart_etc_hosts_present=false
+            metadata_prestart_etc_hostname_inspect_ok=false; metadata_prestart_etc_hostname_present=false
+            metadata_prestart_etc_resolv_conf_inspect_ok=false; metadata_prestart_etc_resolv_conf_present=false
+            metadata_runtime_etc_hosts_inspect_ok=false; metadata_runtime_etc_hosts_present=false; metadata_runtime_etc_hosts_consistent=false
+            metadata_runtime_etc_hostname_inspect_ok=false; metadata_runtime_etc_hostname_present=false; metadata_runtime_etc_hostname_consistent=false
+            metadata_runtime_etc_resolv_conf_inspect_ok=false; metadata_runtime_etc_resolv_conf_present=false; metadata_runtime_etc_resolv_conf_consistent=false
+            # DOCKER_MANAGED_ETC_METADATA_PHASE_BEGIN
+            collect_docker_managed_etc_metadata_phase() {
+              local phase="$1" id template value inspect_ok=false present=false pre_value pre_present pre_inspect_ok consistent=false
+              for id in etc_hosts etc_hostname etc_resolv_conf; do
+                inspect_ok=false; present=false; consistent=false; value=''
+                case "$id" in
+                  etc_hosts) template='{{.HostsPath}}' ;;
+                  etc_hostname) template='{{.HostnamePath}}' ;;
+                  etc_resolv_conf) template='{{.ResolvConfPath}}' ;;
+                esac
+                if value="$(inspect_value "$template")"; then
+                  inspect_ok=true
+                  [[ -n "$value" ]] && present=true
+                else
+                  inspect_ok=false
+                fi
+                case "$phase:$id" in
+                  prestart:etc_hosts) docker_hosts_path_prestart="$value"; metadata_prestart_etc_hosts_inspect_ok="$inspect_ok"; metadata_prestart_etc_hosts_present="$present" ;;
+                  prestart:etc_hostname) docker_hostname_path_prestart="$value"; metadata_prestart_etc_hostname_inspect_ok="$inspect_ok"; metadata_prestart_etc_hostname_present="$present" ;;
+                  prestart:etc_resolv_conf) docker_resolv_path_prestart="$value"; metadata_prestart_etc_resolv_conf_inspect_ok="$inspect_ok"; metadata_prestart_etc_resolv_conf_present="$present" ;;
+                  runtime:etc_hosts)
+                    docker_hosts_path_runtime="$value"; metadata_runtime_etc_hosts_inspect_ok="$inspect_ok"; metadata_runtime_etc_hosts_present="$present"
+                    pre_value="$docker_hosts_path_prestart"; pre_present="$metadata_prestart_etc_hosts_present"; pre_inspect_ok="$metadata_prestart_etc_hosts_inspect_ok" ;;
+                  runtime:etc_hostname)
+                    docker_hostname_path_runtime="$value"; metadata_runtime_etc_hostname_inspect_ok="$inspect_ok"; metadata_runtime_etc_hostname_present="$present"
+                    pre_value="$docker_hostname_path_prestart"; pre_present="$metadata_prestart_etc_hostname_present"; pre_inspect_ok="$metadata_prestart_etc_hostname_inspect_ok" ;;
+                  runtime:etc_resolv_conf)
+                    docker_resolv_path_runtime="$value"; metadata_runtime_etc_resolv_conf_inspect_ok="$inspect_ok"; metadata_runtime_etc_resolv_conf_present="$present"
+                    pre_value="$docker_resolv_path_prestart"; pre_present="$metadata_prestart_etc_resolv_conf_present"; pre_inspect_ok="$metadata_prestart_etc_resolv_conf_inspect_ok" ;;
+                  *) return 2 ;;
+                esac
+                if [[ "$phase" == prestart ]]; then
+                  info "docker_managed_etc_metadata id=$id phase=prestart inspect_ok=$inspect_ok metadata_present=$present"
+                else
+                  # Empty pre-start metadata may become available after start.
+                  # Inspect failure or two differing present values is NO-GO.
+                  if [[ "$inspect_ok" == true && "$present" == true && "$pre_inspect_ok" == true ]] &&
+                     { [[ "$pre_present" == false ]] || [[ "$value" == "$pre_value" ]]; }; then consistent=true; fi
+                  case "$id" in
+                    etc_hosts) metadata_runtime_etc_hosts_consistent="$consistent" ;;
+                    etc_hostname) metadata_runtime_etc_hostname_consistent="$consistent" ;;
+                    etc_resolv_conf) metadata_runtime_etc_resolv_conf_consistent="$consistent" ;;
+                  esac
+                  info "docker_managed_etc_metadata id=$id phase=runtime inspect_ok=$inspect_ok metadata_present=$present phase_consistent=$consistent"
+                fi
+              done
+            }
+            runtime_docker_managed_etc_metadata_paths_available() {
+              local id inspect_ok present consistent paths_available=true
+              for id in etc_hosts etc_hostname etc_resolv_conf; do
+                case "$id" in
+                  etc_hosts) inspect_ok="$metadata_runtime_etc_hosts_inspect_ok"; present="$metadata_runtime_etc_hosts_present"; consistent="$metadata_runtime_etc_hosts_consistent" ;;
+                  etc_hostname) inspect_ok="$metadata_runtime_etc_hostname_inspect_ok"; present="$metadata_runtime_etc_hostname_present"; consistent="$metadata_runtime_etc_hostname_consistent" ;;
+                  etc_resolv_conf) inspect_ok="$metadata_runtime_etc_resolv_conf_inspect_ok"; present="$metadata_runtime_etc_resolv_conf_present"; consistent="$metadata_runtime_etc_resolv_conf_consistent" ;;
+                esac
+                if [[ "$inspect_ok" != true || "$present" != true ]]; then
+                  diagnostic_no_go "docker-managed etc runtime metadata unavailable_or_inspect_failed: $id"
+                  paths_available=false
+                fi
+                [[ "$consistent" == true ]] || diagnostic_no_go "docker-managed etc metadata phase inconsistent: $id"
+              done
+              [[ "$paths_available" == true ]]
+            }
+            # DOCKER_MANAGED_ETC_METADATA_PHASE_END
+            collect_docker_managed_etc_metadata_phase prestart
+            if ! docker_special_mounts="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')" || \
+               ! docker_readonly_rootfs="$(inspect_value '{{.HostConfig.ReadonlyRootfs}}')"; then
+              record_docker_special_correlation_result inspect_error
+            else
+              set +e
+              docker_special_diagnostic="$(diagnose_docker_special_files "$docker_special_mounts" "$docker_hosts_path_prestart" "$docker_hostname_path_prestart" "$docker_resolv_path_prestart" "$docker_readonly_rootfs")"
+              docker_special_rc=$?
+              set -e
+              while IFS= read -r docker_special_line; do
+                [[ -n "$docker_special_line" ]] && info "$docker_special_line"
+              done <<< "$docker_special_diagnostic"
+              record_docker_special_correlation_result "$docker_special_rc"
+            fi
+          fi
+
+          # DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_BEGIN
+          # Observational only: this never changes the runtime mount allowlist.
+          # All raw Docker paths, process identifiers, namespace links, device
+          # numbers and inode values remain in local variables or private files.
+          # The runner observes /proc/PID directly; it does not nsenter or run a
+          # command with the container root as its filesystem root.
+          docker_managed_etc_ids=$'etc_hosts|/etc/hosts\netc_hostname|/etc/hostname\netc_resolv_conf|/etc/resolv.conf'
+          etc_runtime_records=''
+          # PROCESS_SNAPSHOT_BEGIN
+          # Prints only the private snapshot needed by the caller.  Failures
+          # are reported to stderr as sanitized stage IDs, so command
+          # substitution cannot mistake diagnostics for a valid snapshot.
+          process_snapshot_failure() {
+            local stage="$1"
+            printf 'INFO process_snapshot stage=%s state=failed\n' "$stage" >&2
+            return 1
+          }
+          process_snapshot() {
+            local sample running pid identity extra starttime mountns proc_root
+            proc_root="${PREFLIGHT_PROC_ROOT:-/proc}"
+            if ! sample="$(inspect_value '{{.State.Running}}|{{.State.Pid}}|{{.Id}}')"; then
+              process_snapshot_failure docker_inspect; return 2
+            fi
+            IFS='|' read -r running pid identity extra <<<"$sample"
+            [[ -z "$extra" ]] || { process_snapshot_failure docker_inspect; return 2; }
+            [[ "$running" == true ]] || { process_snapshot_failure state_running; return 1; }
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { process_snapshot_failure pid; return 1; }
+            [[ "$identity" == "$container_id" ]] || { process_snapshot_failure container_identity; return 1; }
+            [[ -r "$proc_root/$pid/stat" ]] || { process_snapshot_failure proc_stat_access; return 1; }
+            [[ -d "$proc_root/$pid/root" ]] || { process_snapshot_failure proc_root_access; return 1; }
+            [[ -L "$proc_root/$pid/ns/mnt" ]] || { process_snapshot_failure namespace_link; return 1; }
+            # /proc/PID/stat field 2 (comm) may contain spaces and ')' chars.
+            # Strip through the final ") " and read field 20 of the remainder
+            # (the original field 22, starttime).  A single escaped ')' is
+            # required by AWK; a double backslash matches a literal slash.
+            if ! starttime="$(awk '{ if (!sub(/^.*\) /, "")) exit 2; if (NF != 50) exit 2; print $20 }' "$proc_root/$pid/stat" 2>/dev/null)"; then
+              process_snapshot_failure parsing; return 2
+            fi
+            if ! mountns="$(readlink "$proc_root/$pid/ns/mnt" 2>/dev/null)"; then
+              process_snapshot_failure namespace_read; return 2
+            fi
+            [[ "$starttime" =~ ^[1-9][0-9]*$ ]] || { process_snapshot_failure parsing; return 1; }
+            [[ -n "$mountns" ]] || { process_snapshot_failure namespace_read; return 1; }
+            printf '%s|%s|%s\n' "$pid" "$starttime" "$mountns"
+          }
+          # PROCESS_SNAPSHOT_END
+          path_components_are_non_symlink() {
+            local candidate="$1" root="$2" relative part cursor
+            [[ "$candidate" == "$root"/* ]] || return 1
+            relative="${candidate#"$root"/}"; cursor="$root"
+            [[ ! -L "$cursor" ]] || return 1
+            IFS=/ read -r -a parts <<<"$relative"
+            for part in "${parts[@]}"; do
+              [[ -n "$part" ]] || return 1
+              cursor="$cursor/$part"
+              [[ ! -L "$cursor" ]] || return 1
+            done
+          }
+          mount_record_for_target() {
+            # The optional third argument exists solely for the offline suite;
+            # production always observes the selected process's mountinfo.
+            local pid target mountinfo_path
+            pid="$1"; target="$2"; mountinfo_path="${3:-/proc/$pid/mountinfo}"
+            awk -v wanted="$target" '
+              function has(options, flag, n, a, i) { n=split(options,a,","); for(i=1;i<=n;i++) if(a[i]==flag)return 1; return 0 }
+              $5 == wanted {
+                seen++
+                separator=0; for(i=7;i<=NF;i++) if($i=="-"){separator=i;break}
+                if (!separator || separator + 3 > NF) { malformed=1; next }
+                rw=(has($6,"rw") && !has($6,"ro"))
+                propagation_clear=1; for(i=7;i<separator;i++) if($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) propagation_clear=0
+              }
+              END { if (seen != 1 || malformed) exit 1; printf "%s|%s\n", rw ? "true" : "false", propagation_clear ? "true" : "false" }
+            ' "$mountinfo_path" 2>/dev/null
+          }
+          runtime_reported_etc_mount_status() {
+            local entries="$1" wanted_id="$2" wanted_destination="$3" wanted_source="$4"
+            local destination mount_type mount_rw mount_source extra id expected_source seen=0 unexpected=0 malformed=0 match=false
+            [[ -n "$entries" ]] || { printf '%s\n' unavailable; return 0; }
+            while IFS='|' read -r destination mount_type mount_rw mount_source extra; do
+              [[ -z "$destination" && -z "$mount_type" && -z "$mount_rw" && -z "$mount_source" && -z "$extra" ]] && continue
+              if [[ -z "$destination" || -z "$mount_type" || -z "$mount_rw" || -z "$mount_source" || -n "$extra" ]]; then malformed=1; continue; fi
+              case "$destination" in
+                /etc/hosts) id=etc_hosts; expected_source="$docker_hosts_path_runtime" ;;
+                /etc/hostname) id=etc_hostname; expected_source="$docker_hostname_path_runtime" ;;
+                /etc/resolv.conf) id=etc_resolv_conf; expected_source="$docker_resolv_path_runtime" ;;
+                /tmp|/run) [[ "$mount_type" == tmpfs && "$mount_rw" == true ]] || unexpected=1; continue ;;
+                *) unexpected=1; continue ;;
+              esac
+              if [[ "$id" == "$wanted_id" ]]; then
+                (( ++seen ))
+                [[ "$destination" == "$wanted_destination" && "$mount_type" == bind && "$mount_rw" == true && "$mount_source" == "$wanted_source" && "$mount_source" == "$expected_source" ]] && match=true || match=false
+              elif [[ "$mount_type" != bind || "$mount_rw" != true || "$mount_source" != "$expected_source" ]]; then
+                unexpected=1
+              fi
+            done <<<"$entries"
+            if (( malformed == 0 && unexpected == 0 && seen == 1 )) && [[ "$match" == true ]]; then
+              printf '%s\n' consistent
+            else
+              printf '%s\n' inconsistent
+            fi
+          }
+          # A record is passed only after raw host and /proc observations were
+          # made.  It is deliberately strict and emits known IDs and booleans.
+          validate_docker_managed_etc_record() {
+            local id="$1" metadata_present="$2" source_regular="$3" source_nosymlink="$4" provenance="$5" source_stable="$6" target_regular="$7" target_nosymlink="$8" identity_before="$9" identity_after="${10}" mount_rw="${11}" propagation_clear="${12}" pid_stable="${13}" reported_runtime_mount="${14}"
+            case "$id" in etc_hosts|etc_hostname|etc_resolv_conf) ;; *) return 2 ;; esac
+            case "$reported_runtime_mount" in consistent|unavailable|inconsistent) ;; *) return 1 ;; esac
+            local complete=true value
+            for value in "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable"; do
+              [[ "$value" == true ]] || complete=false
+            done
+            # The post-start report is corroborating evidence. Its absence is
+            # explicitly inconclusive, never an approval.
+            [[ "$reported_runtime_mount" == consistent ]] || complete=false
+            printf 'docker_managed_etc id=%s metadata_present=%s source_regular=%s source_not_symlink=%s provenance_verified=%s source_stable=%s target_regular=%s target_not_symlink=%s identity_before=%s identity_after=%s mount_rw=%s propagation_clear=%s pid_stable=%s reported_runtime_mount=%s\n' \
+              "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount"
+            [[ "$complete" == true ]] || return 1
+          }
+          docker_managed_etc_metadata_path() {
+            local id="$1"
+            case "$id" in
+              etc_hosts) inspect_value '{{.HostsPath}}' ;;
+              etc_hostname) inspect_value '{{.HostnamePath}}' ;;
+              etc_resolv_conf) inspect_value '{{.ResolvConfPath}}' ;;
+              *) return 2 ;;
+            esac
+          }
+          collect_docker_managed_etc_runtime() {
+            local docker_root canonical_docker_root docker_root_after canonical_docker_root_after before after pid starttime mountns id destination source source_after canonical_source canonical_source_after source_stat source_stat_after target_stat source_type source_type_after target_type source_devino source_devino_after target_devino mount_flags raw_report status
+            if ! docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)" ||
+               ! canonical_docker_root="$(readlink -f -- "$docker_root" 2>/dev/null)" ||
+               [[ -z "$docker_root" || "$docker_root" != "$canonical_docker_root" || -L "$docker_root" || ! -d "$docker_root" ]]; then
+              diagnostic_no_go 'docker-managed etc runtime diagnostic DockerRootDir unavailable'
+              return 2
+            fi
+            if ! before="$(process_snapshot)"; then
+              diagnostic_no_go 'docker-managed etc runtime diagnostic process snapshot unavailable'
+              return 2
+            fi
+            IFS='|' read -r pid starttime mountns <<<"$before"
+            if ! raw_report="$(inspect_value '{{range .Mounts}}{{printf "%s|%s|%t|%s\n" .Destination .Type .RW .Source}}{{end}}')"; then
+              diagnostic_no_go 'docker-managed etc runtime diagnostic runtime Mounts inspect failed'
+              return 2
+            fi
+            while IFS='|' read -r id destination; do
+              source=''; case "$id" in
+                etc_hosts) source="$docker_hosts_path_runtime" ;;
+                etc_hostname) source="$docker_hostname_path_runtime" ;;
+                etc_resolv_conf) source="$docker_resolv_path_runtime" ;;
+              esac
+              local metadata_present=false source_regular=false source_nosymlink=false provenance=false source_stable=false target_regular=false target_nosymlink=false identity_before=false identity_after=false mount_rw=false propagation_clear=false pid_stable=false reported_runtime_mount=unavailable
+              if [[ -n "$source" && -e "$source" && ! -L "$source" ]] && source_stat="$(stat -c '%F|%d|%i' "$source" 2>/dev/null)"; then
+                metadata_present=true; IFS='|' read -r source_type source_devino <<<"${source_stat%%|*}|${source_stat#*|}"
+                [[ "$source_type" == 'regular file' ]] && source_regular=true; source_nosymlink=true
+                if canonical_source="$(readlink -f -- "$source" 2>/dev/null)" &&
+                   [[ "$source" == "$canonical_source" && "$source" == "$docker_root"/* && "$source" == *"/$container_id/"* ]] &&
+                   path_components_are_non_symlink "$source" "$docker_root"; then provenance=true; fi
+              fi
+              if [[ -e "/proc/$pid/root$destination" && ! -L "/proc/$pid/root$destination" ]] && target_stat="$(stat -c '%F|%d|%i' "/proc/$pid/root$destination" 2>/dev/null)"; then
+                IFS='|' read -r target_type target_devino <<<"${target_stat%%|*}|${target_stat#*|}"
+                [[ "$target_type" == 'regular file' ]] && target_regular=true; target_nosymlink=true
+                [[ -n "${source_devino:-}" && "$source_devino" == "$target_devino" ]] && identity_before=true
+              fi
+              if mount_flags="$(mount_record_for_target "$pid" "$destination")"; then IFS='|' read -r mount_rw propagation_clear <<<"$mount_flags"; fi
+              reported_runtime_mount="$(runtime_reported_etc_mount_status "$raw_report" "$id" "$destination" "$source")"
+              if after="$(process_snapshot)" && [[ "$after" == "$before" ]]; then
+                pid_stable=true
+                # Re-observe metadata and the backing file after collection.
+                # PID stability alone cannot establish source stability.
+                if source_after="$(docker_managed_etc_metadata_path "$id" 2>/dev/null)" &&
+                   docker_root_after="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)" &&
+                   canonical_docker_root_after="$(readlink -f -- "$docker_root_after" 2>/dev/null)" &&
+                   [[ "$source_after" == "$source" && "$docker_root_after" == "$docker_root" && "$canonical_docker_root_after" == "$canonical_docker_root" && -e "$source_after" && ! -L "$source_after" ]] &&
+                   source_stat_after="$(stat -c '%F|%d|%i' "$source_after" 2>/dev/null)"; then
+                  IFS='|' read -r source_type_after source_devino_after <<<"${source_stat_after%%|*}|${source_stat_after#*|}"
+                  if [[ "$source_type_after" == "$source_type" && "$source_devino_after" == "$source_devino" ]] &&
+                     canonical_source_after="$(readlink -f -- "$source_after" 2>/dev/null)" &&
+                     [[ "$canonical_source_after" == "$source_after" && "$source_after" == "$docker_root_after"/* && "$source_after" == *"/$container_id/"* ]] &&
+                     path_components_are_non_symlink "$source_after" "$docker_root_after"; then
+                    source_stable=true
+                  fi
+                fi
+                if [[ -e "/proc/$pid/root$destination" && ! -L "/proc/$pid/root$destination" ]] && target_stat="$(stat -c '%F|%d|%i' "/proc/$pid/root$destination" 2>/dev/null)"; then
+                  IFS='|' read -r target_type target_devino <<<"${target_stat%%|*}|${target_stat#*|}"
+                  [[ "$source_stable" == true && -n "${source_devino_after:-}" && "$source_devino_after" == "$target_devino" ]] && identity_after=true
+                fi
+              fi
+              set +e; status="$(validate_docker_managed_etc_record "$id" "$metadata_present" "$source_regular" "$source_nosymlink" "$provenance" "$source_stable" "$target_regular" "$target_nosymlink" "$identity_before" "$identity_after" "$mount_rw" "$propagation_clear" "$pid_stable" "$reported_runtime_mount")"; local rc=$?; set -e
+              while IFS= read -r line; do [[ -n "$line" ]] && info "$line"; done <<<"$status"
+              (( rc == 0 )) || diagnostic_no_go "docker-managed etc runtime evidence incomplete: $id"
+            done <<<"$docker_managed_etc_ids"
+          }
+          # DOCKER_MANAGED_ETC_RUNTIME_DIAGNOSTIC_END
+
+          # DOCKER_MANAGED_HOST_SOURCE_GATE_BEGIN
+          # Stage 1 only: determine whether the unprivileged runner process can
+          # observe stable Docker-managed backing files.  This does not compare
+          # them with container-side objects and cannot authorize any mount.
+          host_gate_timeout() {
+            timeout "${HOST_GATE_TIMEOUT_SECONDS:-2}" "$@"
+          }
+          host_gate_docker_root_metadata() {
+            host_gate_timeout docker info --format '{{.DockerRootDir}}' 2>/dev/null
+          }
+          host_gate_source_metadata() {
+            local template
+            case "$1" in
+              etc_hosts) template='{{.HostsPath}}' ;;
+              etc_hostname) template='{{.HostnamePath}}' ;;
+              etc_resolv_conf) template='{{.ResolvConfPath}}' ;;
+              *) return 2 ;;
+            esac
+            host_gate_timeout docker inspect --format "$template" "$container_id" 2>/dev/null
+          }
+          host_gate_expected_basename() {
+            case "$1" in
+              etc_hosts) printf '%s\n' hosts ;;
+              etc_hostname) printf '%s\n' hostname ;;
+              etc_resolv_conf) printf '%s\n' resolv.conf ;;
+              *) return 2 ;;
+            esac
+          }
+          host_gate_canonical_path() {
+            host_gate_timeout readlink -f -- "$1" 2>/dev/null
+          }
+          host_gate_lstat_type() {
+            LC_ALL=C host_gate_timeout stat -c '%F' -- "$1" 2>/dev/null
+          }
+          host_gate_stat_record() {
+            LC_ALL=C host_gate_timeout stat -Lc '%F|%d|%i' -- "$1" 2>/dev/null
+          }
+          host_gate_path_components_safe() {
+            local candidate="$1" component cursor='' kind
+            [[ "$candidate" == /* && "$candidate" != *//* && "$candidate" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+            IFS=/ read -r -a host_gate_components <<<"${candidate#/}"
+            for component in "${host_gate_components[@]}"; do
+              [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+              cursor="$cursor/$component"
+              kind="$(host_gate_lstat_type "$cursor")" || return $?
+              [[ "$kind" != 'symbolic link' ]] || return 1
+            done
+          }
+          host_gate_root_snapshot() {
+            local root canonical kind rc
+            root="$(host_gate_docker_root_metadata)" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|docker_root_inspect'; return 1; }
+            [[ -n "$root" ]] || { printf '%s\n' 'error|docker_root_unavailable'; return 1; }
+            canonical="$(host_gate_canonical_path "$root")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|canonicalization_failed'; return 1; }
+            [[ "$root" == "$canonical" ]] || { printf '%s\n' 'error|symlink_or_noncanonical'; return 1; }
+            kind="$(host_gate_lstat_type "$root")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|docker_root_inaccessible'; return 1; }
+            [[ "$kind" == directory ]] || { printf '%s\n' 'error|docker_root_invalid_type'; return 1; }
+            host_gate_path_components_safe "$root" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|symlink_or_inaccessible_component'; return 1; }
+            printf 'ok|%s\n' "$root"
+          }
+          host_gate_source_snapshot() {
+            local id="$1" root="$2" source expected canonical kind record parent rc
+            expected="$(host_gate_expected_basename "$id")" || { printf '%s\n' 'error|unknown_id'; return 2; }
+            source="$(host_gate_source_metadata "$id")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|metadata_inspect'; return 1; }
+            [[ -n "$source" ]] || { printf '%s\n' 'error|metadata_unavailable'; return 1; }
+            [[ "$source" == "$root"/* && "${source##*/}" == "$expected" ]] || { printf '%s\n' 'error|provenance_invalid'; return 1; }
+            parent="${source%/*}"
+            [[ "${parent##*/}" == "$container_id" && "$container_id" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'error|container_identity_invalid'; return 1; }
+            host_gate_path_components_safe "$source" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|symlink_or_inaccessible_component'; return 1; }
+            canonical="$(host_gate_canonical_path "$source")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|canonicalization_failed'; return 1; }
+            [[ "$source" == "$canonical" ]] || { printf '%s\n' 'error|symlink_or_noncanonical'; return 1; }
+            kind="$(host_gate_lstat_type "$source")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|source_inaccessible'; return 1; }
+            [[ "$kind" == 'regular file' ]] || { printf '%s\n' 'error|source_invalid_type'; return 1; }
+            record="$(host_gate_stat_record "$source")" || { rc=$?; (( rc == 124 )) && printf '%s\n' 'error|timeout' || printf '%s\n' 'error|source_inaccessible'; return 1; }
+            [[ "$record" =~ ^regular\ file\|[0-9]+\|[0-9]+$ ]] || { printf '%s\n' 'error|stat_malformed'; return 1; }
+            # Private return value: the caller compares it but never logs it.
+            printf 'ok|%s|%s\n' "$source" "$record"
+          }
+          run_docker_managed_host_source_gate() {
+            local sample id root_record root_status root_path source_record rc all_pass=true code
+            local root_first='' root_second=''
+            declare -A first_record=() second_record=() first_code=() second_code=()
+            for sample in 1 2; do
+              HOST_GATE_SAMPLE="$sample"
+              set +e; root_record="$(host_gate_root_snapshot)"; rc=$?; set -e
+              if (( rc == 0 )) && [[ "$root_record" == ok\|* ]]; then
+                root_status=none; root_path="${root_record#ok|}"
+                [[ "$sample" == 1 ]] && root_first="$root_path" || root_second="$root_path"
+              else
+                root_status="${root_record#error|}"
+                case "$root_status" in timeout|docker_root_inspect|docker_root_unavailable|canonicalization_failed|symlink_or_noncanonical|docker_root_inaccessible|docker_root_invalid_type|symlink_or_inaccessible_component) ;; *) root_status=inspection_failed ;; esac
+                root_path=''
+              fi
+              for id in etc_hosts etc_hostname etc_resolv_conf; do
+                if [[ "$root_status" != none ]]; then
+                  source_record=''; code="$root_status"
+                else
+                  set +e; source_record="$(host_gate_source_snapshot "$id" "$root_path")"; rc=$?; set -e
+                  if (( rc == 0 )) && [[ "$source_record" == ok\|* ]]; then code=none; else
+                    code="${source_record#error|}"
+                    case "$code" in timeout|metadata_inspect|metadata_unavailable|provenance_invalid|container_identity_invalid|symlink_or_inaccessible_component|canonicalization_failed|symlink_or_noncanonical|source_inaccessible|source_invalid_type|stat_malformed) ;; *) code=inspection_failed ;; esac
+                  fi
+                fi
+                if [[ "$sample" == 1 ]]; then first_record[$id]="$source_record"; first_code[$id]="$code"; else second_record[$id]="$source_record"; second_code[$id]="$code"; fi
+              done
+            done
+            for id in etc_hosts etc_hostname etc_resolv_conf; do
+              local accessible=false provenance_verified=false stable=false inspection_error=none
+              if [[ "${first_code[$id]}" == none && "${second_code[$id]}" == none ]]; then
+                accessible=true; provenance_verified=true
+                if [[ -n "$root_first" && "$root_first" == "$root_second" && "${first_record[$id]}" == "${second_record[$id]}" ]]; then
+                  stable=true
+                else
+                  inspection_error=sample_changed; all_pass=false
+                fi
+              else
+                inspection_error="${first_code[$id]}"
+                [[ "$inspection_error" != none ]] || inspection_error="${second_code[$id]}"
+                all_pass=false
+              fi
+              printf 'docker_managed_host_source_gate id=%s accessible=%s provenance_verified=%s stable=%s inspection_error=%s\n' \
+                "$id" "$accessible" "$provenance_verified" "$stable" "$inspection_error"
+            done
+            [[ "$all_pass" == true ]]
+          }
+          # DOCKER_MANAGED_HOST_SOURCE_GATE_END
+
+          diagnostic_rc=99
+          if runtime_collection_permitted; then
+            if ! diagnostic_log="$(mktemp)"; then
+              fail 'cannot create trusted host diagnostic log'
+            fi
+          fi
+          if runtime_collection_permitted; then
+            # The heredoc is trusted workflow text.  It is the only payload
+            # executed inside the isolated container.
+            # It runs in the background solely so the trusted runner can read
+            # /proc/PID while the process is alive; no command is injected
+            # after start and no nsenter is used.
+            set +e
+            docker start --attach --interactive "$container_id" >"$diagnostic_log" 2>&1 <<'DIAGNOSTIC' &
           set -Eeuo pipefail
           bad=0
           probe_pass() { printf 'PASS %s\n' "$1"; }
           probe_fail() { printf 'FAIL %s\n' "$1"; bad=1; }
-          verify() {
-            local name="$1"
-            shift
-            if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi
-          }
+          verify() { local name="$1"; shift; if "$@"; then probe_pass "$name"; else probe_fail "$name"; fi; }
 
-          verify 'uid_is_10001' test "$(id -u)" -eq 10001
-          verify 'gid_is_10001' test "$(id -g)" -eq 10001
-          verify 'no_extra_groups' bash -c 'test "$(id -G | wc -w)" -eq 1'
-          verify 'no_new_privileges' grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status
+          # Synchronization only.  This is not evidence and it gives the
+          # trusted runner a bounded observation window for /proc/PID.
+          printf '%s\n' PAPERCLIP_PREFLIGHT_RUNTIME_READY
+          sleep 12
+
+          for tool in bash openssl curl nc getent ip awk grep find readlink timeout id cat stat; do
+            command -v "$tool" >/dev/null 2>&1 || probe_fail "required_tool_missing_${tool}"
+          done
+
+          verify uid_is_non_root test "$(id -u)" -eq 10001
+          verify gid_is_non_root test "$(id -g)" -eq 10001
+          verify no_supplementary_groups bash -c 'test "$(id -G | wc -w)" -eq 1'
+          verify no_new_privileges grep -q '^NoNewPrivs:[[:space:]]*1$' /proc/self/status
           for cap in CapInh CapPrm CapEff CapBnd CapAmb; do
             verify "${cap}_is_zero" grep -q "^${cap}:[[:space:]]*0000000000000000$" /proc/self/status
           done
 
-          # cgroup-v2-only. Missing/unreadable files mean NO-GO, not zero use.
-          verify 'cgroup_v2_memory_lte_2GiB' bash -c \
-            'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 2147483648 ]]'
-          verify 'cgroup_v2_pids_lte_256' bash -c \
-            'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -le 256 ]]'
-          verify 'cgroup_v2_cpu_lte_1_core' bash -c \
-            'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
-
-          for ns in user mnt pid net ipc uts cgroup; do
-            if [[ -e "/proc/self/ns/$ns" ]]; then
-              printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")"
-            else
-              probe_fail "namespace_${ns}_missing"
-            fi
+          verify root_filesystem_is_read_only awk '
+            $5 == "/" { n=split($6, opts, ","); for (i=1; i<=n; i++) if (opts[i] == "ro") ok=1 }
+            END { exit !ok }
+          ' /proc/self/mountinfo
+          # These inspect access only; they never read content or attempt a
+          # write.  rw is a mount-level property checked by the runner, while
+          # user_writable is the effective permission of UID 10001.
+          for etc_item in 'etc_hosts|/etc/hosts' 'etc_hostname|/etc/hostname' 'etc_resolv_conf|/etc/resolv.conf'; do
+            IFS='|' read -r etc_id etc_path <<<"$etc_item"
+            etc_regular=false; etc_symlink=false; etc_readable=false; etc_user_writable=false
+            [[ -L "$etc_path" ]] && etc_symlink=true
+            [[ -f "$etc_path" && "$etc_symlink" == false ]] && etc_regular=true
+            [[ -r "$etc_path" ]] && etc_readable=true
+            [[ -w "$etc_path" ]] && etc_user_writable=true
+            printf 'runtime_etc_user_access id=%s object_regular=%s object_symlink=%s user_readable=%s user_writable=%s\n' "$etc_id" "$etc_regular" "$etc_symlink" "$etc_readable" "$etc_user_writable"
+            [[ "$etc_regular" == true && "$etc_symlink" == false && "$etc_readable" == true && "$etc_user_writable" == false ]] || probe_fail "runtime_etc_user_access_inconclusive_${etc_id}"
           done
+          verify tmpfs_tmp_is_writable bash -c 'touch /tmp/preflight-write-test && rm /tmp/preflight-write-test'
+          verify cgroup_memory_lte_512MiB bash -c 'v=$(cat /sys/fs/cgroup/memory.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -le 536870912 ]]'
+          verify cgroup_pids_lte_128 bash -c 'v=$(cat /sys/fs/cgroup/pids.max) && [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 && "$v" -le 128 ]]'
+          verify cgroup_cpu_lte_one_core bash -c 'read -r quota period < /sys/fs/cgroup/cpu.max && [[ "$quota" =~ ^[0-9]+$ && "$quota" -gt 0 && "$period" =~ ^[0-9]+$ && "$period" -gt 0 && "$quota" -le "$period" ]]'
 
-          sockets=(/var/run/docker.sock /run/docker.sock
-                   /var/run/containerd/containerd.sock /run/containerd/containerd.sock
-                   /var/run/podman/podman.sock /run/podman/podman.sock)
-          sock_bad=0
-          for socket in "${sockets[@]}"; do
-            if [[ -e "$socket" || -S "$socket" ]]; then
-              probe_fail 'known_host_control_socket_present'
-              sock_bad=1
-            fi
+          for ns in mnt pid net ipc uts cgroup user; do
+            [[ -e "/proc/self/ns/$ns" ]] && printf 'INFO namespace_%s=%s\n' "$ns" "$(readlink "/proc/self/ns/$ns")" || probe_fail "namespace_missing_${ns}"
           done
-          if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
-            probe_fail 'container_runtime_client_present'
-            sock_bad=1
-          fi
-          if (( sock_bad == 0 )); then probe_pass 'no_known_host_control_socket'; fi
-
-          # Compare mount TARGET ($5), not substring-match all mountinfo fields:
-          # a normal read-only /proc/sys mount is not host-control access.
-          # Runner support bind mounts may still be visible; flag them as
-          # NO-GO until a later runtime can prevent exposing them to the app.
-          if awk '
-            $5 ~ /^\/(root|home\/runner)(\/|$)/ { bad=1 }
-            $5 ~ /^\/(var\/run\/docker\.sock|run\/docker\.sock|run\/containerd|run\/podman)(\/|$)/ { bad=1 }
-            $5 ~ /^\/dev\/(kvm|fuse)$/ { bad=1 }
-            $5 ~ /^\/(__w\/_temp|__w\/_actions|github\/workflow|github\/file_commands)(\/|$)/ { bad=1 }
-            END { exit !bad }
-          ' /proc/self/mountinfo; then
-            probe_fail 'sensitive_or_runner_control_mount_detected'
-          else
-            probe_pass 'no_listed_sensitive_mount_target'
-          fi
-          # Print only the mount COUNT: public Actions logs must not disclose paths.
-          awk 'END { printf "INFO mount_count=%d\n", NR }' /proc/self/mountinfo
-
-          outer_user="$(readlink /proc/self/ns/user)"
-          outer_net="$(readlink /proc/self/ns/net)"
-          outer_mnt="$(readlink /proc/self/ns/mnt)"
-          export outer_user outer_net outer_mnt
-
-          # User, network AND mount namespaces must be distinct. A GitHub job
-          # container may reject this call; that is a legitimate NO-GO.
-          if unshare -Urnm -- bash -s <<'NO_NETWORK'
-          set -Eeuo pipefail
-          [[ "$(readlink /proc/self/ns/user)" != "$outer_user" ]] || exit 40
-          [[ "$(readlink /proc/self/ns/net)" != "$outer_net" ]] || exit 41
-          [[ "$(readlink /proc/self/ns/mnt)" != "$outer_mnt" ]] || exit 42
-
-          # Fail if any interface except loopback or any default route exists.
-          for iface in /sys/class/net/*; do
-            [[ -e "$iface" ]] || continue
-            [[ "${iface##*/}" == lo ]] || exit 43
-          done
-          if awk 'NR>1 && $2=="00000000" { bad=1 } END { exit !bad }' /proc/net/route; then
-            exit 44
-          fi
-
-          # Negative probes are additional evidence, not a standalone proof.
-          # A failed TLS handshake alone is insufficient: test raw TCP too.
-          timeout 6 getent ahostsv4 example.com >/dev/null 2>&1 && exit 45
-          timeout 6 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>&1 && exit 46
-          timeout 6 openssl s_client -connect 1.1.1.1:443 \
-            -servername one.one.one.one -brief </dev/null >/dev/null 2>&1 && exit 47
-          exit 0
-          NO_NETWORK
-          then
-            probe_pass 'fresh_user_network_mount_namespaces'
-            probe_pass 'loopback_only_and_no_default_route'
-            probe_pass 'dns_tcp_https_negative'
-          else
-            rc=$?
-            case "$rc" in
-              40|41|42) probe_fail "namespace_identity_unchanged_rc_${rc}" ;;
-              43|44) probe_fail "namespace_network_route_or_interface_rc_${rc}" ;;
-              45|46|47) probe_fail "unexpected_network_egress_rc_${rc}" ;;
-              *) probe_fail "unshare_unavailable_or_probe_failed_rc_${rc}" ;;
-            esac
-          fi
-          if (( bad != 0 )); then exit 86; fi
-          REDUCED
-            reduced_rc=$?
+          verify only_loopback_interface bash -c 'links=$(ip -o link show) || exit 2; test "$(printf "%s\n" "$links" | wc -l)" -eq 1 && printf "%s\n" "$links" | grep -Eq "^[0-9]+: lo:"'
+          verify_no_default_route() {
+            local family="$1" routes route_rc
+            routes=$(mktemp) || { probe_fail "ipv${family}_route_tempfile_failed"; return; }
+            set +e
+            ip "-$family" route show default >"$routes" 2>&1
+            route_rc=$?
             set -e
-            if (( reduced_rc != 0 )); then
-              fail "reduced boundary probes rejected (exit $reduced_rc)"
+            case "$route_rc" in
+              0)
+                if [[ -s "$routes" ]]; then
+                  probe_fail "ipv${family}_default_route_present"
+                else
+                  probe_pass "ipv${family}_no_default_route"
+                fi
+                ;;
+              *) probe_fail "ipv${family}_route_query_failed_rc_${route_rc}" ;;
+            esac
+            rm -f "$routes"
+          }
+          verify_no_default_route 4
+          verify_no_default_route 6
+
+          # SOCKET_SCAN_CLASSIFIER_BEGIN
+          classify_socket_scan() {
+            local scan_rc="$1" stderr_file="$2" result_file="$3"
+            if (( scan_rc != 0 )); then
+              if grep -Eq 'Permission denied|Operation not permitted' "$stderr_file"; then
+                printf 'socket_scan_incomplete_permission_rc_%s\n' "$scan_rc"
+              elif (( scan_rc == 127 )); then
+                printf '%s\n' socket_scan_tool_unavailable
+              else
+                printf 'socket_scan_incomplete_tool_or_io_rc_%s\n' "$scan_rc"
+              fi
+              return 1
+            fi
+            if [[ -s "$stderr_file" ]]; then
+              printf '%s\n' socket_scan_stderr_without_failure
+              return 1
+            fi
+            if [[ -s "$result_file" ]]; then
+              printf '%s\n' host_control_socket_candidate_found
+              return 1
+            fi
+            printf '%s\n' socket_scan_complete_no_candidates
+            return 0
+          }
+          # SOCKET_SCAN_CLASSIFIER_END
+
+          # The socket scan is deliberately restricted to traversable container
+          # locations. An all-filesystem scan as UID 10001 is incomplete on
+          # pseudo-filesystems and therefore cannot prove absence. This scope is
+          # paired with the closed mount allowlist and direct path checks below.
+          socket_bad=0
+          for socket in /var/run/docker.sock /run/docker.sock /var/run/containerd/containerd.sock /run/containerd/containerd.sock /var/run/podman/podman.sock /run/podman/podman.sock; do
+            [[ ! -e "$socket" && ! -S "$socket" ]] || socket_bad=1
+          done
+          socket_scan=$(mktemp) || { probe_fail socket_scan_setup_failed; socket_bad=1; }
+          socket_scan_err=$(mktemp) || { probe_fail socket_scan_errorlog_setup_failed; socket_bad=1; }
+          if (( socket_bad == 0 )); then
+            socket_scan_scope_inaccessible=0
+            for socket_root in /tmp /run /var/run /dev /etc; do
+              [[ -d "$socket_root" && -r "$socket_root" && -x "$socket_root" ]] || socket_scan_scope_inaccessible=1
+            done
+            if (( socket_scan_scope_inaccessible != 0 )); then
+              probe_fail socket_scan_scope_inaccessible
+              socket_bad=1
             else
-              pass 'reduced boundary diagnostic'
+              set +e
+              find /tmp /run /var/run /dev /etc -xdev -type s \( -name '*docker*.sock' -o -name '*containerd*.sock' -o -name '*podman*.sock' \) -print >"$socket_scan" 2>"$socket_scan_err"
+              socket_scan_rc=$?
+              set -e
+              set +e
+              socket_scan_diagnostic="$(classify_socket_scan "$socket_scan_rc" "$socket_scan_err" "$socket_scan")"
+              socket_scan_status=$?
+              set -e
+              if (( socket_scan_status == 0 )); then
+                probe_pass "$socket_scan_diagnostic"
+              else
+                probe_fail "$socket_scan_diagnostic"
+                socket_bad=1
+              fi
             fi
           fi
+          rm -f "${socket_scan:-}" "${socket_scan_err:-}"
+          (( socket_bad == 0 )) && probe_pass no_host_control_socket || probe_fail host_control_socket_or_scan_failure
+          # Exit status is deliberately tri-state: 0 = valid/allowed, 1 =
+          # forbidden exposure, 2+ = unreadable or malformed mountinfo.
+          set +e
+          awk '
+            # MOUNTINFO_AWK_BEGIN
+            function has_option(options, wanted, n, values, i) {
+              n = split(options, values, ",")
+              for (i = 1; i <= n; i++) if (values[i] == wanted) return 1
+              return 0
+            }
+            function is_ro(options) { return has_option(options, "ro") && !has_option(options, "rw") }
+            function is_rw(options) { return has_option(options, "rw") && !has_option(options, "ro") }
+            function is_proc_readonly_path(path) {
+              return path == "/proc/bus" || path == "/proc/fs" || path == "/proc/irq" || \
+                     path == "/proc/sys" || path == "/proc/sysrq-trigger"
+            }
+            function is_masked_proc_path(path) {
+              return path == "/proc/acpi" || path == "/proc/asound" || path == "/proc/scsi" || \
+                     path == "/proc/interrupts" || path == "/proc/kcore" || path == "/proc/keys" || \
+                     path == "/proc/latency_stats" || path == "/proc/timer_list" || path == "/proc/timer_stats"
+            }
+            # These are the only mask exceptions supported by run #6 evidence.
+            # They are deliberately destination-specific: no prefix, tmpfs or
+            # rw rule is accepted outside this closed set.
+            function is_verified_mask_directory(path) {
+              return path == "/proc/acpi" || path == "/proc/scsi" || path == "/sys/firmware"
+            }
+            function is_verified_mask_file(path) {
+              return path == "/proc/interrupts" || path == "/proc/kcore" || path == "/proc/keys" || \
+                     path == "/proc/latency_stats" || path == "/proc/timer_list"
+            }
+            function is_verified_mask(path) { return is_verified_mask_directory(path) || is_verified_mask_file(path) }
+            function expected_path(path) {
+              return path == "/" || path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || \
+                     path == "/dev" || path == "/dev/pts" || path == "/dev/mqueue" || path == "/dev/shm" || \
+                     path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || \
+                     path == "/tmp" || path == "/run" || path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf"
+            }
+            function destination_class(path) {
+              if (expected_path(path)) return "expected"
+              if (path ~ /^\/proc(\/|$)/) return "proc_descendant"
+              if (path ~ /^\/sys(\/|$)/) return "sys_descendant"
+              if (path ~ /^\/dev(\/|$)/) return "dev_descendant"
+              if (path ~ /^\/etc(\/|$)/) return "etc_other"
+              return "other"
+            }
+            function destination_id(path) {
+              if (path == "/") return "root_overlay"
+              if (path == "/proc") return "proc_root"
+              if (path == "/proc/bus") return "proc_bus"
+              if (path == "/proc/fs") return "proc_fs"
+              if (path == "/proc/irq") return "proc_irq"
+              if (path == "/proc/sys") return "proc_sys"
+              if (path == "/proc/sysrq-trigger") return "proc_sysrq"
+              if (path == "/proc/acpi") return "proc_acpi"
+              if (path == "/proc/asound") return "proc_asound"
+              if (path == "/proc/scsi") return "proc_scsi"
+              if (path == "/proc/interrupts") return "proc_interrupts"
+              if (path == "/proc/kcore") return "proc_kcore"
+              if (path == "/proc/keys") return "proc_keys"
+              if (path == "/proc/latency_stats") return "proc_latency_stats"
+              if (path == "/proc/timer_list") return "proc_timer_list"
+              if (path == "/proc/timer_stats") return "proc_timer_stats"
+              if (path == "/dev") return "dev_root"
+              if (path == "/dev/pts") return "dev_pts"
+              if (path == "/dev/mqueue") return "dev_mqueue"
+              if (path == "/dev/shm") return "dev_shm"
+              if (path == "/sys") return "sys_root"
+              if (path == "/sys/fs/cgroup") return "sys_cgroup"
+              if (path == "/sys/firmware") return "sys_firmware"
+              if (path == "/sys/devices/virtual/powercap") return "sys_powercap"
+              if (path == "/tmp") return "tmp"
+              if (path == "/run") return "run"
+              if (path == "/etc/hosts") return "etc_hosts"
+              if (path == "/etc/hostname") return "etc_hostname"
+              if (path == "/etc/resolv.conf") return "etc_resolv_conf"
+              return "none"
+            }
+            function known_fstype_category(value) {
+              return value == "overlay" || value == "proc" || value == "tmpfs" || value == "devpts" || value == "mqueue" || value == "sysfs" || value == "cgroup2" ? value : "other"
+            }
+            function known_source_category(value) {
+              return value == "overlay" || value == "proc" || value == "tmpfs" || value == "devpts" || value == "mqueue" || value == "shm" || value == "sysfs" || value == "cgroup" ? value : "other"
+            }
+            function identity_matches(path, filesystem, source) {
+              if (path == "/") return filesystem == "overlay" && source == "overlay"
+              if (path == "/proc" || is_proc_readonly_path(path)) return filesystem == "proc" && source == "proc"
+              if (is_masked_proc_path(path) || path == "/dev" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || path == "/tmp" || path == "/run" || path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf") return filesystem == "tmpfs" && source == "tmpfs"
+              if (path == "/dev/pts") return filesystem == "devpts" && source == "devpts"
+              if (path == "/dev/mqueue") return filesystem == "mqueue" && source == "mqueue"
+              if (path == "/dev/shm") return filesystem == "tmpfs" && source == "shm"
+              if (path == "/sys") return filesystem == "sysfs" && source == "sysfs"
+              if (path == "/sys/fs/cgroup") return filesystem == "cgroup2" && source == "cgroup"
+              return 0
+            }
+            function expected_access(path) {
+              if (is_verified_mask_file(path)) return "rw"
+              if (path == "/" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap") return "ro"
+              return "rw"
+            }
+            function requires_option(path, option) {
+              # The verified Docker and runc mask representation in run #6 did not
+              # carry these flags per mount.  This exception is limited to the
+              # eight destinations and is paired with all mask predicates.
+              if (is_verified_mask(path)) return 0
+              if (option == "nosuid") return path != "/" && !(path == "/etc/hosts" || path == "/etc/hostname" || path == "/etc/resolv.conf")
+              if (option == "nodev") return path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/dev/mqueue" || path == "/dev/shm" || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap"
+              if (option == "noexec") return path == "/proc" || is_proc_readonly_path(path) || is_masked_proc_path(path) || path == "/dev/pts" || path == "/dev/mqueue" || path == "/dev/shm" || path == "/sys" || path == "/sys/fs/cgroup" || path == "/sys/firmware" || path == "/sys/devices/virtual/powercap" || path == "/tmp" || path == "/run"
+              return 0
+            }
+            function per_mount_option_code(path, options, code, access) {
+              code = ""
+              access = expected_access(path)
+              if ((access == "ro" && !is_ro(options)) || (access == "rw" && !is_rw(options))) code = "access_" access "_required"
+              if (requires_option(path, "nosuid") && !has_option(options, "nosuid")) code = code (code ? "+" : "") "missing_nosuid"
+              if (requires_option(path, "nodev") && !has_option(options, "nodev")) code = code (code ? "+" : "") "missing_nodev"
+              if (requires_option(path, "noexec") && !has_option(options, "noexec")) code = code (code ? "+" : "") "missing_noexec"
+              return code == "" ? "none" : code
+            }
+            function superblock_access_category(options) {
+              if (has_option(options, "ro") && has_option(options, "rw")) return "conflict"
+              if (has_option(options, "ro")) return "ro"
+              if (has_option(options, "rw")) return "rw"
+              return "other"
+            }
+            function propagation_clear(first, last, i) {
+              for (i = first; i <= last; i++)
+                if ($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) return 0
+              return 1
+            }
+            function mask_predicate_code(path, root, options, first, last) {
+              if (!is_verified_mask(path)) return "none"
+              if (is_verified_mask_directory(path) && root != "/") return "root_slash_required"
+              if (is_verified_mask_file(path) && root != "/null") return "root_null_required"
+              if ((is_verified_mask_directory(path) && !is_ro(options)) || (is_verified_mask_file(path) && !is_rw(options))) return "access_required"
+              if (!propagation_clear(first, last)) return "propagation_markers_forbidden"
+              return "none"
+            }
+            function options_match(path, options) { return per_mount_option_code(path, options) == "none" }
+            function report_rejection(reason, path, filesystem, source, options, super_options, id) {
+              id = expected_path(path) ? destination_id(path) : "none"
+              printf "INFO mountinfo_reject reason=%s destination_class=%s", reason, destination_class(path)
+              if (id != "none") printf " destination_id=%s", id
+              if (reason == "filesystem_or_source_incompatible") printf " fstype_category=%s source_category=%s", known_fstype_category(filesystem), known_source_category(source)
+              if (reason == "mount_options_incompatible") printf " per_mount=%s superblock_access=%s", per_mount_option_code(path, options), superblock_access_category(super_options)
+              if (reason == "mask_predicate_incompatible") printf " mask_predicate=%s", mask_predicate_code(path, root, options, 7, separator - 1)
+              printf "\n"
+              rejected++
+            }
+            function report_mask_submount(id) {
+              printf "INFO mountinfo_reject reason=mask_submount_unexpected destination_class=expected destination_id=%s\n", id
+              rejected++
+            }
+            {
+              records++
+              if (NF < 7) { malformed = 1; report_rejection("format_invalid", "", "", "", "", ""); next }
+              separator = 0
+              for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+              if (!separator || separator + 3 > NF) { malformed = 1; report_rejection("format_invalid", "", "", "", "", ""); next }
+              root = $4; target = $5; options = $6; filesystem = $(separator + 1); source = $(separator + 2); super_options = $(separator + 3)
+              if (seen[target]++) { forbidden = 1; report_rejection("duplicate_destination", target, filesystem, source, options, super_options) }
+              if (!expected_path(target)) {
+                forbidden = 1
+                report_rejection("destination_not_allowlisted", target, filesystem, source, options, super_options)
+              } else if (!identity_matches(target, filesystem, source)) {
+                forbidden = 1
+                report_rejection("filesystem_or_source_incompatible", target, filesystem, source, options, super_options)
+              } else if (!options_match(target, options)) {
+                forbidden = 1
+                report_rejection("mount_options_incompatible", target, filesystem, source, options, super_options)
+              } else if (mask_predicate_code(target, root, options, 7, separator - 1) != "none") {
+                forbidden = 1
+                report_rejection("mask_predicate_incompatible", target, filesystem, source, options, super_options)
+              }
+              if (target ~ /^\/proc\/acpi\//) mask_submount["proc_acpi"] = 1
+              if (target ~ /^\/proc\/scsi\//) mask_submount["proc_scsi"] = 1
+              if (target ~ /^\/sys\/firmware\//) mask_submount["sys_firmware"] = 1
+              if (target ~ /(^|\/)(docker|containerd|podman)\.sock$/ || \
+                  target ~ /^\/(home\/runner|__w|github)(\/|$)/ || \
+                  source ~ /(docker\.sock|containerd\.sock|podman\.sock|\/home\/runner|\/__w|\/github)/) {
+                forbidden = 1
+                report_rejection("forbidden_host_reference", target, filesystem, source, options, super_options)
+              }
+            }
+            END {
+              if (records == 0) { printf "%s\n", "INFO mountinfo_reject reason=empty destination_class=none"; exit 2 }
+              if (malformed) exit 2
+              if (mask_submount["proc_acpi"]) { forbidden = 1; report_mask_submount("proc_acpi") }
+              if (mask_submount["proc_scsi"]) { forbidden = 1; report_mask_submount("proc_scsi") }
+              if (mask_submount["sys_firmware"]) { forbidden = 1; report_mask_submount("sys_firmware") }
+              if (forbidden) exit 1
+              exit 0
+            }
+            # MOUNTINFO_AWK_END
+          ' /proc/self/mountinfo
+          mountinfo_rc=$?
+          set -e
+          case "$mountinfo_rc" in
+            0) probe_pass runtime_mountinfo_closed_allowlist ;;
+            1) probe_fail prohibited_or_unexpected_runtime_mount ;;
+            *) probe_fail "mountinfo_inspection_error_rc_${mountinfo_rc}" ;;
+          esac
 
-          {
-            echo '## Paperclip TI-0093 - diagnostic only'
-            echo
-            echo '- No Paperclip source, packages, models or third-party scripts were fetched/executed.'
-            echo '- Container image uses mutable `ubuntu:24.04` for diagnostics only.'
-            echo '- Actual P01/P02/P04 execution remains prohibited pending a new digest-pinned, separately reviewed workflow.'
-            echo
-            if (( ${#failures[@]} > 0 )); then
-              echo '### Preflight verdict: NO-GO'
-              printf -- '- %s\n' "${failures[@]}"
-            else
-              echo '### Preflight verdict: diagnostic probes passed'
-              echo '- **NOT an authorization to run Paperclip.**'
+          # The following probes are mandatory companion predicates for the
+          # eight narrowly accepted runtime masks.  All raw mountinfo fields
+          # stay inside awk/shell variables.
+          # RUNTIME_MASK_DIAGNOSTIC_AWK_BEGIN
+          runtime_mask_diagnostic_awk='\
+            BEGIN {
+              dir_paths["proc_acpi"] = "/proc/acpi"
+              dir_paths["proc_scsi"] = "/proc/scsi"
+              dir_paths["sys_firmware"] = "/sys/firmware"
+            }
+            function option(options, wanted, n, values, i) {
+              n = split(options, values, ",")
+              for (i = 1; i <= n; i++) if (values[i] == wanted) return 1
+              return 0
+            }
+            function ro(options) { return option(options, "ro") && !option(options, "rw") }
+            function rw(options) { return option(options, "rw") && !option(options, "ro") }
+            function dir_id(path) {
+              if (path == "/proc/acpi") return "proc_acpi"
+              if (path == "/proc/scsi") return "proc_scsi"
+              if (path == "/sys/firmware") return "sys_firmware"
+              return ""
+            }
+            function file_id(path) {
+              if (path == "/proc/interrupts") return "proc_interrupts"
+              if (path == "/proc/kcore") return "proc_kcore"
+              if (path == "/proc/keys") return "proc_keys"
+              if (path == "/proc/latency_stats") return "proc_latency_stats"
+              if (path == "/proc/timer_list") return "proc_timer_list"
+              return ""
+            }
+            function propagation_clear(first, last, i) {
+              for (i = first; i <= last; i++)
+                if ($i ~ /^(shared:|master:|propagate_from:|unbindable$)/) return "false"
+              return "true"
+            }
+            function bool(value) { return value ? "true" : "false" }
+            function report_dir(id, path, fs, source, root, options, propagation) {
+              dir_seen[id]++
+              dir_fs[id] = bool(fs == "tmpfs" && source == "tmpfs")
+              dir_root[id] = bool(root == "/")
+              dir_ro[id] = bool(ro(options))
+              dir_propagation[id] = propagation
+            }
+            function report_file(id, path, fs, source, root, options, propagation) {
+              file_seen[id]++
+              file_fs[id] = bool(fs == "tmpfs" && source == "tmpfs")
+              file_root[id] = bool(root == "/null")
+              file_rw[id] = bool(rw(options))
+              file_propagation[id] = propagation
+            }
+            {
+              records++
+              if (NF < 7) { malformed = 1; next }
+              separator = 0
+              for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+              if (!separator || separator + 3 > NF) { malformed = 1; next }
+              root = $4; target = $5; options = $6; fs = $(separator + 1); source = $(separator + 2)
+              propagation = propagation_clear(7, separator - 1)
+              id = dir_id(target)
+              if (id != "") report_dir(id, target, fs, source, root, options, propagation)
+              id = file_id(target)
+              if (id != "") report_file(id, target, fs, source, root, options, propagation)
+              for (d in dir_paths) if (target ~ ("^" dir_paths[d] "/")) dir_submount[d] = "true"
+            }
+            END {
+              split("proc_acpi proc_scsi sys_firmware", dirs, " ")
+              split("proc_interrupts proc_kcore proc_keys proc_latency_stats proc_timer_list", files, " ")
+              if (records == 0 || malformed) { print "runtime_mask_mountinfo_parser_error"; exit 2 }
+              bad = 0
+              for (i in dirs) {
+                id = dirs[i]; seen = dir_seen[id] == 1 ? "true" : "false"
+                submount = dir_submount[id] == "true" ? "true" : "false"
+                printf "runtime_mask_directory id=%s cardinality_one=%s type_source_tmpfs=%s root_is_slash=%s per_mount_ro=%s propagation_markers_absent=%s submounts_unexpected=%s\n", id, seen, dir_fs[id] ? dir_fs[id] : "false", dir_root[id] ? dir_root[id] : "false", dir_ro[id] ? dir_ro[id] : "false", dir_propagation[id] ? dir_propagation[id] : "false", submount
+                if (seen != "true" || submount != "false" || dir_fs[id] != "true" || dir_root[id] != "true" || dir_ro[id] != "true" || dir_propagation[id] != "true") bad = 1
+              }
+              for (i in files) {
+                id = files[i]; seen = file_seen[id] == 1 ? "true" : "false"
+                printf "runtime_mask_file id=%s cardinality_one=%s type_source_tmpfs=%s root_is_null=%s per_mount_rw=%s propagation_markers_absent=%s\n", id, seen, file_fs[id] ? file_fs[id] : "false", file_root[id] ? file_root[id] : "false", file_rw[id] ? file_rw[id] : "false", file_propagation[id] ? file_propagation[id] : "false"
+                if (seen != "true" || file_fs[id] != "true" || file_root[id] != "true" || file_rw[id] != "true" || file_propagation[id] != "true") bad = 1
+              }
+              exit bad ? 1 : 0
+            }'
+          # RUNTIME_MASK_DIAGNOSTIC_AWK_END
+          # RUNTIME_OBJECT_DIAGNOSTIC_BEGIN
+          diagnose_masked_directory_objects() {
+            local entries="$1" id path extra listing error_file find_rc
+            local invalid=0 parse_error=0
+            while IFS='|' read -r id path extra; do
+              [[ -z "$id" && -z "$path" && -z "$extra" ]] && continue
+              if [[ -z "$id" || -z "$path" || -n "$extra" ]]; then parse_error=1; continue; fi
+              # Production supplies the fixed paths below; this helper keeps
+              # the ID closed so fixtures can exercise its object checks
+              # without emitting their temporary paths.
+              case "$id" in
+                proc_acpi|proc_scsi|sys_firmware) ;;
+                *) parse_error=1; continue ;;
+              esac
+              local object_dir=false object_symlink=false empty=false inspection_complete=false
+              [[ -L "$path" ]] && object_symlink=true
+              [[ -d "$path" && "$object_symlink" == false ]] && object_dir=true
+              if [[ "$object_dir" == true ]]; then
+                error_file="$(mktemp)" || { parse_error=1; continue; }
+                set +e
+                listing="$(find "$path" -xdev -mindepth 1 -maxdepth 1 -print -quit 2>"$error_file")"
+                find_rc=$?
+                set -e
+                if (( find_rc == 0 )) && [[ ! -s "$error_file" ]]; then
+                  inspection_complete=true
+                  [[ -z "$listing" ]] && empty=true
+                fi
+                rm -f "$error_file"
+              fi
+              [[ "$object_dir" == true && "$object_symlink" == false && "$empty" == true && "$inspection_complete" == true ]] || invalid=1
+              printf 'runtime_mask_directory_object id=%s object_dir=%s object_symlink=%s empty=%s inspection_complete=%s\n' "$id" "$object_dir" "$object_symlink" "$empty" "$inspection_complete"
+            done <<< "$entries"
+            if (( parse_error != 0 )); then printf '%s\n' runtime_mask_directory_object_parser_error; return 2; fi
+            (( invalid == 0 )) || return 1
+          }
+
+          diagnose_masked_file_objects() {
+            local entries="$1" id path extra details null_details object_type major minor null_type null_major null_minor
+            local invalid=0 parse_error=0
+            if ! null_details="$(stat -Lc '%F|%t|%T' /dev/null)"; then
+              printf '%s\n' runtime_mask_file_null_stat_error
+              return 2
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+            IFS='|' read -r null_type null_major null_minor <<< "$null_details"
+            while IFS='|' read -r id path extra; do
+              [[ -z "$id" && -z "$path" && -z "$extra" ]] && continue
+              if [[ -z "$id" || -z "$path" || -n "$extra" ]]; then parse_error=1; continue; fi
+              # Production supplies the fixed paths below; only known IDs are
+              # accepted and the inspected path is never logged.
+              case "$id" in
+                proc_interrupts|proc_kcore|proc_keys|proc_latency_stats|proc_timer_list) ;;
+                *) parse_error=1; continue ;;
+              esac
+              local character_device=false object_symlink=false null_1_3=false null_identity_match=false inspection_complete=false
+              [[ -L "$path" ]] && object_symlink=true
+              if details="$(stat -Lc '%F|%t|%T' "$path" 2>/dev/null)"; then
+                IFS='|' read -r object_type major minor <<< "$details"
+                inspection_complete=true
+                [[ "$object_type" == 'character special file' ]] && character_device=true
+                [[ "$major" == 1 && "$minor" == 3 && "$null_type" == 'character special file' && "$null_major" == 1 && "$null_minor" == 3 ]] && null_1_3=true
+                [[ "$details" == "$null_details" ]] && null_identity_match=true
+              fi
+              [[ "$character_device" == true && "$object_symlink" == false && "$null_1_3" == true && "$null_identity_match" == true && "$inspection_complete" == true ]] || invalid=1
+              printf 'runtime_mask_file_object id=%s character_device=%s object_symlink=%s null_char_1_3=%s null_identity_match=%s inspection_complete=%s\n' "$id" "$character_device" "$object_symlink" "$null_1_3" "$null_identity_match" "$inspection_complete"
+            done <<< "$entries"
+            if (( parse_error != 0 )); then printf '%s\n' runtime_mask_file_object_parser_error; return 2; fi
+            (( invalid == 0 )) || return 1
+          }
+          # RUNTIME_OBJECT_DIAGNOSTIC_END
+          # The awk probe must have a complete view: malformed input and every
+          # unrecognised descendant of a masked directory are NO-GO.
+          set +e
+          runtime_mask_mount_diagnostic="$(awk "$runtime_mask_diagnostic_awk" /proc/self/mountinfo)"
+          runtime_mask_mount_rc=$?
+          set -e
+          while IFS= read -r runtime_mask_line; do
+            [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"
+          done <<< "$runtime_mask_mount_diagnostic"
+          case "$runtime_mask_mount_rc" in
+            0) probe_pass runtime_mask_mount_predicates_verified ;;
+            1) probe_fail runtime_mask_mount_diagnostic_inconclusive_or_mismatch ;;
+            *) probe_fail runtime_mask_mount_diagnostic_parser_error ;;
+          esac
+          set +e
+          runtime_mask_dir_diagnostic="$(diagnose_masked_directory_objects $'proc_acpi|/proc/acpi\nproc_scsi|/proc/scsi\nsys_firmware|/sys/firmware')"
+          runtime_mask_dir_rc=$?
+          runtime_mask_file_diagnostic="$(diagnose_masked_file_objects $'proc_interrupts|/proc/interrupts\nproc_kcore|/proc/kcore\nproc_keys|/proc/keys\nproc_latency_stats|/proc/latency_stats\nproc_timer_list|/proc/timer_list')"
+          runtime_mask_file_rc=$?
+          set -e
+          while IFS= read -r runtime_mask_line; do [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"; done <<< "$runtime_mask_dir_diagnostic"
+          while IFS= read -r runtime_mask_line; do [[ -n "$runtime_mask_line" ]] && printf 'INFO %s\n' "$runtime_mask_line"; done <<< "$runtime_mask_file_diagnostic"
+          case "$runtime_mask_dir_rc" in 0) probe_pass runtime_mask_directory_objects_verified ;; 1) probe_fail runtime_mask_directory_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_directory_object_diagnostic_parser_error ;; esac
+          case "$runtime_mask_file_rc" in 0) probe_pass runtime_mask_file_objects_verified ;; 1) probe_fail runtime_mask_file_object_diagnostic_inconclusive_or_mismatch ;; *) probe_fail runtime_mask_file_object_diagnostic_parser_error ;; esac
 
-          # Unlike the original file, the Actions job is red when probes fail.
-          if (( ${#failures[@]} > 0 )); then exit 1; fi
-          exit 0
+          # --network none plus one loopback interface is primary evidence.
+          # DNS, raw TCP and TLS/HTTPS attempts are independent negative probes.
+          timeout 5 getent ahostsv4 example.com >/dev/null 2>&1 && probe_fail dns_egress_available || probe_pass dns_negative
+          timeout 5 nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1 && probe_fail tcp_egress_available || probe_pass tcp_negative
+          timeout 5 openssl s_client -connect 1.1.1.1:443 -servername one.one.one.one -brief </dev/null >/dev/null 2>&1 && probe_fail tls_egress_available || probe_pass tls_negative
+          HTTPS_PROXY= HTTP_PROXY= ALL_PROXY= NO_PROXY= timeout 5 curl --noproxy '*' --insecure --silent --show-error --output /dev/null https://1.1.1.1/ >/dev/null 2>&1 && probe_fail https_egress_available || probe_pass https_negative
+
+          (( bad == 0 )) || exit 86
+          printf '%s\n' 'PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE'
+          DIAGNOSTIC
+            diagnostic_start_pid=$!
+            runtime_ready=false
+            for _ in $(seq 1 48); do
+              if grep -Fqx 'PAPERCLIP_PREFLIGHT_RUNTIME_READY' "$diagnostic_log" 2>/dev/null; then
+                runtime_ready=true
+                break
+              fi
+              kill -0 "$diagnostic_start_pid" >/dev/null 2>&1 || break
+              sleep 0.25
+            done
+            if [[ "$runtime_ready" == true ]]; then
+              collect_docker_managed_etc_metadata_phase runtime
+              if runtime_docker_managed_etc_metadata_paths_available; then
+                set +e
+                host_source_gate_diagnostic="$(run_docker_managed_host_source_gate)"
+                host_source_gate_rc=$?
+                set -e
+                while IFS= read -r host_source_gate_line; do
+                  [[ -n "$host_source_gate_line" ]] && info "$host_source_gate_line"
+                done <<<"$host_source_gate_diagnostic"
+                if (( host_source_gate_rc == 0 )); then
+                  pass 'docker-managed host source viability gate passed; diagnostic only'
+                else
+                  diagnostic_no_go 'docker-managed host source viability gate inconclusive'
+                fi
+                # Stage 1 can never authorize the three mounts.  The private
+                # container-to-runner evidence protocol is intentionally absent.
+                diagnostic_no_go 'docker-managed host source viability gate is diagnostic-only'
+              fi
+            else
+              diagnostic_no_go 'docker-managed etc runtime diagnostic readiness timeout or start failure'
+            fi
+            wait "$diagnostic_start_pid"
+            start_rc=$?
+            diagnostic_start_pid=''
+            set -e
+            cat "$diagnostic_log"
+            if ! diagnostic_rc="$(inspect_value '{{.State.ExitCode}}')"; then
+              fail 'docker inspect failed for diagnostic exit code'
+            fi
+            if ! diagnostic_state="$(inspect_value '{{.State.Status}}')"; then
+              fail 'docker inspect failed for diagnostic state'
+            fi
+            [[ "$start_rc" == 0 ]] || fail "docker start returned non-zero: $start_rc"
+            [[ "$diagnostic_state" == exited ]] || fail "diagnostic container state is not exited: $diagnostic_state"
+            [[ "$diagnostic_rc" == 0 ]] || fail "diagnostic container exit code is not zero: $diagnostic_rc"
+            [[ "$(grep -Fxc 'PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE' "$diagnostic_log")" == 1 ]] || fail 'diagnostic completion marker missing or duplicated'
+            [[ "$(tail -n 1 "$diagnostic_log")" == PAPERCLIP_PREFLIGHT_DIAGNOSTIC_COMPLETE ]] || fail 'diagnostic completion marker is not final output'
+          fi
+
+          summary_payload="$({
+            echo '## Paperclip TI-0093 isolation preflight v2'
+            echo
+            echo '- No Paperclip source, packages, models, third-party repository scripts or private data were accessed.'
+            echo '- The runner used Docker only to create the separately configured diagnostic container.'
+            echo '- The summary is written by the trusted runner process, not the UID 10001 container process.'
+            echo '- A pass validates only this diagnostic configuration; it does not authorize P01, P02 or P04.'
+            echo
+            if final_verdict_is_go; then
+              echo '### Verdict: GO for separate review of a later Paperclip test workflow only'
+              echo '- P01/P02/P04 remain NO-GO pending explicit approval and a separately reviewed workflow.'
+            else
+              echo '### Verdict: NO-GO'
+              printf -- '- %s\n' "${hard_prestart_failures[@]}" "${diagnostic_findings[@]}"
+            fi
+          })"
+          if ! printf '%s\n' "$summary_payload" >> "$GITHUB_STEP_SUMMARY"; then
+            fail 'cannot write GITHUB_STEP_SUMMARY from trusted runner process'
+          fi
+
+          # Fail the job for any mandatory failure or diagnostic NO-GO.
+          final_verdict_is_go
