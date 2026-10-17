@@ -72,6 +72,25 @@ install_root="$tmp/install-root"
 source_file="$tmp/reviewed-probe.sh"
 printf '%s\n' '#!/usr/bin/env bash' >"$source_file"
 chmod 0500 "$source_file"
+# The production helper must require root:root.  This test intentionally
+# models only the metadata returned by privileged operations for paths inside
+# its disposable fixture, so it can exercise the real helper under a normal
+# non-root CI user without weakening the production predicate.
+stat() {
+  local format='' arg last=''
+  for arg in "$@"; do
+    [[ "$arg" == -c || "$arg" == -Lc ]] && continue
+    if [[ -z "$format" && "$arg" == *%* ]]; then format="$arg"; fi
+    last="$arg"
+  done
+  if [[ "$last" == "$install_root"/* ]]; then
+    case "$format" in
+      '%u:%g:%a:%F') printf '0:0:%s:%s\n' "$(command stat -Lc '%a' -- "$last")" "$(command stat -Lc '%F' -- "$last")"; return 0 ;;
+      '%d:%i:%u:%g:%a:%F') printf '%s:0:0:%s:%s\n' "$(command stat -Lc '%d:%i' -- "$last")" "$(command stat -Lc '%a' -- "$last")" "$(command stat -Lc '%F' -- "$last")"; return 0 ;;
+    esac
+  fi
+  command stat "$@"
+}
 controller_installed_by_run=false
 probe_installed_by_run=false
 controller_installed_identity=''
@@ -167,8 +186,81 @@ set -e
 [[ "$rc" == 86 && -f "$install_temp_path" ]] || test_fail install_unproven_cleanup_preserved
 rm -f -- "$install_temp_path"
 
-unset -f sudo mktemp install install_root_owned_script installation_dir_is_trusted installation_temp_is_owned remove_execution_owned_install cleanup_partial_install
+unset -f sudo mktemp install stat install_root_owned_script installation_dir_is_trusted installation_temp_is_owned remove_execution_owned_install cleanup_partial_install
 test_pass reviewed_transactional_script_installation_and_partial_cleanup
+
+# Exercise the actual step-4 manifest reader and cleanup verifier.  The
+# manifest transports only identity and digest values; the paths remain fixed
+# in the trusted workflow, and no raw values are logged.
+extract_marker_block INSTALL_MANIFEST_READER_BEGIN INSTALL_MANIFEST_READER_END "$workflow" "$tmp/manifest-reader.sh"
+source "$tmp/manifest-reader.sh"
+continuity_root="$tmp/continuity"
+stage="$continuity_root/stage"
+mkdir -p -- "$stage"
+chmod 0700 -- "$stage"
+owner_marker="$stage/.owner"
+manifest="$stage/.installed-manifest"
+expected_owner='run:attempt:sha'
+printf '%s\n' "$expected_owner" >"$owner_marker"
+chmod 0400 -- "$owner_marker"
+controller_installed="$continuity_root/controller"
+probe_installed="$continuity_root/probe"
+printf '%s\n' controller >"$controller_installed"
+printf '%s\n' probe >"$probe_installed"
+chmod 0555 -- "$controller_installed" "$probe_installed"
+controller_identity="$(stat -Lc '%d:%i' -- "$controller_installed")"
+probe_identity="$(stat -Lc '%d:%i' -- "$probe_installed")"
+controller_hash="$(sha256sum -- "$controller_installed" | awk '{print $1}')"
+probe_hash="$(sha256sum -- "$probe_installed" | awk '{print $1}')"
+{
+  printf 'owner\t%s\n' "$expected_owner"
+  printf 'controller\t%s\t%s\n' "$controller_identity" "$controller_hash"
+  printf 'probe\t%s\t%s\n' "$probe_identity" "$probe_hash"
+} >"$manifest"
+chmod 0400 -- "$manifest"
+verify_stage_manifest || test_fail continuity_manifest_valid_rejected
+stage_owned=true
+read_install_manifest || test_fail continuity_manifest_parse_valid_rejected
+verify_installed_artifact "$controller_installed" "$controller_identity" "$controller_hash" || test_fail continuity_controller_valid_rejected
+verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash" || test_fail continuity_probe_valid_rejected
+
+# A symlink, missing file, device/inode drift or changed content cannot pass
+# the before-execution gate.  The cleanup helper consequently preserves each
+# unproven resource.
+probe_saved="$probe_installed"
+rm -f -- "$probe_installed"
+ln -s "$controller_installed" "$probe_installed"
+set +e; verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash"; rc=$?; set -e
+[[ "$rc" == 1 && -L "$probe_installed" ]] || test_fail continuity_symlink_not_rejected
+rm -f -- "$probe_installed"
+set +e; verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail continuity_missing_not_rejected
+replacement_probe="$continuity_root/replacement-probe"
+printf '%s\n' probe >"$replacement_probe"
+chmod 0555 -- "$replacement_probe"
+mv -- "$replacement_probe" "$probe_installed"
+drifted_probe_identity='999999:999999'
+set +e; verify_installed_artifact "$probe_installed" "$drifted_probe_identity" "$probe_hash"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail continuity_identity_drift_not_rejected
+replacement_controller="$continuity_root/replacement-controller"
+printf '%s\n' altered >"$replacement_controller"
+chmod 0555 -- "$replacement_controller"
+mv -- "$replacement_controller" "$controller_installed"
+set +e; verify_installed_artifact "$controller_installed" "$controller_identity" "$controller_hash"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail continuity_hash_drift_not_rejected
+set +e; remove_verified_artifact "$controller_installed" "$controller_identity" "$controller_hash"; rc=$?; set -e
+[[ "$rc" == 1 && -f "$controller_installed" ]] || test_fail continuity_cleanup_removed_unproven
+
+# A malformed or extended manifest is rejected before any executable is run.
+replacement_manifest="$continuity_root/replacement-manifest"
+cat -- "$manifest" >"$replacement_manifest"
+printf 'extra\tentry\n' >>"$replacement_manifest"
+chmod 0400 -- "$replacement_manifest"
+mv -- "$replacement_manifest" "$manifest"
+set +e; read_install_manifest; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail continuity_manifest_extra_record_not_rejected
+unset -f verify_stage_manifest read_install_manifest verify_installed_artifact remove_verified_artifact remove_verified_stage
+test_pass continuity_manifest_and_verified_cleanup
 
 # Exercise the two workflow staging blocks as the owning, non-root user when a
 # normal test user is available.  This deliberately uses the extracted

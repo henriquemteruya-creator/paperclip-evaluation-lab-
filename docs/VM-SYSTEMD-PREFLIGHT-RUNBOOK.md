@@ -58,6 +58,24 @@ deleted. This prevents a partial `install` failure from being mistaken for a
 preexisting resource while also preventing cleanup from removing an unproven
 path.
 
+## Continuity between workflow steps
+
+The installation step writes a private, runner-owned manifest in the existing
+mode-`0700` staging directory only after both root-owned executables have been
+published. It binds the current run marker to each fixed artifact ID and stores
+only its device/inode identity and SHA-256 digest. The following step validates
+the staging directory, run marker and manifest ownership/modes, parses exactly
+the expected three records, then rechecks each executable as a non-symlink
+root-owned mode-`0555` regular file with the recorded identity and digest
+before invoking the controller. A mismatch, unreadable metadata, absent hash
+tool or malformed/extra manifest record is a fail-closed `NO-GO`.
+
+Final cleanup repeats the same artifact checks before deletion. It also checks
+the staging directory identity and owner/mode before recursive removal. An
+unproven path is deliberately preserved and turns the run into `NO-GO`; the
+workflow never treats inability to prove ownership as authorization to remove a
+resource.
+
 Execution #4 (run `39075677975`, SHA
 `45b70744fd7771e5a82c17e881cce62b343aafcb`) failed before the controller ran:
 the GitHub-hosted image had no `/usr/local/libexec` directory, so the second

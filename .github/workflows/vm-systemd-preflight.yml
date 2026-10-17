@@ -667,6 +667,9 @@ jobs:
           stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
           controller_stage="$stage/controller.sh"
           probe_stage="$stage/probe.sh"
+          owner_marker="$stage/.owner"
+          manifest="$stage/.installed-manifest"
+          expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"
           controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
           probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'
           controller_installed_by_run=false
@@ -734,6 +737,40 @@ jobs:
           # INSTALL_HELPER_END
           [[ "$controller_installed" == '/usr/local/sbin/ti0093-vm-preflight-controller' ]] || exit 86
           [[ "$probe_installed" == '/usr/local/sbin/ti0093-vm-preflight-probe' ]] || exit 86
+          # INSTALL_MANIFEST_WRITER_BEGIN
+          installed_artifact_record() {
+            local artifact_id="$1" artifact_path="$2" expected_identity="$3" metadata digest
+            [[ "$artifact_id" == controller || "$artifact_id" == probe ]] || return 1
+            [[ -f "$artifact_path" && ! -L "$artifact_path" && -n "$expected_identity" ]] || return 1
+            metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$artifact_path" 2>/dev/null)" || return 1
+            [[ "$metadata" == "$expected_identity:0:0:555:regular file" ]] || return 1
+            digest="$(sha256sum -- "$artifact_path" 2>/dev/null)" || return 1
+            digest="${digest%% *}"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+            printf '%s\t%s\t%s\n' "$artifact_id" "$expected_identity" "$digest"
+          }
+
+          write_install_manifest() {
+            local manifest_temp
+            [[ -d "$stage" && ! -L "$stage" && -f "$owner_marker" && ! -L "$owner_marker" ]] || return 1
+            [[ "$(stat -Lc '%u:%g:%a:%F' -- "$stage" 2>/dev/null)" == "$(id -u):$(id -g):700:directory" ]] || return 1
+            [[ "$(stat -Lc '%u:%g:%a:%F' -- "$owner_marker" 2>/dev/null)" == "$(id -u):$(id -g):400:regular file" ]] || return 1
+            [[ "$(<"$owner_marker")" == "$expected_owner" ]] || return 1
+            [[ ! -e "$manifest" && ! -L "$manifest" ]] || return 1
+            command -v sha256sum >/dev/null 2>&1 || return 1
+            manifest_temp="$(mktemp "$stage/.installed-manifest.XXXXXXXXXX")" || return 1
+            [[ "$manifest_temp" == "$stage"/.installed-manifest.* && -f "$manifest_temp" && ! -L "$manifest_temp" ]] || return 1
+            {
+              printf 'owner\t%s\n' "$expected_owner"
+              installed_artifact_record controller "$controller_installed" "$controller_installed_identity"
+              installed_artifact_record probe "$probe_installed" "$probe_installed_identity"
+            } >"$manifest_temp" || return 1
+            chmod 0400 -- "$manifest_temp" || return 1
+            [[ "$(stat -Lc '%u:%g:%a:%F' -- "$manifest_temp" 2>/dev/null)" == "$(id -u):$(id -g):400:regular file" ]] || return 1
+            mv -n -- "$manifest_temp" "$manifest" || return 1
+            [[ -f "$manifest" && ! -L "$manifest" && ! -e "$manifest_temp" && ! -L "$manifest_temp" ]] || return 1
+          }
+          # INSTALL_MANIFEST_WRITER_END
           # PARTIAL_INSTALL_CLEANUP_BEGIN
           remove_execution_owned_install() {
             local target_path="$1" owned_flag_name="$2" identity_name="$3" expected_identity metadata
@@ -1070,6 +1107,7 @@ jobs:
           bash -n "$probe_stage"
           install_root_owned_script "$controller_stage" "$controller_installed" controller_installed_by_run controller_installed_identity || exit 86
           install_root_owned_script "$probe_stage" "$probe_installed" probe_installed_by_run probe_installed_identity || exit 86
+          write_install_manifest || exit 86
           trap - EXIT
 
       - name: Run trusted controller with a benign transient service
@@ -1081,17 +1119,88 @@ jobs:
           stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
           controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
           probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'
-          controller_owned=true
-          probe_owned=true
-          stage_owned=true
+          owner_marker="$stage/.owner"
+          manifest="$stage/.installed-manifest"
+          expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"
+          controller_owned=false
+          probe_owned=false
+          stage_owned=false
+          controller_identity=''
+          probe_identity=''
+          controller_hash=''
+          probe_hash=''
+          stage_identity=''
+          # INSTALL_MANIFEST_READER_BEGIN
+          verify_stage_manifest() {
+            local stage_metadata marker_metadata manifest_metadata
+            [[ -d "$stage" && ! -L "$stage" && -f "$owner_marker" && ! -L "$owner_marker" && -f "$manifest" && ! -L "$manifest" ]] || return 1
+            stage_metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$stage" 2>/dev/null)" || return 1
+            [[ "$stage_metadata" =~ ^([0-9]+:[0-9]+):$(id -u):$(id -g):700:directory$ ]] || return 1
+            stage_identity="${BASH_REMATCH[1]}"
+            marker_metadata="$(stat -Lc '%u:%g:%a:%F' -- "$owner_marker" 2>/dev/null)" || return 1
+            manifest_metadata="$(stat -Lc '%u:%g:%a:%F' -- "$manifest" 2>/dev/null)" || return 1
+            [[ "$marker_metadata" == "$(id -u):$(id -g):400:regular file" && "$manifest_metadata" == "$(id -u):$(id -g):400:regular file" ]] || return 1
+            [[ "$(<"$owner_marker")" == "$expected_owner" ]] || return 1
+          }
+
+          read_install_manifest() {
+            local owner_line controller_line probe_line extra id identity digest tail
+            mapfile -t manifest_lines <"$manifest" || return 1
+            (( ${#manifest_lines[@]} == 3 )) || return 1
+            owner_line="${manifest_lines[0]}"; controller_line="${manifest_lines[1]}"; probe_line="${manifest_lines[2]}"
+            IFS=$'\t' read -r id identity tail <<<"$owner_line"
+            [[ "$id" == owner && "$identity" == "$expected_owner" && -z "$tail" ]] || return 1
+            IFS=$'\t' read -r id identity digest tail <<<"$controller_line"
+            [[ "$id" == controller && "$identity" =~ ^[0-9]+:[0-9]+$ && "$digest" =~ ^[0-9a-f]{64}$ && -z "$tail" ]] || return 1
+            controller_identity="$identity"; controller_hash="$digest"
+            IFS=$'\t' read -r id identity digest tail <<<"$probe_line"
+            [[ "$id" == probe && "$identity" =~ ^[0-9]+:[0-9]+$ && "$digest" =~ ^[0-9a-f]{64}$ && -z "$tail" ]] || return 1
+            probe_identity="$identity"; probe_hash="$digest"
+          }
+
+          verify_installed_artifact() {
+            local artifact_path="$1" expected_identity="$2" expected_hash="$3" metadata actual_hash
+            [[ -f "$artifact_path" && ! -L "$artifact_path" && "$expected_identity" =~ ^[0-9]+:[0-9]+$ && "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+            metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$artifact_path" 2>/dev/null)" || return 1
+            [[ "$metadata" == "$expected_identity:0:0:555:regular file" ]] || return 1
+            actual_hash="$(sha256sum -- "$artifact_path" 2>/dev/null)" || return 1
+            actual_hash="${actual_hash%% *}"
+            [[ "$actual_hash" == "$expected_hash" ]]
+          }
+
+          remove_verified_artifact() {
+            local artifact_path="$1" expected_identity="$2" expected_hash="$3"
+            verify_installed_artifact "$artifact_path" "$expected_identity" "$expected_hash" || return 1
+            sudo rm -f -- "$artifact_path" || return 1
+            [[ ! -e "$artifact_path" && ! -L "$artifact_path" ]]
+          }
+
+          remove_verified_stage() {
+            local metadata
+            [[ "$stage_owned" == true && -n "$stage_identity" && -d "$stage" && ! -L "$stage" ]] || return 1
+            metadata="$(stat -Lc '%d:%i:%u:%g:%a:%F' -- "$stage" 2>/dev/null)" || return 1
+            [[ "$metadata" == "$stage_identity:$(id -u):$(id -g):700:directory" ]] || return 1
+            rm -rf -- "$stage" || return 1
+            [[ ! -e "$stage" && ! -L "$stage" ]]
+          }
+          # INSTALL_MANIFEST_READER_END
           cleanup_stage() {
-            set +e
-            [[ "$probe_owned" == true ]] && sudo rm -f -- "$probe_installed" >/dev/null 2>&1
-            [[ "$controller_owned" == true ]] && sudo rm -f -- "$controller_installed" >/dev/null 2>&1
-            [[ "$stage_owned" == true ]] && rm -rf -- "$stage" >/dev/null 2>&1
+            local rc=$? cleanup_rc=0
+            if [[ "$probe_owned" == true ]]; then remove_verified_artifact "$probe_installed" "$probe_identity" "$probe_hash" >/dev/null 2>&1 || cleanup_rc=1; fi
+            if [[ "$controller_owned" == true ]]; then remove_verified_artifact "$controller_installed" "$controller_identity" "$controller_hash" >/dev/null 2>&1 || cleanup_rc=1; fi
+            if [[ "$stage_owned" == true ]]; then remove_verified_stage >/dev/null 2>&1 || cleanup_rc=1; fi
+            if (( cleanup_rc != 0 )); then trap - EXIT; exit 86; fi
+            return "$rc"
           }
           trap cleanup_stage EXIT
-          [[ -x "$controller_installed" && -x "$probe_installed" ]] || exit 86
+          command -v sha256sum >/dev/null 2>&1 || exit 86
+          verify_stage_manifest || exit 86
+          stage_owned=true
+          read_install_manifest || exit 86
+          verify_installed_artifact "$controller_installed" "$controller_identity" "$controller_hash" || exit 86
+          controller_owned=true
+          verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash" || exit 86
+          probe_owned=true
 
           set +e
           sudo env -i \
@@ -1104,11 +1213,11 @@ jobs:
           controller_rc=$?
           set -e
           cleanup_rc=0
-          sudo rm -f -- "$probe_installed" || cleanup_rc=1
-          [[ ! -e "$probe_installed" && ! -L "$probe_installed" ]] && probe_owned=false || cleanup_rc=1
-          sudo rm -f -- "$controller_installed" || cleanup_rc=1
-          [[ ! -e "$controller_installed" && ! -L "$controller_installed" ]] && controller_owned=false || cleanup_rc=1
-          rm -rf -- "$stage" || cleanup_rc=1
-          [[ ! -e "$stage" && ! -L "$stage" ]] && stage_owned=false || cleanup_rc=1
+          remove_verified_artifact "$probe_installed" "$probe_identity" "$probe_hash" || cleanup_rc=1
+          probe_owned=false
+          remove_verified_artifact "$controller_installed" "$controller_identity" "$controller_hash" || cleanup_rc=1
+          controller_owned=false
+          remove_verified_stage || cleanup_rc=1
+          stage_owned=false
           if (( cleanup_rc != 0 )); then exit 86; fi
           exit "$controller_rc"
