@@ -189,6 +189,16 @@ awk '
 [[ -s "$docker_managed_etc_runtime" ]] || { printf 'FAIL Docker-managed /etc runtime diagnostic was not extracted from workflow\n' >&2; exit 1; }
 # shellcheck source=/dev/null
 source "$docker_managed_etc_runtime"
+docker_managed_host_source_gate="$tmpdir/docker-managed-host-source-gate.sh"
+awk '
+  /DOCKER_MANAGED_HOST_SOURCE_GATE_BEGIN/ { in_program = 1; next }
+  /DOCKER_MANAGED_HOST_SOURCE_GATE_END/ { exit }
+  in_program { sub(/^          /, ""); print }
+' "$workflow" >"$docker_managed_host_source_gate"
+[[ -s "$docker_managed_host_source_gate" ]] || { printf 'FAIL Docker-managed host source gate was not extracted from workflow\n' >&2; exit 1; }
+bash -n "$docker_managed_host_source_gate"
+# shellcheck source=/dev/null
+source "$docker_managed_host_source_gate"
 
 # Extracted process snapshots must parse the actual /proc/PID/stat grammar,
 # including a comm field with spaces and closing parentheses.  Fixtures live
@@ -910,6 +920,147 @@ if rg -n '(^|[[:space:]])nsenter[[:space:]]+-|sudo[[:space:]]+.*nsenter' "$workf
   exit 1
 fi
 printf 'PASS docker_managed_etc_runtime_diagnostic_is_fail_closed\n'
+
+# Stage 1 host-side viability gate.  Every case below runs the functions
+# extracted from the workflow; only Docker metadata primitives are replaced by
+# local fixtures.  No Docker command or container is started.
+gate_container_id="$(printf 'a%.0s' {1..64})"
+gate_root="$tmpdir/docker-root"
+gate_container_dir="$gate_root/containers/$gate_container_id"
+mkdir -p "$gate_container_dir"
+printf 'fixture\n' >"$gate_container_dir/hosts"
+printf 'fixture\n' >"$gate_container_dir/hostname"
+printf 'fixture\n' >"$gate_container_dir/resolv.conf"
+
+reset_host_source_gate() {
+  # shellcheck source=/dev/null
+  source "$docker_managed_host_source_gate"
+  container_id="$gate_container_id"
+  host_gate_docker_root_metadata() { printf '%s\n' "$gate_root"; }
+  host_gate_source_metadata() {
+    case "$1" in
+      etc_hosts) printf '%s\n' "$gate_container_dir/hosts" ;;
+      etc_hostname) printf '%s\n' "$gate_container_dir/hostname" ;;
+      etc_resolv_conf) printf '%s\n' "$gate_container_dir/resolv.conf" ;;
+      *) return 2 ;;
+    esac
+  }
+}
+run_gate_case() {
+  local expected_rc="$1" label="$2" output rc
+  set +e; output="$(run_docker_managed_host_source_gate)"; rc=$?; set -e
+  assert_rc "$expected_rc" "$rc" "$label"
+  printf '%s' "$output"
+}
+
+reset_host_source_gate
+gate_output="$(run_gate_case 0 host_source_gate_three_accessible)"
+[[ "$(printf '%s\n' "$gate_output" | grep -c '^docker_managed_host_source_gate id=')" == 3 ]] || { printf 'FAIL host source gate did not emit three records\n' >&2; exit 1; }
+[[ "$(printf '%s\n' "$gate_output" | grep -c 'accessible=true provenance_verified=true stable=true inspection_error=none$')" == 3 ]] || { printf 'FAIL host source gate positive evidence incomplete\n' >&2; exit 1; }
+[[ "$gate_output" != *"$tmpdir"* && "$gate_output" != *"$gate_container_id"* && "$gate_output" != *'987654'* ]] || { printf 'FAIL host source gate leaked private fixture metadata\n' >&2; exit 1; }
+
+reset_host_source_gate
+host_gate_stat_record() {
+  [[ "${1##*/}" != hostname ]] || return 13
+  LC_ALL=C host_gate_timeout stat -Lc '%F|%d|%i' -- "$1" 2>/dev/null
+}
+gate_output="$(run_gate_case 1 host_source_gate_single_eacces_is_no_go)"
+[[ "$gate_output" == *'id=etc_hostname accessible=false provenance_verified=false stable=false inspection_error=source_inaccessible'* ]] || { printf 'FAIL EACCES fixture was not fail-closed\n' >&2; exit 1; }
+
+reset_host_source_gate
+host_gate_source_metadata() {
+  case "$1" in
+    etc_hosts) return 0 ;;
+    etc_hostname) printf '%s\n' "$gate_container_dir/hostname" ;;
+    etc_resolv_conf) printf '%s\n' "$gate_container_dir/resolv.conf" ;;
+  esac
+}
+gate_output="$(run_gate_case 1 host_source_gate_missing_origin_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=false provenance_verified=false stable=false inspection_error=metadata_unavailable'* ]] || { printf 'FAIL missing runtime metadata was not fail-closed\n' >&2; exit 1; }
+
+reset_host_source_gate
+ln -s "$gate_container_dir/hosts" "$gate_container_dir/hosts-link"
+host_gate_source_metadata() {
+  case "$1" in
+    etc_hosts) printf '%s\n' "$gate_container_dir/hosts-link" ;;
+    etc_hostname) printf '%s\n' "$gate_container_dir/hostname" ;;
+    etc_resolv_conf) printf '%s\n' "$gate_container_dir/resolv.conf" ;;
+  esac
+}
+gate_output="$(run_gate_case 1 host_source_gate_symlink_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=false'* && "$gate_output" != *"$gate_container_dir"* ]] || { printf 'FAIL symlink fixture was accepted or leaked\n' >&2; exit 1; }
+
+reset_host_source_gate
+outside_root="$tmpdir/outside/$gate_container_id"
+mkdir -p "$outside_root"; printf 'fixture\n' >"$outside_root/hosts"
+host_gate_source_metadata() {
+  case "$1" in
+    etc_hosts) printf '%s\n' "$outside_root/hosts" ;;
+    etc_hostname) printf '%s\n' "$gate_container_dir/hostname" ;;
+    etc_resolv_conf) printf '%s\n' "$gate_container_dir/resolv.conf" ;;
+  esac
+}
+gate_output="$(run_gate_case 1 host_source_gate_outside_root_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=false provenance_verified=false stable=false inspection_error=provenance_invalid'* ]] || { printf 'FAIL outside-root source was accepted\n' >&2; exit 1; }
+
+reset_host_source_gate
+wrong_container_id="$(printf 'b%.0s' {1..64})"
+wrong_container_dir="$gate_root/containers/$wrong_container_id"
+mkdir -p "$wrong_container_dir"; printf 'fixture\n' >"$wrong_container_dir/hosts"
+host_gate_source_metadata() {
+  case "$1" in
+    etc_hosts) printf '%s\n' "$wrong_container_dir/hosts" ;;
+    etc_hostname) printf '%s\n' "$gate_container_dir/hostname" ;;
+    etc_resolv_conf) printf '%s\n' "$gate_container_dir/resolv.conf" ;;
+  esac
+}
+gate_output="$(run_gate_case 1 host_source_gate_wrong_container_component_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=false provenance_verified=false stable=false inspection_error=container_identity_invalid'* ]] || { printf 'FAIL wrong container-ID component was accepted\n' >&2; exit 1; }
+
+reset_host_source_gate
+printf 'fixture\n' >"$gate_container_dir/unexpected"
+host_gate_source_metadata() {
+  case "$1" in
+    etc_hosts) printf '%s\n' "$gate_container_dir/unexpected" ;;
+    etc_hostname) printf '%s\n' "$gate_container_dir/hostname" ;;
+    etc_resolv_conf) printf '%s\n' "$gate_container_dir/resolv.conf" ;;
+  esac
+}
+gate_output="$(run_gate_case 1 host_source_gate_unexpected_basename_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=false provenance_verified=false stable=false inspection_error=provenance_invalid'* ]] || { printf 'FAIL unexpected basename was accepted\n' >&2; exit 1; }
+
+reset_host_source_gate
+host_gate_stat_record() {
+  if [[ "${1##*/}" == hosts ]]; then
+    [[ "$HOST_GATE_SAMPLE" == 1 ]] && printf '%s\n' 'regular file|11|101' || printf '%s\n' 'regular file|11|102'
+  else
+    LC_ALL=C host_gate_timeout stat -Lc '%F|%d|%i' -- "$1" 2>/dev/null
+  fi
+}
+gate_output="$(run_gate_case 1 host_source_gate_identity_change_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=true provenance_verified=true stable=false inspection_error=sample_changed'* ]] || { printf 'FAIL changed device/inode sample was accepted\n' >&2; exit 1; }
+
+reset_host_source_gate
+host_gate_stat_record() {
+  [[ "${1##*/}" != hosts ]] || return 124
+  LC_ALL=C host_gate_timeout stat -Lc '%F|%d|%i' -- "$1" 2>/dev/null
+}
+gate_output="$(run_gate_case 1 host_source_gate_timeout_is_no_go)"
+[[ "$gate_output" == *'id=etc_hosts accessible=false provenance_verified=false stable=false inspection_error=timeout'* ]] || { printf 'FAIL timeout was not fail-closed\n' >&2; exit 1; }
+
+[[ "$gate_output" != *"$tmpdir"* && "$gate_output" != *"$gate_container_id"* && "$gate_output" != *'regular file|'* ]] || { printf 'FAIL negative host source diagnostic leaked private metadata\n' >&2; exit 1; }
+if rg -n '(/proc/\$pid/root|nsenter|sudo|docker exec)' "$docker_managed_host_source_gate"; then
+  printf 'FAIL stage 1 host source gate contains a prohibited observation mechanism\n' >&2
+  exit 1
+fi
+reset_host_source_gate
+set +e; run_docker_managed_host_source_gate >/dev/null; gate_rc=$?; set -e
+assert_rc 0 "$gate_rc" host_source_gate_positive_remains_diagnostic
+hard_prestart_failures=(); diagnostic_findings=()
+diagnostic_no_go 'docker-managed host source viability gate is diagnostic-only'
+set +e; final_verdict_is_go; rc=$?; set -e
+assert_rc 1 "$rc" host_source_gate_pass_preserves_final_no_go
+printf 'PASS docker_managed_host_source_gate_is_fail_closed_and_sanitized\n'
 
 runtime_mask_valid=$'36 25 0:32 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n37 25 0:33 / /proc/scsi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n38 25 0:34 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n39 25 0:35 /null /proc/interrupts rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n40 25 0:35 /null /proc/kcore rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n41 25 0:35 /null /proc/keys rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n42 25 0:35 /null /proc/latency_stats rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n43 25 0:35 /null /proc/timer_list rw,nosuid,nodev,noexec - tmpfs tmpfs rw'
 printf '%s\n' "$runtime_mask_valid" >"$tmpdir/runtime-mask-valid"
