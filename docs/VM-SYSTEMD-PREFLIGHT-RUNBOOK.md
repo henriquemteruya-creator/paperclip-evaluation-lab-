@@ -17,6 +17,22 @@ The closed Docker preflight in PR #1 is not used or modified. This workflow
 implements the control-only step required by ADR-002 and its independent
 review.
 
+## Publication-time workflow validation
+
+The first publication divided neither embedded script from the surrounding
+workflow step. GitHub created three automatic `push` validation records for the
+three initial commits and rejected the workflow before scheduling any job with
+`Exceeded max expression length 21000`. The records have no jobs and no runner
+duration; the benign service, systemd and every workflow command remained
+unexecuted.
+
+Commit `c8a3012df2dd9e31ead4da7955157a1ca4dcaf48` split staging and execution into
+three `run` blocks below the platform limit. Publishing that correction did not
+create another run, consistent with the valid manual-only trigger. The offline
+suite now calculates every real block length and rejects a regression at or
+above 21,000 characters. The three failed validation records remain evidence
+and must not be represented as preflight executions.
+
 ## Files and execution model
 
 The workflow is intentionally self-contained because it does not checkout the
