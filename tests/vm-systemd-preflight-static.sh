@@ -40,6 +40,144 @@ bash -n "$tmp/controller.sh"
 bash -n "$tmp/probe.sh"
 test_pass embedded_scripts_parse
 
+# Exercise the two workflow staging blocks as the owning, non-root user when a
+# normal test user is available.  This deliberately uses the extracted
+# controller fragments rather than a duplicate fixture: the append is
+# meaningful only if the exact heredoc boundary remains executable after the
+# mode transition.
+grep -Fq 'chmod 0600 "$controller_stage"' "$workflow" || test_fail staging_append_window_missing
+grep -Fq 'bash -n "$controller_stage"' "$workflow" || test_fail staging_final_parse_missing
+grep -Fq 'chmod 0500 "$controller_stage"' "$workflow" || test_fail staging_final_close_missing
+chmod 0444 "$tmp/controller-a.sh" "$tmp/controller-b.sh"
+chmod 0755 "$tmp"
+cat >"$tmp/staging-integration.sh" <<'STAGING_INTEGRATION'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+parent="$1"
+part_a="$2"
+part_b="$3"
+owner="$(id -u):$(id -g)"
+expected_marker='run:attempt:sha'
+
+assert_mode() {
+  local path="$1" mode="$2"
+  [[ "$(stat -Lc '%u:%g:%a' "$path")" == "$owner:$mode" ]]
+}
+
+cleanup_owned_stage() {
+  local stage="$1"
+  [[ "$stage" == "$parent"/stage-* && -d "$stage" && ! -L "$stage" ]] || return 1
+  rm -rf -- "$stage"
+  [[ ! -e "$stage" && ! -L "$stage" ]]
+}
+
+validate_stage() {
+  local stage="$1" controller marker
+  controller="$stage/controller.sh"
+  marker="$stage/.owner"
+  [[ -d "$stage" && ! -L "$stage" && -f "$controller" && ! -L "$controller" && -f "$marker" && ! -L "$marker" ]] || return 1
+  assert_mode "$stage" 700 && assert_mode "$controller" 400 && assert_mode "$marker" 400 || return 1
+  [[ "$(<"$marker")" == "$expected_marker" ]]
+}
+
+make_valid_stage() {
+  local stage="$1" controller marker
+  controller="$stage/controller.sh"
+  marker="$stage/.owner"
+  [[ ! -e "$stage" && ! -L "$stage" ]] || return 1
+  mkdir -m 0700 -- "$stage"
+  cat "$part_a" >"$controller"
+  printf '%s\n' "$expected_marker" >"$marker"
+  chmod 0400 "$controller" "$marker"
+}
+
+# Successful two-step transaction: closed -> validated -> append window ->
+# parsed -> closed.  A post-close append must be denied to this non-root owner.
+success="$parent/stage-success"
+make_valid_stage "$success"
+validate_stage "$success"
+chmod 0600 "$success/controller.sh"
+assert_mode "$success/controller.sh" 600
+cat "$part_b" >>"$success/controller.sh"
+bash -n "$success/controller.sh"
+chmod 0500 "$success/controller.sh"
+assert_mode "$success/controller.sh" 500
+if ( printf '\n' >>"$success/controller.sh" ) >/dev/null 2>&1; then exit 10; fi
+cleanup_owned_stage "$success"
+
+# An incorrect initial mode is rejected before the controlled append, then an
+# execution-owned stage is removed safely.
+wrong_mode="$parent/stage-wrong-mode"
+make_valid_stage "$wrong_mode"
+chmod 0600 "$wrong_mode/controller.sh"
+if validate_stage "$wrong_mode"; then exit 11; fi
+cleanup_owned_stage "$wrong_mode"
+
+# A preexisting controller is a collision: it is neither overwritten nor
+# removed by this execution because ownership was never established.
+collision="$parent/stage-preexisting"
+mkdir -m 0700 -- "$collision"
+printf '%s\n' preexisting >"$collision/controller.sh"
+chmod 0600 "$collision/controller.sh"
+if make_valid_stage "$collision"; then exit 12; fi
+[[ -f "$collision/controller.sh" && "$(<"$collision/controller.sh")" == preexisting ]] || exit 13
+
+# A symlink is rejected; the target outside the stage survives cleanup.
+target="$parent/symlink-target"
+printf '%s\n' target >"$target"
+chmod 0600 "$target"
+symlink_stage="$parent/stage-symlink"
+mkdir -m 0700 -- "$symlink_stage"
+ln -s "$target" "$symlink_stage/controller.sh"
+printf '%s\n' "$expected_marker" >"$symlink_stage/.owner"
+chmod 0400 "$symlink_stage/.owner"
+if validate_stage "$symlink_stage"; then exit 14; fi
+cleanup_owned_stage "$symlink_stage"
+[[ -f "$target" && "$(<"$target")" == target ]] || exit 15
+
+# A marker mismatch is rejected before the append and its owned stage is
+# removed.  No content is emitted by this test.
+bad_marker="$parent/stage-bad-marker"
+make_valid_stage "$bad_marker"
+chmod 0600 "$bad_marker/.owner"
+printf '%s\n' wrong >"$bad_marker/.owner"
+chmod 0400 "$bad_marker/.owner"
+if validate_stage "$bad_marker"; then exit 16; fi
+cleanup_owned_stage "$bad_marker"
+
+# Simulate a failing append after the short writable window.  The stage was
+# created by this execution and therefore must be cleaned; no collision is
+# allowed to escape the transaction.
+append_failure="$parent/stage-append-failure"
+make_valid_stage "$append_failure"
+validate_stage "$append_failure"
+chmod 0600 "$append_failure/controller.sh"
+rm -- "$append_failure/controller.sh"
+mkdir -- "$append_failure/controller.sh"
+if ( cat "$part_b" >>"$append_failure/controller.sh" ) >/dev/null 2>&1; then exit 17; fi
+cleanup_owned_stage "$append_failure"
+
+printf '%s\n' stage_integration_restricted_identity_pass
+STAGING_INTEGRATION
+chmod 0755 "$tmp/staging-integration.sh"
+staging_parent="$tmp/staging-parent"
+mkdir -m 1777 "$staging_parent"
+if (( EUID == 0 )); then
+  # Some constrained development sandboxes run as uid 0 with every effective
+  # capability removed and no ability to change uid.  That identity still
+  # cannot bypass owner write bits, so it safely exercises the DAC transition;
+  # a normal GitHub-hosted runner takes the non-root branch below.
+  cap_eff="$(awk '/^CapEff:/ {print $2}' /proc/self/status 2>/dev/null || true)"
+  [[ "$cap_eff" =~ ^0+$ ]] || test_fail staging_privileged_root_environment
+  staging_output="$("$tmp/staging-integration.sh" "$staging_parent" "$tmp/controller-a.sh" "$tmp/controller-b.sh")" || test_fail staging_restricted_identity_integration
+else
+  staging_output="$("$tmp/staging-integration.sh" "$staging_parent" "$tmp/controller-a.sh" "$tmp/controller-b.sh")" || test_fail staging_nonroot_integration
+fi
+[[ "$staging_output" == stage_integration_restricted_identity_pass ]] || test_fail staging_restricted_identity_output
+test_pass controller_staging_restricted_identity_integration
+
 python3 - "$workflow" <<'PY'
 import pathlib, sys, yaml
 document = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
