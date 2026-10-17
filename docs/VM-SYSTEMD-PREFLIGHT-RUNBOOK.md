@@ -51,6 +51,20 @@ after successful creation; cleanup stops or removes only flagged resources and
 requires the transient unit's run-specific description tag to match. Partial
 creation failures remain NO-GO while cleanup still attempts every owned item.
 
+The controller source is intentionally assembled across two bounded workflow
+blocks. The first writes the reviewed first fragment and closes both it and its
+run marker at `0400`. The second validates the directory, regular-file type,
+absence of symlinks, owner/mode and exact marker before opening a short,
+owner-only `0600` append window. It appends only the second reviewed heredoc,
+runs `bash -n`, and closes the final controller at `0500` before installation.
+Any failure after ownership is established removes only this execution's stage;
+a collision remains untouched. The offline suite exercises that exact two-step
+transition as the ordinary non-root test identity; a constrained development
+environment that cannot switch UID may use only a UID 0 identity with an empty
+effective capability set, which remains subject to the owner write-bit check.
+It covers bad modes, collisions, symlinks, marker mismatch, append failure and
+cleanup.
+
 The controller creates a dedicated system UID/GID, private root-owned output
 directory under `/run`, one explicitly writable work directory under
 `/var/lib`, and a synthetic world-readable sentinel under `/home/runner/work`.
