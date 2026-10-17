@@ -1,73 +1,111 @@
-# `/etc` Docker-managed mounts: pending correlation design
+# Docker-managed `/etc` mounts: host-side viability investigation closed
 
-The three special destinations remain rejected by the runtime allowlist:
+This document records the formal stop decision for the current host-side
+observation design. It is an evidence record, not an authorization to change
+the workflow, its allowlists, or to execute Paperclip.
+
+## Final status
+
+- `host_source_viability=unproven`
+- `host_sources_proven_inaccessible=false`
+- `limitation_class=timeout_ambiguous_stage`
+- `private_protocol_status=blocked`
+- `evidence_complete=false`
+- `paperclip_tests=P01,P02,P04:NO-GO`
+- `rerun_14=not_authorized`
+
+The three destinations remain rejected by the runtime allowlist:
 
 - `/etc/hosts`
 - `/etc/hostname`
 - `/etc/resolv.conf`
 
-Runs through #8 established that `docker inspect .Mounts` may not expose
-matching entries for these Docker-managed files.  This does not establish that
-the files are absent at runtime, nor does it establish their effective origin.
+No private container-to-runner evidence protocol was implemented. The current
+line of investigation is closed under the present GitHub-hosted runner design
+and time limits.
 
-## What is not sufficient
+## Positive evidence retained
 
-The following are evidence inputs only and cannot authorize these mounts on
-their own:
+Run #8 (`38834411994`, commit
+`bf14ee642697715ae37f6919c4dc31c9114cca3e`) established the eight narrowly
+scoped masked mounts without creating a generic exception:
 
-- a matching string between `.Mounts[].Source` and `HostsPath`,
-  `HostnamePath`, or `ResolvConfPath`;
-- `ReadonlyRootfs=true`;
-- a destination name, filesystem category, or an empty pre-start `.Mounts`
-  collection.
+- masked directories `proc_acpi`, `proc_scsi`, and `sys_firmware`: cardinality
+  one, `tmpfs/tmpfs`, root `/`, per-mount read-only, no unexpected propagation
+  or submounts, non-symlink directory objects, and empty contents;
+- masked pseudo-files `proc_interrupts`, `proc_kcore`, `proc_keys`,
+  `proc_latency_stats`, and `proc_timer_list`: cardinality one, `tmpfs/tmpfs`,
+  root `/null`, the observed per-mount mode required by the closed rule, no
+  unexpected propagation, non-symlink character-device objects, and `/dev/null`
+  identity `1:3`.
 
-## Minimum additional diagnostic for separate review
+The same run also produced positive evidence for the existing isolation
+controls: UID/GID 10001, all five capability sets zero, `NoNewPrivs`, read-only
+root filesystem, bounded tmpfs, CPU/memory/PID cgroups, loopback-only network,
+no default IPv4 or IPv6 route, successful socket scan in its defined scope,
+and negative DNS, TCP, TLS, and HTTPS egress probes. Later diagnostic runs
+continued to preserve these controls. These results support only the tested
+preflight predicates; they do not prove a complete sandbox.
 
-A future diagnostic, if approved separately, must collect while the container
-is running and emit only known IDs and booleans.  For each of the three
-destinations it must independently establish:
+## Run #13 result
 
-1. exactly one effective runtime mount at the known destination;
-2. the runtime mount's read/write mode and object type;
-3. whether the trusted runner can correlate the runtime mount to Docker's
-   container-specific metadata without logging the source path; and
-4. whether the correlation is complete, rather than merely string-equal.
+Run #13 (`39050285747`) executed commit
+`92fb8aa0838b5205334a0f462c8b0e91df21646d`. After `RUNTIME_READY`, all three
+Docker-managed metadata fields reported `inspect_ok=true`,
+`metadata_present=true`, and `phase_consistent=true`.
 
-That design crosses the runner/container observation boundary and needs its
-own review before implementation.  Until it has reproducible evidence, the
-preflight records an inconclusive diagnostic and returns NO-GO.  This document
-does not authorize changing the `/etc` allowlist or executing run #7.
+The host-side gate then reported exactly one sanitized result per known ID,
+each with:
 
-## Current #9 evidence policy: `.Mounts=unavailable`
+```text
+accessible=false provenance_verified=false stable=false inspection_error=timeout
+```
 
-The runtime collector records an empty post-start `.Mounts` response as the
-sanitized state `unavailable`; it does not treat it as a Docker inspection
-error.  The independent kernel evidence (stable PID and mount namespace,
-effective `mountinfo`, object type, source/destination device+inode identity,
-and Docker-root provenance) is still collected so that a future review can
-inspect which layer was conclusive.
+The workflow correctly remained fail-closed and ended with exit 86/NO-GO.
+Paperclip was not downloaded, installed, or executed.
 
-The Docker-managed path metadata is separately sampled in `created` and again
-after `RUNTIME_READY` in `running`.  A false `metadata_present_prestart` does
-not block the runtime collector: a value may legitimately be materialized only
-after start.  The public log contains only the known ID plus boolean
-`inspect_ok`, `metadata_present`, and (at runtime) `phase_consistent`; it never
-prints a metadata path.  A runtime absence, inspection error, or a conflict
-between two present phase values is still diagnostic NO-GO.
+The gate did not identify which bounded operation expired. The elapsed time is
+compatible with a shared operation such as a `DockerRootDir` observation
+timing out in both samples, which would propagate `timeout` to all three IDs
+before individual source inspection. It is also compatible with other bounded
+operations. The public evidence cannot distinguish those cases.
 
-For the current diagnostic, however, `unavailable` is **not** sufficient for
-`evidence_complete`: the collector requires the structured post-start report
-to be `consistent` as corroboration.  This is deliberately conservative for
-two reasons:
+Therefore, the three timeout records are not three independent proofs of
+source-file inaccessibility. They do not establish EACCES, permission denial,
+physical absence, or universal infeasibility. The correct conclusion is
+**viability not proved by this design**, not **sources proved inaccessible**.
 
-1. the host-side kernel observation and Docker metadata are related through a
-   rootful daemon controlled by the runner, so neither is an independent
-   attestation of the other; and
-2. no approved runtime-specific proof yet explains why Docker omits these
-   three managed files from `.Mounts` on this runner/version.
+## Independent blockers
 
-Therefore an unavailable `.Mounts` report produces a per-ID diagnostic NO-GO
-while retaining sanitized kernel observations.  This policy is not an
-authorization to relax the runtime allowlist, and the final workflow verdict
-remains NO-GO even if every auxiliary diagnostic is complete.  Changing this
-requirement would require new runtime evidence and an independent review.
+The host-side timeout does not resolve or replace these independent limits:
+
+1. `.Mounts=unavailable` remains insufficient for `evidence_complete`. A
+   future device/inode correlation would not automatically change that policy.
+2. The trusted runner controls a rootful Docker daemon and shares the host
+   kernel boundary. Related host and daemon observations are not independent
+   attestation.
+3. A user namespace distinct from the host user namespace has not been
+   demonstrated.
+4. No approved private channel exists to compare container-side and host-side
+   evidence. Its design remains blocked rather than merely pending execution.
+
+## Reopening conditions
+
+No run #14, timeout increase, privilege increase, allowlist relaxation, private
+protocol, or Paperclip test may follow from this result. Reconsideration first
+requires a new, explicit architecture decision that:
+
+1. states whether the GitHub-hosted/rootful-Docker boundary remains acceptable
+   or replaces it with a different isolated environment;
+2. identifies the exact observation stages and sets justified timing and
+   timeout criteria before execution;
+3. defines a privacy-preserving, strictly parsed trust boundary for any private
+   container-to-runner evidence channel;
+4. independently resolves the `.Mounts=unavailable` evidence policy;
+5. addresses the unproven user-namespace boundary and shared-kernel risk;
+6. receives independent review and explicit authorization for one bounded
+   validation run.
+
+Only after those conditions are satisfied and the laboratory preflight has a
+separately reviewed GO could P01, P02, or P04 be reconsidered. This closure is
+not a GO for Paperclip, merge, deploy, or infrastructure changes.
