@@ -305,6 +305,39 @@ jobs:
           }
           # PROBE_LOG_PARSER_END
 
+          CONTROLLER_A
+          owner_marker="$stage/.owner"
+          printf '%s\n' "${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}" >"$owner_marker"
+          chmod 0400 "$controller_stage" "$owner_marker"
+          trap - EXIT
+
+      - name: Append trusted controller lifecycle source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
+          controller_stage="$stage/controller.sh"
+          owner_marker="$stage/.owner"
+          expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"
+          stage_owned=false
+          cleanup_lifecycle_on_error() {
+            local rc=$?
+            if (( rc != 0 )) && [[ "$stage_owned" == true ]]; then
+              if ! rm -rf -- "$stage" >/dev/null 2>&1 || [[ -e "$stage" || -L "$stage" ]]; then trap - EXIT; exit 86; fi
+            fi
+            return "$rc"
+          }
+          trap cleanup_lifecycle_on_error EXIT
+          [[ -d "$stage" && ! -L "$stage" && -f "$controller_stage" && ! -L "$controller_stage" && -f "$owner_marker" && ! -L "$owner_marker" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$stage")" == "$(id -u):$(id -g):700" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):400" ]] || exit 86
+          [[ "$(<"$owner_marker")" == "$expected_owner" ]] || exit 86
+          stage_owned=true
+          chmod 0600 "$controller_stage"
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):600" ]] || exit 86
+          cat >>"$controller_stage" <<'CONTROLLER_LIFECYCLE'
           # PROBE_DIAGNOSTICS_BEGIN
           probe_failure_ids() {
             local file="$1" phase="$2" line id status code parser_rc=0 count=0 output=''
@@ -331,6 +364,44 @@ jobs:
             done <"$file"
             (( count > 0 && count <= EXPECTED_RECORDS && ${#output} <= 512 )) || return 2
             [[ "$output" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] || return 2
+            printf '%s' "$output"
+          }
+
+          # Produces only a small, closed vocabulary of supplementary
+          # diagnostic pairs.  The private log is first validated in full;
+          # construction is held in memory so an invalid trailing record can
+          # never cause a partial public diagnostic to be emitted.
+          probe_failure_categories() {
+            local file="$1" phase="$2" line id status code parser_rc=0 count=0 output=''
+            local -A seen=()
+            [[ "$phase" == ready || "$phase" == final ]] || return 2
+            parse_probe_log "$file" "$phase" || parser_rc=$?
+            case "$parser_rc" in
+              0) return 1 ;;
+              1) ;;
+              *) return 2 ;;
+            esac
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^RESULT\ id=([a-z0-9_]+)\ status=(PASS|FAIL)\ code=([a-z0-9_]+)$ ]]; then
+                id="${BASH_REMATCH[1]}"; status="${BASH_REMATCH[2]}"; code="${BASH_REMATCH[3]}"
+                [[ -z "${seen[$id]+x}" ]] || return 2
+                seen["$id"]=1
+                [[ "$status" == FAIL ]] || continue
+                case "$id:$code" in
+                  run_mount_diagnostic:known_submount_restrictive|run_mount_diagnostic:known_submount_incompatible|run_mount_diagnostic:unexpected_submount|run_mount_diagnostic:inspection_error|routes:tool_unavailable|routes:ipv4_query_error|routes:ipv6_query_error|routes:present|tcp_blocked:not_attempted_prerequisite|tcp_blocked:connected|tcp_blocked:inconclusive|https_blocked:not_attempted_prerequisite|https_blocked:connected|https_blocked:inconclusive) ;;
+                  run_mount_diagnostic:*|routes:*|tcp_blocked:*|https_blocked:*) return 2 ;;
+                  *) continue ;;
+                esac
+                (( ++count <= 4 )) || return 2
+                output+="${output:+,}$id=$code"
+              elif [[ "$line" =~ ^(READY|FINAL)\ status=(PASS|FAIL)\ records=([0-9]+)$ ]]; then
+                :
+              else
+                return 2
+              fi
+            done <"$file"
+            (( count > 0 && ${#output} <= 512 )) || return 1
+            [[ "$output" =~ ^[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*$ ]] || return 2
             printf '%s' "$output"
           }
           # PROBE_DIAGNOSTICS_END
@@ -433,6 +504,7 @@ jobs:
           # TIMEOUT_CGROUP_OBSERVER_BEGIN
           timeout_cgroup_path=''
           timeout_cgroup_identity=''
+          timeout_cgroup_pid=''
           cgroup_events_populated() {
             local file="$1" result
             [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
@@ -478,6 +550,7 @@ jobs:
                 [[ "$populated_rc" == 1 ]] || return 2
                 timeout_cgroup_path="$path"
                 timeout_cgroup_identity="$identity"
+                timeout_cgroup_pid="$pid"
                 return 0
               fi
               [[ "$state" == inactive || "$state" == failed ]] && return 2
@@ -501,12 +574,54 @@ jobs:
             cgroup_procs_is_empty "$path/cgroup.procs" || procs_rc=$?
             [[ "$procs_rc" == 0 ]] || { [[ "$procs_rc" == 1 ]] && return 1; return 2; }
           }
+
+          verify_timeout_cgroup_identity() {
+            local cgroup path identity
+            [[ -n "$timeout_cgroup_path" && -n "$timeout_cgroup_identity" && "$timeout_cgroup_pid" =~ ^[1-9][0-9]*$ ]] || return 2
+            cgroup="$(show_value "$TIMEOUT_UNIT" ControlGroup)" || return 2
+            [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
+            path="/sys/fs/cgroup$cgroup"
+            [[ "$path" == "$timeout_cgroup_path" ]] || return 2
+            identity="$(cgroup_directory_identity "$path")" || return 2
+            [[ "$identity" == "$timeout_cgroup_identity" ]] || return 2
+          }
+
+          # Poll from the trusted controller, outside the canary cgroup.  A
+          # positive result is possible only when terminal unit state and an
+          # empty, stable cgroup are observed in the same polling iteration.
+          # Automatic cgroup removal therefore remains an inconclusive NO-GO.
+          observe_timeout_cgroup_transition() {
+            local attempts=0 state description result pid identity_rc=0 quiescent_rc=0
+            [[ -n "$owner_tag" ]] || return 2
+            while (( attempts < 150 )); do
+              description="$(show_value "$TIMEOUT_UNIT" Description)" || return 2
+              [[ "$description" == "$owner_tag" ]] || return 2
+              state="$(show_value "$TIMEOUT_UNIT" ActiveState)" || return 2
+              case "$state" in
+                activating|active|deactivating|reloading)
+                  verify_timeout_cgroup_identity || return 2
+                  pid="$(show_value "$TIMEOUT_UNIT" MainPID)" || return 2
+                  [[ "$pid" == "$timeout_cgroup_pid" ]] || return 2
+                  cgroup_membership_matches "$pid" "${timeout_cgroup_path#/sys/fs/cgroup}" || return 2
+                  ;;
+                inactive|failed)
+                  result="$(show_value "$TIMEOUT_UNIT" Result)" || return 2
+                  pid="$(show_value "$TIMEOUT_UNIT" MainPID)" || return 2
+                  [[ "$result" == timeout && "$pid" == 0 ]] || return 2
+                  verify_timeout_cgroup_quiescent || quiescent_rc=$?
+                  case "$quiescent_rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+                  ;;
+                *) return 2 ;;
+              esac
+              sleep 0.1
+              (( ++attempts ))
+            done
+            return 2
+          }
           # TIMEOUT_CGROUP_OBSERVER_END
           # RUNTIME_LIFECYCLE_VERIFIERS_END
 
-          CONTROLLER_A
-          owner_marker="$stage/.owner"
-          printf '%s\n' "${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}" >"$owner_marker"
+          CONTROLLER_LIFECYCLE
           chmod 0400 "$controller_stage" "$owner_marker"
           trap - EXIT
 
@@ -605,6 +720,37 @@ jobs:
             } >>"$summary_path"
           }
 
+          CONTROLLER_B
+          chmod 0400 "$controller_stage"
+          trap - EXIT
+
+      - name: Finalize trusted controller source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
+          controller_stage="$stage/controller.sh"
+          owner_marker="$stage/.owner"
+          expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"
+          stage_owned=false
+          cleanup_controller_final_on_error() {
+            local rc=$?
+            if (( rc != 0 )) && [[ "$stage_owned" == true ]]; then
+              if ! rm -rf -- "$stage" >/dev/null 2>&1 || [[ -e "$stage" || -L "$stage" ]]; then trap - EXIT; exit 86; fi
+            fi
+            return "$rc"
+          }
+          trap cleanup_controller_final_on_error EXIT
+          [[ -d "$stage" && ! -L "$stage" && -f "$controller_stage" && ! -L "$controller_stage" && -f "$owner_marker" && ! -L "$owner_marker" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$stage")" == "$(id -u):$(id -g):700" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):400" ]] || exit 86
+          [[ "$(<"$owner_marker")" == "$expected_owner" ]] || exit 86
+          stage_owned=true
+          chmod 0600 "$controller_stage"
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):600" ]] || exit 86
+          cat >>"$controller_stage" <<'CONTROLLER_MAIN'
           main() {
             [[ "${EUID:-$(id -u)}" == 0 ]] || { printf '%s\n' 'NO-GO controller_not_root'; exit 86; }
 
@@ -691,7 +837,7 @@ jobs:
             fi
             main_owned=true
 
-            local probe_ready_rc=0 probe_gate_rc=0 probe_ready_passed=false probe_ids=''
+            local probe_ready_rc=0 probe_gate_rc=0 probe_ready_passed=false probe_ids='' probe_categories=''
             wait_for_probe_ready "$main_log" || probe_ready_rc=$?
             case "$probe_ready_rc" in
               0|1)
@@ -712,6 +858,18 @@ jobs:
                     else
                       fail 'probe_ready_failure_diagnostics_unavailable'
                     fi
+                    local category_rc=0
+                    probe_categories=''
+                    probe_failure_categories "$main_log" ready >"$PRIVATE_ROOT/probe-ready-categories" || category_rc=$?
+                    case "$category_rc" in
+                      0)
+                        probe_categories="$(<"$PRIVATE_ROOT/probe-ready-categories")"
+                        [[ "$probe_categories" =~ ^[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*$ && ${#probe_categories} -le 512 ]] || fail 'probe_ready_category_diagnostics_unavailable'
+                        [[ -z "$probe_categories" ]] || printf '%s\n' "INFO probe_ready_failure_categories=$probe_categories"
+                        ;;
+                      1) : ;;
+                      *) fail 'probe_ready_category_diagnostics_unavailable' ;;
+                    esac
                     ;;
                   *) fail 'probe_ready_parser_error' ;;
                 esac
@@ -813,6 +971,18 @@ jobs:
                   else
                     fail 'probe_final_failure_diagnostics_unavailable'
                   fi
+                  local category_rc=0
+                  probe_categories=''
+                  probe_failure_categories "$main_log" final >"$PRIVATE_ROOT/probe-final-categories" || category_rc=$?
+                  case "$category_rc" in
+                    0)
+                      probe_categories="$(<"$PRIVATE_ROOT/probe-final-categories")"
+                      [[ "$probe_categories" =~ ^[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*$ && ${#probe_categories} -le 512 ]] || fail 'probe_final_category_diagnostics_unavailable'
+                      [[ -z "$probe_categories" ]] || printf '%s\n' "INFO probe_final_failure_categories=$probe_categories"
+                      ;;
+                    1) : ;;
+                    *) fail 'probe_final_category_diagnostics_unavailable' ;;
+                  esac
                   ;;
                 *) fail 'probe_final_parser_error' ;;
               esac
@@ -821,7 +991,7 @@ jobs:
             fi
 
             build_service_args "$timeout_log" 3s
-            local timeout_start_rc=0 timeout_wait_rc=0 timeout_cgroup_capture_rc=0
+            local timeout_start_rc=0 timeout_wait_rc=0 timeout_cgroup_capture_rc=0 timeout_transition_rc=0
             systemd-run --system --quiet --unit="$TIMEOUT_UNIT" --description="$owner_tag" --service-type=exec "${SERVICE_ARGS[@]}" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/sleep 30 >"$PRIVATE_ROOT/controller-timeout-start.out" 2>&1 || timeout_start_rc=$?
             if (( timeout_start_rc != 0 )); then
               if [[ "$(show_value "$TIMEOUT_UNIT" Description 2>/dev/null || true)" == "$owner_tag" ]]; then timeout_owned=true; fi
@@ -834,20 +1004,20 @@ jobs:
               else
                 fail 'timeout_canary_cgroup_live_evidence_unavailable'
               fi
-              wait_for_unit_terminal "$TIMEOUT_UNIT" || timeout_wait_rc=$?
+              if (( timeout_cgroup_capture_rc == 0 )); then
+                observe_timeout_cgroup_transition || timeout_transition_rc=$?
+              else
+                wait_for_unit_terminal "$TIMEOUT_UNIT" || timeout_wait_rc=$?
+              fi
               case "$timeout_wait_rc" in
                 0) ;;
                 1) fail 'timeout_canary_did_not_stop' ;;
-                *) fail 'timeout_canary_state_query_error' ;;
+                2) fail 'timeout_canary_state_query_error' ;;
               esac
               show_exact "$TIMEOUT_UNIT" Result timeout 'timeout_canary_result'
               show_exact "$TIMEOUT_UNIT" MainPID 0 'timeout_canary_no_main_pid'
-              cgroup_rc=0
-              if (( timeout_cgroup_capture_rc == 0 )); then
-                verify_timeout_cgroup_quiescent || cgroup_rc=$?
-              else
-                cgroup_rc=2
-              fi
+              cgroup_rc="$timeout_transition_rc"
+              (( timeout_cgroup_capture_rc == 0 )) || cgroup_rc=2
               case "$cgroup_rc" in
                 0) pass 'timeout_canary_cgroup_empty' ;;
                 1) fail 'timeout_canary_cgroup_has_processes' ;;
@@ -886,7 +1056,7 @@ jobs:
           if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             main "$@"
           fi
-          CONTROLLER_B
+          CONTROLLER_MAIN
           # CONTROLLER_HEREDOC_END
 
           bash -n "$controller_stage"
@@ -1240,34 +1410,11 @@ jobs:
             local file="$1"
             [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
             awk '
-              function has(optlist, wanted, a, n, i, count) {
-                n=split(optlist,a,","); count=0
-                for (i=1;i<=n;i++) if (a[i]==wanted) count++
-                return count==1
-              }
-              function size_ok(optlist, a, n, i, value, count) {
-                n=split(optlist,a,","); count=0; value=""
-                for (i=1;i<=n;i++) if (a[i] ~ /^size=/) {count++; value=tolower(substr(a[i],6))}
-                return count==1 && (value=="1m" || value=="1024k" || value=="1048576")
-              }
-              BEGIN {matches=0; bad=0; submount=0}
-              {
-                sep=0
-                for (i=7;i<=NF;i++) if ($i=="-") {sep=i; break}
-                if (NF<10 || sep==0 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+:[0-9]+$/) {bad=1; next}
-                if ($5 ~ /^\/run\//) submount=1
-                if ($5!="/run") next
-                matches++
-                if ($4!="/" || sep!=7 || $(sep+1)!="tmpfs" || $(sep+2)!="tmpfs") bad=1
-                if (!has($6,"ro") || !has($6,"nosuid") || !has($6,"nodev") || !has($6,"noexec") || has($6,"rw")) bad=1
-                if (!size_ok($(sep+3))) bad=1
-                device=$3
-              }
-              END {
-                if (bad) exit 2
-                if (matches!=1 || submount) exit 1
-                print device
-              }
+              function has(o,w,a,n,i,c){n=split(o,a,",");c=0;for(i=1;i<=n;i++)if(a[i]==w)c++;return c==1}
+              function size_ok(o,a,n,i,v,c){n=split(o,a,",");c=0;v="";for(i=1;i<=n;i++)if(a[i]~/^size=/){c++;v=tolower(substr(a[i],6))};return c==1&&(v=="1m"||v=="1024k"||v=="1048576")}
+              BEGIN{matches=bad=submount=0}
+              {sep=0;for(i=7;i<=NF;i++)if($i=="-"){sep=i;break};if(NF<10||sep==0||$1!~/^[0-9]+$/||$2!~/^[0-9]+$/||$3!~/^[0-9]+:[0-9]+$/){bad=1;next};if($5~/^\/run\//)submount=1;if($5!="/run")next;matches++;if($4!="/"||sep!=7||$(sep+1)!="tmpfs"||$(sep+2)!="tmpfs")bad=1;if(!has($6,"ro")||!has($6,"nosuid")||!has($6,"nodev")||!has($6,"noexec")||has($6,"rw"))bad=1;if(!size_ok($(sep+3)))bad=1;device=$3}
+              END{if(bad)exit 2;if(matches!=1||submount)exit 1;print device}
             ' "$file"
           }
           # RUN_MOUNT_VALIDATOR_END
@@ -1369,9 +1516,7 @@ jobs:
             if ! command -v ip >/dev/null 2>&1; then
               bad routes tool_unavailable
             else
-              ip_available=true
-              routes4="$(ip -4 route show 2>/dev/null)" || route4_rc=$?
-              routes6="$(ip -6 route show 2>/dev/null)" || route6_rc=$?
+              ip_available=true; routes4="$(ip -4 route show 2>/dev/null)" || route4_rc=$?; routes6="$(ip -6 route show 2>/dev/null)" || route6_rc=$?
             fi
             if [[ "$ip_available" == true ]] && (( route4_rc != 0 )); then
               bad routes ipv4_query_error
@@ -1387,8 +1532,7 @@ jobs:
             if ! command -v getent >/dev/null 2>&1 || ! timeout 2 getent hosts localhost >/dev/null 2>&1; then
               bad dns_blocked tool_error
             else
-              timeout 3 getent ahosts example.com >/dev/null 2>&1 || dns_rc=$?
-              rc=0; classify_dns_result "$dns_rc" || rc=$?
+              timeout 3 getent ahosts example.com >/dev/null 2>&1 || dns_rc=$?; rc=0; classify_dns_result "$dns_rc" || rc=$?
               case "$rc" in 0) ok dns_blocked ;; 1) bad dns_blocked resolved ;; *) bad dns_blocked inconclusive ;; esac
             fi
 
@@ -1399,13 +1543,11 @@ jobs:
               return
             fi
 
-            : >"$WORK/tcp.error"
-            timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>"$WORK/tcp.error" || tcp_rc=$?
+            : >"$WORK/tcp.error"; timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' >/dev/null 2>"$WORK/tcp.error" || tcp_rc=$?
             rc=0; classify_tcp_result "$tcp_rc" "$WORK/tcp.error" || rc=$?
             case "$rc" in 0) ok tcp_blocked; tcp_was_blocked=true ;; 1) bad tcp_blocked connected ;; *) bad tcp_blocked inconclusive ;; esac
 
-            timeout 3 curl --noproxy '*' --resolve example.com:443:1.1.1.1 --fail --silent --show-error --max-time 2 https://example.com >/dev/null 2>"$WORK/https.error" || https_rc=$?
-            rc=0; classify_https_result "$https_rc" "$routes_blocked" "$tcp_was_blocked" || rc=$?
+            timeout 3 curl --noproxy '*' --resolve example.com:443:1.1.1.1 --fail --silent --show-error --max-time 2 https://example.com >/dev/null 2>"$WORK/https.error" || https_rc=$?; rc=0; classify_https_result "$https_rc" "$routes_blocked" "$tcp_was_blocked" || rc=$?
             case "$rc" in 0) ok https_blocked ;; 1) bad https_blocked connected ;; *) bad https_blocked inconclusive ;; esac
             rm -f -- "$WORK/tcp.error" "$WORK/https.error"
           }
@@ -1417,11 +1559,8 @@ jobs:
             rel="${line#0::}"
             [[ "$rel" == /* && "$rel" != *'..'* ]] || { bad cgroup_memory malformed; bad cgroup_pids malformed; bad cgroup_cpu malformed; return; }
             base="/sys/fs/cgroup$rel"
-            memory="$(<"$base/memory.max")" 2>/dev/null || memory=''
-            pids="$(<"$base/pids.max")" 2>/dev/null || pids=''
-            read -r quota period <"$base/cpu.max" 2>/dev/null || { quota=''; period=''; }
-            [[ "$memory" == 268435456 ]] && ok cgroup_memory || bad cgroup_memory mismatch
-            [[ "$pids" == 64 ]] && ok cgroup_pids || bad cgroup_pids mismatch
+            memory="$(<"$base/memory.max")" 2>/dev/null || memory=''; pids="$(<"$base/pids.max")" 2>/dev/null || pids=''; read -r quota period <"$base/cpu.max" 2>/dev/null || { quota=''; period=''; }
+            [[ "$memory" == 268435456 ]] && ok cgroup_memory || bad cgroup_memory mismatch; [[ "$pids" == 64 ]] && ok cgroup_pids || bad cgroup_pids mismatch
             if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( quota * 2 == period )); then ok cgroup_cpu; else bad cgroup_cpu mismatch; fi
           }
 

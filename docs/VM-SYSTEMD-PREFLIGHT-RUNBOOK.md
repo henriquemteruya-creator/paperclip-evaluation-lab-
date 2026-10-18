@@ -221,8 +221,12 @@ The controller rejects unknown/duplicate/missing IDs, failures, malformed
 records, control characters, workflow-command syntax, oversized output,
 missing final newline, symlinked logs, unexpected ownership/mode or absent
 markers. Results must precede READY; FINAL must follow READY and be the final
-record. It never echoes a rejected line. The GitHub step summary is generated
-from controller-owned literals and aggregate counts only.
+record. It never echoes a rejected line. For a fully valid failing log it may
+publish at most four `id=category` pairs, limited to the reviewed diagnostic
+IDs `run_mount_diagnostic`, `routes`, `tcp_blocked` and `https_blocked` and
+their closed category vocabulary. Unknown categories, duplicates, truncation
+or any parser error suppress those pairs entirely. The GitHub step summary is
+generated from controller-owned literals and aggregate counts only.
 
 ## Timeout and cleanup canary
 
@@ -232,10 +236,13 @@ with the same profile and `RuntimeMaxSec=3s`. Approval requires:
 - systemd reports `Result=timeout`;
 - `MainPID=0` after termination;
 - while active, the controller captures the cgroup's private path and
-  device/inode identity and observes `cgroup.events populated=1`; after the
-  timeout it requires the same still-accessible cgroup identity,
-  `populated=0`, and an empty `cgroup.procs` read. A vanished, unreadable or
-  changed cgroup is inconclusive NO-GO, never evidence of emptiness;
+  device/inode identity, the canary MainPID membership and
+  `cgroup.events populated=1`. It then polls from outside that cgroup. A pass
+  requires, in one post-terminal observation, the same `Description` owner
+  tag, stable path/device/inode, `Result=timeout`, `MainPID=0`,
+  `populated=0`, and a completed empty `cgroup.procs` read. A vanished,
+  unreadable or changed cgroup, PID, identity, description or incomplete read
+  is inconclusive NO-GO, never evidence of emptiness;
 - no process remains under the dedicated UID after both units are stopped;
 - controller cleanup removes only units, UID/GID, sentinel and directories
   proven to have been created by this execution; the trusted workflow step

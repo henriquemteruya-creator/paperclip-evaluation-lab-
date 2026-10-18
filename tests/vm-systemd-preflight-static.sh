@@ -33,8 +33,10 @@ extract_marker_block() {
 
 [[ -s "$workflow" ]] || test_fail workflow_missing
 extract_heredoc CONTROLLER_A "$tmp/controller-a.sh"
+extract_heredoc CONTROLLER_LIFECYCLE "$tmp/controller-lifecycle.sh"
 extract_heredoc CONTROLLER_B "$tmp/controller-b.sh"
-cat "$tmp/controller-a.sh" "$tmp/controller-b.sh" >"$tmp/controller.sh"
+extract_heredoc CONTROLLER_MAIN "$tmp/controller-main.sh"
+cat "$tmp/controller-a.sh" "$tmp/controller-lifecycle.sh" "$tmp/controller-b.sh" "$tmp/controller-main.sh" >"$tmp/controller.sh"
 extract_heredoc PROBE_A "$tmp/probe-a.sh"
 extract_heredoc PROBE_B "$tmp/probe-b.sh"
 cat "$tmp/probe-a.sh" "$tmp/probe-b.sh" >"$tmp/probe.sh"
@@ -469,7 +471,7 @@ for index, line in enumerate(lines):
         block.append(candidate[trim:])
     lengths.append(len("".join(block)))
 
-if len(lengths) != 5 or any(length >= 21000 for length in lengths):
+if len(lengths) != 7 or any(length >= 21000 for length in lengths):
     raise SystemExit(1)
 PY
 test_pass run_expression_limits
@@ -744,6 +746,28 @@ set +e; captured="$(probe_failure_ids "$tmp/diagnostic-many.log" ready)"; rc=$?;
 captured="$(probe_failure_ids "$tmp/diagnostic-failure.log" ready 2>&1 || true)"
 [[ "$captured" != *untrusted_secret_path* && "$captured" != *private_path* && "$captured" == identity ]] || test_fail probe_diagnostic_leak
 test_pass probe_diagnostics_allowlisted_and_sanitized
+
+# The supplementary public categories use a separate closed vocabulary. They
+# are emitted only after the complete private log has passed the same parser.
+cp "$valid_ready" "$tmp/category-valid.log"
+sed -i '17cRESULT id=run_mount_diagnostic status=FAIL code=known_submount_restrictive' "$tmp/category-valid.log"
+sed -i '19cRESULT id=routes status=FAIL code=ipv4_query_error' "$tmp/category-valid.log"
+sed -i '21cRESULT id=tcp_blocked status=FAIL code=not_attempted_prerequisite' "$tmp/category-valid.log"
+sed -i '22cRESULT id=https_blocked status=FAIL code=inconclusive' "$tmp/category-valid.log"
+captured="$(probe_failure_categories "$tmp/category-valid.log" ready)" || test_fail probe_categories_valid_rejected
+[[ "$captured" == 'run_mount_diagnostic=known_submount_restrictive,routes=ipv4_query_error,tcp_blocked=not_attempted_prerequisite,https_blocked=inconclusive' ]] || test_fail probe_categories_wrong_pairs
+cp "$tmp/category-valid.log" "$tmp/category-invalid-code.log"
+sed -i '19cRESULT id=routes status=FAIL code=private_route_10_0_0_1' "$tmp/category-invalid-code.log"
+set +e; captured="$(probe_failure_categories "$tmp/category-invalid-code.log" ready)"; rc=$?; set -e
+[[ "$rc" == 2 && -z "$captured" ]] || test_fail probe_categories_unknown_code_output
+cp "$tmp/category-valid.log" "$tmp/category-truncated.log"
+truncate -s -1 "$tmp/category-truncated.log"
+set +e; captured="$(probe_failure_categories "$tmp/category-truncated.log" ready)"; rc=$?; set -e
+[[ "$rc" == 2 && -z "$captured" ]] || test_fail probe_categories_truncated_output
+set +e; captured="$(probe_failure_categories "$valid_ready" ready)"; rc=$?; set -e
+[[ "$rc" == 1 && -z "$captured" ]] || test_fail probe_categories_pass_log_output
+[[ "$captured" != *private_route* && "$captured" != *10_0_0_1* ]] || test_fail probe_categories_sensitive_leak
+test_pass probe_categories_closed_and_atomic
 
 cp "$valid_final" "$tmp/final-before-ready.log"
 python3 - "$tmp/final-before-ready.log" <<'PY'
@@ -1025,14 +1049,15 @@ set +e; cgroup_membership_matches 123 /synthetic "$cgroup_proc_root"; rc=$?; set
 [[ "$rc" == 2 ]] || test_fail cgroup_membership_ambiguous_not_inconclusive
 printf '%s\n' '0::/synthetic' >"$cgroup_proc_root/123/cgroup"
 TIMEOUT_UNIT=synthetic.service
-timeout_cgroup_path=''; timeout_cgroup_identity=''
-show_value() { case "$2" in ActiveState) printf '%s\n' active ;; MainPID) printf '%s\n' 123 ;; ControlGroup) printf '%s\n' /synthetic ;; *) return 1 ;; esac; }
+owner_tag='ti0093:synthetic-owner'
+timeout_cgroup_path=''; timeout_cgroup_identity=''; timeout_cgroup_pid=''
+show_value() { case "$2" in ActiveState) printf '%s\n' active ;; MainPID) printf '%s\n' 123 ;; ControlGroup) printf '%s\n' /synthetic ;; Description) printf '%s\n' "$owner_tag" ;; Result) printf '%s\n' timeout ;; *) return 1 ;; esac; }
 cgroup_directory_identity() { [[ "$1" == /sys/fs/cgroup/synthetic ]] || return 2; printf '%s\n' "${CGROUP_IDENTITY:-9:9:directory}"; }
 cgroup_membership_matches() { [[ "$1:$2" == '123:/synthetic' ]] || return 2; return 0; }
 cgroup_events_populated() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.events ]] || return 2; return "${CGROUP_EVENTS_RC:-1}"; }
 cgroup_procs_is_empty() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.procs ]] || return 2; return "${CGROUP_PROCS_RC:-0}"; }
 capture_timeout_cgroup_live || test_fail cgroup_observer_live_capture_rejected
-[[ "$timeout_cgroup_path" == /sys/fs/cgroup/synthetic && "$timeout_cgroup_identity" == '9:9:directory' ]] || test_fail cgroup_observer_identity_not_captured
+[[ "$timeout_cgroup_path" == /sys/fs/cgroup/synthetic && "$timeout_cgroup_identity" == '9:9:directory' && "$timeout_cgroup_pid" == 123 ]] || test_fail cgroup_observer_identity_not_captured
 CGROUP_EVENTS_RC=0; CGROUP_PROCS_RC=0
 verify_timeout_cgroup_quiescent || test_fail cgroup_observer_quiescent_rejected
 CGROUP_EVENTS_RC=1
@@ -1046,7 +1071,43 @@ unset CGROUP_IDENTITY
 cgroup_directory_identity() { return 2; }
 set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail cgroup_observer_disappeared_not_inconclusive
-unset -f show_value cgroup_directory_identity cgroup_membership_matches cgroup_events_populated cgroup_procs_is_empty
+
+# The real transition observer samples the same cgroup identity while active
+# and accepts emptiness only in an iteration that has already observed the
+# terminal state, Result=timeout and MainPID=0.
+cgroup_directory_identity() { [[ "$1" == /sys/fs/cgroup/synthetic ]] || return 2; printf '%s\n' '9:9:directory'; }
+cgroup_membership_matches() { [[ "$1:$2" == '123:/synthetic' ]] || return 2; return 0; }
+cgroup_procs_is_empty() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.procs ]] || return 2; return "${CGROUP_PROCS_RC:-0}"; }
+transition_file="$tmp/transition-step"
+printf '%s\n' 0 >"$transition_file"
+show_value() {
+  local step
+  case "$2" in
+    Description) printf '%s\n' "${TEST_DESCRIPTION:-$owner_tag}" ;;
+    ActiveState) step="$(<"$transition_file")"; step=$(( step + 1 )); printf '%s\n' "$step" >"$transition_file"; [[ "$step" -eq 1 ]] && printf '%s\n' active || printf '%s\n' failed ;;
+    MainPID) step="$(<"$transition_file")"; [[ "$step" -le 1 ]] && printf '%s\n' 123 || printf '%s\n' 0 ;;
+    ControlGroup) printf '%s\n' /synthetic ;;
+    Result) printf '%s\n' timeout ;;
+    *) return 1 ;;
+  esac
+}
+cgroup_events_populated() { local step; [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.events ]] || return 2; step="$(<"$transition_file")"; (( step <= 1 )) && return 1 || return "${CGROUP_EVENTS_RC:-0}"; }
+sleep() { :; }
+timeout_cgroup_path=/sys/fs/cgroup/synthetic; timeout_cgroup_identity='9:9:directory'; timeout_cgroup_pid=123
+CGROUP_EVENTS_RC=0; CGROUP_PROCS_RC=0
+observe_timeout_cgroup_transition || test_fail cgroup_transition_terminal_empty_rejected
+printf '%s\n' 0 >"$transition_file"; CGROUP_EVENTS_RC=1
+set +e; observe_timeout_cgroup_transition; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail cgroup_transition_terminal_populated_not_rejected
+printf '%s\n' 0 >"$transition_file"; CGROUP_EVENTS_RC=0; TEST_DESCRIPTION='other-owner'
+set +e; observe_timeout_cgroup_transition; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_transition_description_change_not_inconclusive
+unset TEST_DESCRIPTION
+printf '%s\n' 0 >"$transition_file"
+cgroup_directory_identity() { return 2; }
+set +e; observe_timeout_cgroup_transition; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_transition_disappearance_not_inconclusive
+unset -f show_value cgroup_directory_identity cgroup_membership_matches cgroup_events_populated cgroup_procs_is_empty sleep
 
 grep -Fq "runtime_namespace_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_namespace_inconclusive_not_reported
 grep -Fq "runtime_run_mount_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_mount_inconclusive_not_reported
@@ -1066,6 +1127,17 @@ probe_part_a_hash="$(sha256sum -- "$tmp/probe-a.sh")" || test_fail probe_part_ha
 probe_part_a_hash="${probe_part_a_hash%% *}"
 [[ "$(grep -Fc "EXPECTED_PROBE_PART_A_SHA256='$probe_part_a_hash'" "$workflow")" == 2 ]] || test_fail probe_part_hash_commitment_mismatch
 test_pass probe_source_split_integrity
+
+# Every controller fragment used across steps is extracted from the published
+# YAML and parsed as one script. The staging hand-offs remain restricted to a
+# verified owner marker and a 0400-to-0600 controlled append transition.
+for fragment in controller-a.sh controller-lifecycle.sh controller-b.sh controller-main.sh; do
+  [[ -s "$tmp/$fragment" ]] || test_fail "controller_fragment_missing_${fragment%.sh}"
+done
+[[ "$(grep -Fc 'expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"' "$workflow")" -ge 3 ]] || test_fail controller_fragment_owner_marker_guards
+[[ "$(grep -Fc 'chmod 0600 "$controller_stage"' "$workflow")" == 3 ]] || test_fail controller_fragment_append_transitions
+[[ "$(grep -Fc 'chmod 0400 "$controller_stage"' "$workflow")" -ge 3 ]] || test_fail controller_fragment_restricted_handoffs
+test_pass controller_source_split_integrity
 
 
 extract_marker_block SOCKET_SCAN_VALIDATOR_BEGIN SOCKET_SCAN_VALIDATOR_END "$tmp/probe.sh" "$tmp/socket-validator.sh"
