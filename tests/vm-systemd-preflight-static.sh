@@ -601,12 +601,34 @@ extract_marker_block PROBE_DIAGNOSTICS_BEGIN PROBE_DIAGNOSTICS_END "$tmp/control
 source "$tmp/probe-diagnostics.sh"
 cp "$valid_ready" "$tmp/diagnostic-failure.log"
 sed -i '1cRESULT id=identity status=FAIL code=untrusted_secret_path' "$tmp/diagnostic-failure.log"
-[[ "$(probe_failure_ids "$tmp/diagnostic-failure.log")" == identity ]] || test_fail probe_diagnostic_allowlisted_id
-printf '%s\n' 'RESULT id=private_path status=FAIL code=secret_value' >"$tmp/diagnostic-unknown.log"
-set +e; probe_failure_ids "$tmp/diagnostic-unknown.log" >/dev/null; rc=$?; set -e
+set +e; parse_probe_log "$tmp/diagnostic-failure.log" ready; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail parser_reported_failure_not_distinct
+[[ "$(probe_failure_ids "$tmp/diagnostic-failure.log" ready)" == identity ]] || test_fail probe_diagnostic_allowlisted_id
+cp "$tmp/diagnostic-failure.log" "$tmp/diagnostic-multiple.log"
+sed -i '2cRESULT id=groups status=FAIL code=another_internal_reason' "$tmp/diagnostic-multiple.log"
+[[ "$(probe_failure_ids "$tmp/diagnostic-multiple.log" ready)" == identity,groups ]] || test_fail probe_diagnostic_multiple_failures
+cp "$tmp/diagnostic-failure.log" "$tmp/diagnostic-unknown.log"
+sed -i '2cRESULT id=private_path status=FAIL code=secret_value' "$tmp/diagnostic-unknown.log"
+set +e; captured="$(probe_failure_ids "$tmp/diagnostic-unknown.log" ready)"; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail probe_diagnostic_unknown_id_not_rejected
-captured="$(probe_failure_ids "$tmp/diagnostic-failure.log" 2>&1 || true)"
-[[ "$captured" != *untrusted_secret_path* && "$captured" != *private_path* ]] || test_fail probe_diagnostic_leak
+[[ -z "$captured" ]] || test_fail probe_diagnostic_partial_output
+cp "$tmp/diagnostic-failure.log" "$tmp/diagnostic-duplicate.log"
+sed -n '1p' "$tmp/diagnostic-failure.log" >>"$tmp/diagnostic-duplicate.log"
+set +e; captured="$(probe_failure_ids "$tmp/diagnostic-duplicate.log" ready)"; rc=$?; set -e
+[[ "$rc" == 2 && -z "$captured" ]] || test_fail probe_diagnostic_duplicate_output
+cp "$tmp/diagnostic-failure.log" "$tmp/diagnostic-truncated.log"
+truncate -s -1 "$tmp/diagnostic-truncated.log"
+set +e; captured="$(probe_failure_ids "$tmp/diagnostic-truncated.log" ready)"; rc=$?; set -e
+[[ "$rc" == 2 && -z "$captured" ]] || test_fail probe_diagnostic_truncated_output
+python3 - "$tmp/diagnostic-many.log" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_text(('RESULT id=identity status=FAIL code=x\n' * 400), encoding='ascii')
+PY
+set +e; captured="$(probe_failure_ids "$tmp/diagnostic-many.log" ready)"; rc=$?; set -e
+[[ "$rc" == 2 && -z "$captured" ]] || test_fail probe_diagnostic_many_output
+captured="$(probe_failure_ids "$tmp/diagnostic-failure.log" ready 2>&1 || true)"
+[[ "$captured" != *untrusted_secret_path* && "$captured" != *private_path* && "$captured" == identity ]] || test_fail probe_diagnostic_leak
 test_pass probe_diagnostics_allowlisted_and_sanitized
 
 cp "$valid_final" "$tmp/final-before-ready.log"
@@ -761,6 +783,25 @@ extract_marker_block RUNTIME_LIFECYCLE_VERIFIERS_BEGIN RUNTIME_LIFECYCLE_VERIFIE
 source "$tmp/runtime-lifecycle.sh"
 set +e; verify_runtime_namespaces 99999999; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail runtime_namespace_missing_pid_not_inconclusive
+cgroup_empty="$tmp/cgroup-empty.procs"
+cgroup_pids="$tmp/cgroup-pids.procs"
+cgroup_bad="$tmp/cgroup-malformed.procs"
+: >"$cgroup_empty"
+printf '%s\n%s\n' 101 202 >"$cgroup_pids"
+printf '%s\n' not-a-pid >"$cgroup_bad"
+cgroup_procs_is_empty "$cgroup_empty" || test_fail cgroup_empty_rejected
+# A cgroup-v2 pseudo-file can advertise size zero while yielding PIDs.  The
+# real helper deliberately never calls stat; this fixture makes a fake zero
+# size visible only to prove that metadata cannot influence the result.
+stat() { [[ "${*: -1}" == "$cgroup_pids" ]] && { printf '0\n'; return 0; }; command stat "$@"; }
+[[ "$(stat -Lc '%s' -- "$cgroup_pids")" == 0 ]] || test_fail cgroup_zero_size_fixture
+set +e; cgroup_procs_is_empty "$cgroup_pids"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail cgroup_zero_size_pids_accepted
+unset -f stat
+set +e; cgroup_procs_is_empty "$cgroup_bad"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_malformed_not_inconclusive
+set +e; cgroup_procs_is_empty "$tmp/missing-cgroup.procs"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_missing_not_inconclusive
 show_value() { printf '%s\n' '/invalid/../cgroup'; }
 set +e; verify_unit_cgroup_empty synthetic.service; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail cgroup_malformed_not_inconclusive
@@ -772,6 +813,7 @@ grep -Fq "runtime_namespace_verification_inconclusive" "$tmp/controller.sh" || t
 grep -Fq "runtime_run_mount_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_mount_inconclusive_not_reported
 grep -Fq "main_unit_cgroup_verification_inconclusive" "$tmp/controller.sh" || test_fail main_cgroup_inconclusive_not_reported
 grep -Fq "timeout_canary_cgroup_verification_inconclusive" "$tmp/controller.sh" || test_fail timeout_cgroup_inconclusive_not_reported
+! grep -Fq '[[ ! -s ' "$tmp/runtime-lifecycle.sh" || test_fail cgroup_uses_st_size
 test_pass runtime_lifecycle_fail_closed_classification
 
 extract_marker_block SOCKET_SCAN_VALIDATOR_BEGIN SOCKET_SCAN_VALIDATOR_END "$tmp/probe.sh" "$tmp/socket-validator.sh"

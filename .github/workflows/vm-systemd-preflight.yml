@@ -209,7 +209,7 @@ jobs:
           # PROBE_LOG_PARSER_BEGIN
           parse_probe_log() {
             local file="$1" phase="$2" line id status code extra
-            local ready_count=0 final_count=0 result_count=0 parser_error=0 state='results'
+            local ready_count=0 final_count=0 result_count=0 parser_error=0 reported_failure=0 state='results'
             local ready_status='' final_status=''
             local -A expected=() seen=()
             local expected_ids=(
@@ -239,7 +239,11 @@ jobs:
                 [[ -z "${seen[$id]+x}" ]] || { parser_error=1; continue; }
                 seen["$id"]=1
                 (( ++result_count ))
-                [[ "$status" == PASS && "$code" == ok ]] || parser_error=1
+                if [[ "$status" == PASS ]]; then
+                  [[ "$code" == ok ]] || parser_error=1
+                else
+                  reported_failure=1
+                fi
               elif [[ "$line" =~ ^READY\ status=(PASS|FAIL)\ records=([0-9]+)$ ]]; then
                 [[ "$state" == results && "$result_count" == "$EXPECTED_RECORDS" ]] || parser_error=1
                 (( ++ready_count )); ready_status="${BASH_REMATCH[1]}"
@@ -257,43 +261,46 @@ jobs:
 
             (( result_count == EXPECTED_RECORDS && ready_count == 1 )) || parser_error=1
             for id in "${expected_ids[@]}"; do [[ -n "${seen[$id]+x}" ]] || parser_error=1; done
-            [[ "$ready_status" == PASS ]] || parser_error=1
+            [[ "$ready_status" == PASS ]] || reported_failure=1
             if [[ "$phase" == ready ]]; then
               (( final_count == 0 )) || parser_error=1
             else
               (( final_count == 1 )) || parser_error=1
-              [[ "$final_status" == PASS ]] || parser_error=1
+              [[ "$final_status" == PASS ]] || reported_failure=1
             fi
-            (( parser_error == 0 )) || return 1
+            (( parser_error == 0 )) || return 2
+            (( reported_failure == 0 )) || return 1
             return 0
           }
           # PROBE_LOG_PARSER_END
 
           # PROBE_DIAGNOSTICS_BEGIN
           probe_failure_ids() {
-            local file="$1" line id status code first=true
-            local -A expected=()
-            local expected_ids=(
-              identity groups privilege_tools capabilities nonewprivs environment
-              descriptors workdir_write outside_write_denied tmp_write_denied
-              vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount
-              network_interfaces routes dns_blocked tcp_blocked https_blocked
-              cgroup_memory cgroup_pids cgroup_cpu
-            )
-            [[ -f "$file" && ! -L "$file" ]] || return 2
-            for id in "${expected_ids[@]}"; do expected["$id"]=1; done
+            local file="$1" phase="$2" line id status code parser_rc=0 count=0 output=''
+            local -A seen=()
+            [[ "$phase" == ready || "$phase" == final ]] || return 2
+            # The parser verifies file bounds, line grammar, the complete
+            # 24-record allowlist, cardinality and marker order before this
+            # helper is allowed to construct any public string.
+            parse_probe_log "$file" "$phase" || parser_rc=$?
+            [[ "$parser_rc" == 1 ]] || return 2
             while IFS= read -r line; do
               if [[ "$line" =~ ^RESULT\ id=([a-z0-9_]+)\ status=(PASS|FAIL)\ code=([a-z0-9_]+)$ ]]; then
                 id="${BASH_REMATCH[1]}"; status="${BASH_REMATCH[2]}"; code="${BASH_REMATCH[3]}"
-                [[ -n "${expected[$id]+x}" ]] || return 2
+                [[ -z "${seen[$id]+x}" ]] || return 2
+                seen["$id"]=1
                 if [[ "$status" == FAIL ]]; then
-                  [[ "$first" == true ]] || printf ','
-                  printf '%s' "$id"
-                  first=false
+                  (( ++count <= EXPECTED_RECORDS )) || return 2
+                  output+="${output:+,}$id"
                 fi
+              elif [[ "$line" =~ ^(READY|FINAL)\ status=(PASS|FAIL)\ records=([0-9]+)$ ]]; then
+                : # Full marker validation already occurred in parse_probe_log.
+              else return 2
               fi
             done <"$file"
-            [[ "$first" == false ]] || return 1
+            (( count > 0 && count <= EXPECTED_RECORDS && ${#output} <= 512 )) || return 2
+            [[ "$output" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] || return 2
+            printf '%s' "$output"
           }
           # PROBE_DIAGNOSTICS_END
 
@@ -445,12 +452,25 @@ jobs:
             [[ "$host_net" != "$service_net" && "$host_mnt" != "$service_mnt" ]]
           }
 
+          cgroup_procs_is_empty() {
+            local file="$1" pid saw=false
+            [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
+            # cgroup v2 pseudo-files may report st_size=0 even with PIDs; read
+            # the stream rather than trusting metadata such as test -s.
+            while IFS= read -r pid || [[ -n "$pid" ]]; do
+              saw=true
+              [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+            done <"$file" || return 2
+            [[ "$saw" == false ]] && return 0
+            return 1
+          }
+
           verify_unit_cgroup_empty() {
-            local unit="$1" cgroup
+            local unit="$1" cgroup file
             cgroup="$(show_value "$unit" ControlGroup)" || return 2
             [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
-            [[ -f "/sys/fs/cgroup$cgroup/cgroup.procs" && ! -L "/sys/fs/cgroup$cgroup/cgroup.procs" && -r "/sys/fs/cgroup$cgroup/cgroup.procs" ]] || return 2
-            [[ ! -s "/sys/fs/cgroup$cgroup/cgroup.procs" ]]
+            file="/sys/fs/cgroup$cgroup/cgroup.procs"
+            cgroup_procs_is_empty "$file"
           }
           # RUNTIME_LIFECYCLE_VERIFIERS_END
 
@@ -617,10 +637,14 @@ jobs:
               1)
                 fail 'probe_ready_reported_failure'
                 probe_ids=''
-                probe_failure_ids "$main_log" >"$PRIVATE_ROOT/probe-ready.ids" 2>/dev/null || true
-                if [[ -f "$PRIVATE_ROOT/probe-ready.ids" ]]; then
-                  probe_ids="$(<"$PRIVATE_ROOT/probe-ready.ids")"
-                  [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] && printf '%s\n' "INFO probe_ready_failed_ids=$probe_ids"
+                if probe_ids="$(probe_failure_ids "$main_log" ready)"; then
+                  if [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ && ${#probe_ids} -le 512 ]]; then
+                    printf '%s\n' "INFO probe_ready_failed_ids=$probe_ids"
+                  else
+                    fail 'probe_ready_failure_diagnostics_unavailable'
+                  fi
+                else
+                  fail 'probe_ready_failure_diagnostics_unavailable'
                 fi
                 ;;
               *) fail 'probe_ready_parser_error' ;;
@@ -647,10 +671,14 @@ jobs:
               1)
                 fail 'probe_final_reported_failure'
                 probe_ids=''
-                probe_failure_ids "$main_log" >"$PRIVATE_ROOT/probe-final.ids" 2>/dev/null || true
-                if [[ -f "$PRIVATE_ROOT/probe-final.ids" ]]; then
-                  probe_ids="$(<"$PRIVATE_ROOT/probe-final.ids")"
-                  [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] && printf '%s\n' "INFO probe_final_failed_ids=$probe_ids"
+                if probe_ids="$(probe_failure_ids "$main_log" final)"; then
+                  if [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ && ${#probe_ids} -le 512 ]]; then
+                    printf '%s\n' "INFO probe_final_failed_ids=$probe_ids"
+                  else
+                    fail 'probe_final_failure_diagnostics_unavailable'
+                  fi
+                else
+                  fail 'probe_final_failure_diagnostics_unavailable'
                 fi
                 ;;
               *) fail 'probe_final_parser_error' ;;
