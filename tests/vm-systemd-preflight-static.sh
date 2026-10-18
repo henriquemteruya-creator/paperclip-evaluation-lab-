@@ -189,11 +189,12 @@ rm -f -- "$install_temp_path"
 unset -f sudo mktemp install stat install_root_owned_script installation_dir_is_trusted installation_temp_is_owned remove_execution_owned_install cleanup_partial_install
 test_pass reviewed_transactional_script_installation_and_partial_cleanup
 
-# Exercise the actual step-4 manifest reader and cleanup verifier.  The
-# manifest transports only identity and digest values; the paths remain fixed
-# in the trusted workflow, and no raw values are logged.
+# Exercise the actual writer and reader together.  Only metadata for the two
+# disposable executable paths is simulated as root-owned, allowing this exact
+# fixture to run under a normal non-root user while production still demands
+# real root:root metadata.
+extract_marker_block INSTALL_MANIFEST_WRITER_BEGIN INSTALL_MANIFEST_WRITER_END "$workflow" "$tmp/manifest-writer.sh"
 extract_marker_block INSTALL_MANIFEST_READER_BEGIN INSTALL_MANIFEST_READER_END "$workflow" "$tmp/manifest-reader.sh"
-source "$tmp/manifest-reader.sh"
 continuity_root="$tmp/continuity"
 stage="$continuity_root/stage"
 mkdir -p -- "$stage"
@@ -208,26 +209,57 @@ probe_installed="$continuity_root/probe"
 printf '%s\n' controller >"$controller_installed"
 printf '%s\n' probe >"$probe_installed"
 chmod 0555 -- "$controller_installed" "$probe_installed"
-controller_identity="$(stat -Lc '%d:%i' -- "$controller_installed")"
-probe_identity="$(stat -Lc '%d:%i' -- "$probe_installed")"
-controller_hash="$(sha256sum -- "$controller_installed" | awk '{print $1}')"
-probe_hash="$(sha256sum -- "$probe_installed" | awk '{print $1}')"
-{
-  printf 'owner\t%s\n' "$expected_owner"
-  printf 'controller\t%s\t%s\n' "$controller_identity" "$controller_hash"
-  printf 'probe\t%s\t%s\n' "$probe_identity" "$probe_hash"
-} >"$manifest"
-chmod 0400 -- "$manifest"
+
+stat() {
+  local format='' arg last=''
+  for arg in "$@"; do
+    [[ "$arg" == -c || "$arg" == -Lc ]] && continue
+    [[ -z "$format" && "$arg" == *%* ]] && format="$arg"
+    last="$arg"
+  done
+  if [[ "$last" == "$controller_installed" || "$last" == "$probe_installed" ]]; then
+    case "$format" in
+      '%d:%i:%u:%g:%a:%F') printf '%s:0:0:%s:%s\n' "$(command stat -Lc '%d:%i' -- "$last")" "$(command stat -Lc '%a' -- "$last")" "$(command stat -Lc '%F' -- "$last")"; return 0 ;;
+    esac
+  fi
+  command stat "$@"
+}
+sudo() { "$@"; }
+source "$tmp/manifest-writer.sh"
+source "$tmp/manifest-reader.sh"
+controller_installed_identity="$(command stat -Lc '%d:%i' -- "$controller_installed")"
+probe_installed_identity="$(command stat -Lc '%d:%i' -- "$probe_installed")"
+
+# Real writer -> published manifest -> real reader -> real verifier.
+write_install_manifest || test_fail continuity_manifest_write_rejected
+[[ -f "$manifest" && ! -L "$manifest" && "$(command stat -Lc '%a' -- "$manifest")" == 400 ]] || test_fail continuity_manifest_not_private
 verify_stage_manifest || test_fail continuity_manifest_valid_rejected
 stage_owned=true
 read_install_manifest || test_fail continuity_manifest_parse_valid_rejected
 verify_installed_artifact "$controller_installed" "$controller_identity" "$controller_hash" || test_fail continuity_controller_valid_rejected
 verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash" || test_fail continuity_probe_valid_rejected
 
-# A symlink, missing file, device/inode drift or changed content cannot pass
-# the before-execution gate.  The cleanup helper consequently preserves each
-# unproven resource.
-probe_saved="$probe_installed"
+# Collisions and partial writer failures must not overwrite/publish a manifest.
+manifest_before="$(sha256sum -- "$manifest" | awk '{print $1}')"
+set +e; write_install_manifest; rc=$?; set -e
+[[ "$rc" == 1 && "$(sha256sum -- "$manifest" | awk '{print $1}')" == "$manifest_before" ]] || test_fail continuity_manifest_collision_not_preserved
+rm -f -- "$manifest"
+sha256sum() {
+  [[ "${TEST_MANIFEST_HASH_FAIL:-false}" != true || "${!#}" != "$probe_installed" ]] || return 97
+  command sha256sum "$@"
+}
+TEST_MANIFEST_HASH_FAIL=true
+set +e; write_install_manifest; rc=$?; set -e
+unset TEST_MANIFEST_HASH_FAIL
+[[ "$rc" == 1 && ! -e "$manifest" && ! -L "$manifest" ]] || test_fail continuity_manifest_partial_publish
+rm -f -- "$stage"/.installed-manifest.*
+unset -f sha256sum
+write_install_manifest || test_fail continuity_manifest_rewrite_after_partial
+read_install_manifest || test_fail continuity_manifest_reparse_after_partial
+
+# A symlink, missing file or device/inode drift cannot pass.  The hash case
+# changes bytes in place, proving the identity is retained and rejection is
+# specifically due to the recorded SHA-256 digest.
 rm -f -- "$probe_installed"
 ln -s "$controller_installed" "$probe_installed"
 set +e; verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash"; rc=$?; set -e
@@ -235,23 +267,22 @@ set +e; verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_h
 rm -f -- "$probe_installed"
 set +e; verify_installed_artifact "$probe_installed" "$probe_identity" "$probe_hash"; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail continuity_missing_not_rejected
-replacement_probe="$continuity_root/replacement-probe"
-printf '%s\n' probe >"$replacement_probe"
-chmod 0555 -- "$replacement_probe"
-mv -- "$replacement_probe" "$probe_installed"
-drifted_probe_identity='999999:999999'
-set +e; verify_installed_artifact "$probe_installed" "$drifted_probe_identity" "$probe_hash"; rc=$?; set -e
+printf '%s\n' probe >"$probe_installed"
+chmod 0555 -- "$probe_installed"
+set +e; verify_installed_artifact "$probe_installed" '999999:999999' "$probe_hash"; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail continuity_identity_drift_not_rejected
-replacement_controller="$continuity_root/replacement-controller"
-printf '%s\n' altered >"$replacement_controller"
-chmod 0555 -- "$replacement_controller"
-mv -- "$replacement_controller" "$controller_installed"
+controller_identity_before="$(command stat -Lc '%d:%i' -- "$controller_installed")"
+chmod u+w -- "$controller_installed"
+printf '%s\n' altered-in-place >"$controller_installed"
+chmod 0555 -- "$controller_installed"
+controller_identity_after="$(command stat -Lc '%d:%i' -- "$controller_installed")"
+[[ "$controller_identity_after" == "$controller_identity_before" && "$(command stat -Lc '%a' -- "$controller_installed")" == 555 ]] || test_fail continuity_hash_fixture_changed_identity_or_mode
 set +e; verify_installed_artifact "$controller_installed" "$controller_identity" "$controller_hash"; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail continuity_hash_drift_not_rejected
 set +e; remove_verified_artifact "$controller_installed" "$controller_identity" "$controller_hash"; rc=$?; set -e
-[[ "$rc" == 1 && -f "$controller_installed" ]] || test_fail continuity_cleanup_removed_unproven
+[[ "$rc" == 1 && -f "$controller_installed" ]] || test_fail continuity_cleanup_removed_hash_divergent
 
-# A malformed or extended manifest is rejected before any executable is run.
+# Altering a published manifest is rejected before executable validation.
 replacement_manifest="$continuity_root/replacement-manifest"
 cat -- "$manifest" >"$replacement_manifest"
 printf 'extra\tentry\n' >>"$replacement_manifest"
@@ -259,8 +290,8 @@ chmod 0400 -- "$replacement_manifest"
 mv -- "$replacement_manifest" "$manifest"
 set +e; read_install_manifest; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail continuity_manifest_extra_record_not_rejected
-unset -f verify_stage_manifest read_install_manifest verify_installed_artifact remove_verified_artifact remove_verified_stage
-test_pass continuity_manifest_and_verified_cleanup
+unset -f sudo stat installed_artifact_record write_install_manifest verify_stage_manifest read_install_manifest verify_installed_artifact remove_verified_artifact remove_verified_stage
+test_pass continuity_manifest_writer_reader_and_verified_cleanup
 
 # Exercise the two workflow staging blocks as the owning, non-root user when a
 # normal test user is available.  This deliberately uses the extracted

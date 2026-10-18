@@ -76,6 +76,26 @@ unproven path is deliberately preserved and turns the run into `NO-GO`; the
 workflow never treats inability to prove ownership as authorization to remove a
 resource.
 
+## Offline manifest-test evidence
+
+The static suite extracts both the manifest writer and reader from the workflow
+and exercises them end to end in a disposable directory: creation, private
+publication, positive read/verification, collision preservation, a partial
+writer failure with no published manifest, an altered manifest, and verified
+cleanup refusal. For portability, the fixture simulates `root:root` metadata
+only for its two disposable executable paths; the production functions remain
+unchanged and still require actual `root:root` mode-`0555` files. The hash
+regression changes a fixture file in place, restores mode `0555`, proves the
+device/inode is unchanged, and then confirms rejection and cleanup refusal
+caused by the SHA-256 mismatch.
+
+The suite is designed to run under a non-root user. In the constrained review
+environment used for this revision, an attempted `setpriv --reuid=65534` failed
+with `setresuid: Invalid argument`, so a separate real non-root invocation was
+not demonstrated there. That is an environment limitation, not evidence that
+the non-root execution passed; the future GitHub-hosted runner remains the
+place to observe that runtime identity after separate authorization.
+
 Execution #4 (run `39075677975`, SHA
 `45b70744fd7771e5a82c17e881cce62b343aafcb`) failed before the controller ran:
 the GitHub-hosted image had no `/usr/local/libexec` directory, so the second
