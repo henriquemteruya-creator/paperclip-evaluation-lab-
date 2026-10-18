@@ -404,6 +404,33 @@ jobs:
             [[ "$output" =~ ^[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*$ ]] || return 2
             printf '%s' "$output"
           }
+
+          # The extractor is private-log only. This final publisher repeats a
+          # closed validation before emitting anything, so a malformed file or
+          # a future extractor regression cannot turn into partial public text.
+          publish_failure_categories() {
+            local label="$1" pairs="$2" pair id code output='' count=0
+            local -a entries=()
+            local -A seen=()
+            [[ "$label" == probe_ready_failure_categories || "$label" == probe_final_failure_categories ]] || return 1
+            [[ -n "$pairs" && ${#pairs} -le 512 && "$pairs" != *$'\n'* && "$pairs" != *[[:space:]]* ]] || return 1
+            IFS=',' read -r -a entries <<<"$pairs"
+            (( ${#entries[@]} >= 1 && ${#entries[@]} <= 4 )) || return 1
+            for pair in "${entries[@]}"; do
+              [[ "$pair" =~ ^([a-z0-9_]+)=([a-z0-9_]+)$ ]] || return 1
+              id="${BASH_REMATCH[1]}"; code="${BASH_REMATCH[2]}"
+              [[ -z "${seen[$id]+x}" ]] || return 1
+              seen["$id"]=1
+              case "$id:$code" in
+                run_mount_diagnostic:known_submount_restrictive|run_mount_diagnostic:known_submount_incompatible|run_mount_diagnostic:unexpected_submount|run_mount_diagnostic:inspection_error|routes:tool_unavailable|routes:ipv4_query_error|routes:ipv6_query_error|routes:present|tcp_blocked:not_attempted_prerequisite|tcp_blocked:connected|tcp_blocked:inconclusive|https_blocked:not_attempted_prerequisite|https_blocked:connected|https_blocked:inconclusive) ;;
+                *) return 1 ;;
+              esac
+              (( ++count <= 4 )) || return 1
+              output+="${output:+,}$id=$code"
+            done
+            [[ "$output" == "$pairs" && ${#output} -le 512 ]] || return 1
+            printf 'INFO %s=%s\n' "$label" "$output"
+          }
           # PROBE_DIAGNOSTICS_END
 
           # RUN_PROPERTY_VALIDATOR_BEGIN
@@ -569,10 +596,27 @@ jobs:
             [[ "$path" == "$timeout_cgroup_path" ]] || return 2
             identity="$(cgroup_directory_identity "$path")" || return 2
             [[ "$identity" == "$timeout_cgroup_identity" ]] || return 2
-            cgroup_events_populated "$path/cgroup.events" || populated_rc=$?
+            timeout_cgroup_read_bound cgroup_events_populated "$path/cgroup.events" || populated_rc=$?
             [[ "$populated_rc" == 0 ]] || { [[ "$populated_rc" == 1 ]] && return 1; return 2; }
-            cgroup_procs_is_empty "$path/cgroup.procs" || procs_rc=$?
+            timeout_cgroup_read_bound cgroup_procs_is_empty "$path/cgroup.procs" || procs_rc=$?
             [[ "$procs_rc" == 0 ]] || { [[ "$procs_rc" == 1 ]] && return 1; return 2; }
+            identity="$(cgroup_directory_identity "$path")" || return 2
+            [[ "$identity" == "$timeout_cgroup_identity" ]] || return 2
+          }
+
+          # Binds each read to the stored directory identity with revalidation
+          # on both sides of the file open/read. A replace-before, during, or
+          # after-read race is therefore a NO-GO instead of a stale PASS.
+          timeout_cgroup_read_bound() {
+            local reader="$1" file="$2" path identity_before identity_after reader_rc=0
+            [[ "$file" == "$timeout_cgroup_path"/* && "$file" != *'..'* ]] || return 2
+            path="$timeout_cgroup_path"
+            identity_before="$(cgroup_directory_identity "$path")" || return 2
+            [[ "$identity_before" == "$timeout_cgroup_identity" ]] || return 2
+            "$reader" "$file" || reader_rc=$?
+            identity_after="$(cgroup_directory_identity "$path")" || return 2
+            [[ "$identity_after" == "$timeout_cgroup_identity" ]] || return 2
+            return "$reader_rc"
           }
 
           verify_timeout_cgroup_identity() {
@@ -591,18 +635,27 @@ jobs:
           # empty, stable cgroup are observed in the same polling iteration.
           # Automatic cgroup removal therefore remains an inconclusive NO-GO.
           observe_timeout_cgroup_transition() {
-            local attempts=0 state description result pid identity_rc=0 quiescent_rc=0
+            local attempts=0 state description result pid quiescent_rc=0
             [[ -n "$owner_tag" ]] || return 2
             while (( attempts < 150 )); do
               description="$(show_value "$TIMEOUT_UNIT" Description)" || return 2
               [[ "$description" == "$owner_tag" ]] || return 2
               state="$(show_value "$TIMEOUT_UNIT" ActiveState)" || return 2
               case "$state" in
-                activating|active|deactivating|reloading)
+                activating|active|reloading)
                   verify_timeout_cgroup_identity || return 2
                   pid="$(show_value "$TIMEOUT_UNIT" MainPID)" || return 2
                   [[ "$pid" == "$timeout_cgroup_pid" ]] || return 2
                   cgroup_membership_matches "$pid" "${timeout_cgroup_path#/sys/fs/cgroup}" || return 2
+                  ;;
+                deactivating)
+                  verify_timeout_cgroup_identity || return 2
+                  pid="$(show_value "$TIMEOUT_UNIT" MainPID)" || return 2
+                  if [[ "$pid" == "$timeout_cgroup_pid" ]]; then
+                    cgroup_membership_matches "$pid" "${timeout_cgroup_path#/sys/fs/cgroup}" || return 2
+                  elif [[ "$pid" != 0 ]]; then
+                    return 2
+                  fi
                   ;;
                 inactive|failed)
                   result="$(show_value "$TIMEOUT_UNIT" Result)" || return 2
@@ -864,8 +917,7 @@ jobs:
                     case "$category_rc" in
                       0)
                         probe_categories="$(<"$PRIVATE_ROOT/probe-ready-categories")"
-                        [[ "$probe_categories" =~ ^[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*$ && ${#probe_categories} -le 512 ]] || fail 'probe_ready_category_diagnostics_unavailable'
-                        [[ -z "$probe_categories" ]] || printf '%s\n' "INFO probe_ready_failure_categories=$probe_categories"
+                        publish_failure_categories probe_ready_failure_categories "$probe_categories" || fail 'probe_ready_category_diagnostics_unavailable'
                         ;;
                       1) : ;;
                       *) fail 'probe_ready_category_diagnostics_unavailable' ;;
@@ -977,8 +1029,7 @@ jobs:
                   case "$category_rc" in
                     0)
                       probe_categories="$(<"$PRIVATE_ROOT/probe-final-categories")"
-                      [[ "$probe_categories" =~ ^[a-z0-9_]+=[a-z0-9_]+(,[a-z0-9_]+=[a-z0-9_]+)*$ && ${#probe_categories} -le 512 ]] || fail 'probe_final_category_diagnostics_unavailable'
-                      [[ -z "$probe_categories" ]] || printf '%s\n' "INFO probe_final_failure_categories=$probe_categories"
+                      publish_failure_categories probe_final_failure_categories "$probe_categories" || fail 'probe_final_category_diagnostics_unavailable'
                       ;;
                     1) : ;;
                     *) fail 'probe_final_category_diagnostics_unavailable' ;;

@@ -224,9 +224,11 @@ markers. Results must precede READY; FINAL must follow READY and be the final
 record. It never echoes a rejected line. For a fully valid failing log it may
 publish at most four `id=category` pairs, limited to the reviewed diagnostic
 IDs `run_mount_diagnostic`, `routes`, `tcp_blocked` and `https_blocked` and
-their closed category vocabulary. Unknown categories, duplicates, truncation
-or any parser error suppress those pairs entirely. The GitHub step summary is
-generated from controller-owned literals and aggregate counts only.
+their closed category vocabulary. A second closed publisher revalidates the
+label, cardinality, syntax, IDs and categories immediately before `printf`.
+Unknown categories, duplicates, truncation or any parser error suppress those
+pairs entirely. The GitHub step summary is generated from controller-owned
+literals and aggregate counts only.
 
 ## Timeout and cleanup canary
 
@@ -242,7 +244,12 @@ with the same profile and `RuntimeMaxSec=3s`. Approval requires:
   tag, stable path/device/inode, `Result=timeout`, `MainPID=0`,
   `populated=0`, and a completed empty `cgroup.procs` read. A vanished,
   unreadable or changed cgroup, PID, identity, description or incomplete read
-  is inconclusive NO-GO, never evidence of emptiness;
+  is inconclusive NO-GO, never evidence of emptiness. Directory identity is
+  revalidated immediately before and after *each* `cgroup.events` and
+  `cgroup.procs` read, and once more after both reads; a replacement race is
+  therefore not accepted. During `deactivating`, `MainPID=0` is only treated
+  as an expected intermediate condition—the final evidence is still required
+  in `inactive` or `failed`;
 - no process remains under the dedicated UID after both units are stopped;
 - controller cleanup removes only units, UID/GID, sentinel and directories
   proven to have been created by this execution; the trusted workflow step

@@ -769,6 +769,20 @@ set +e; captured="$(probe_failure_categories "$valid_ready" ready)"; rc=$?; set 
 [[ "$captured" != *private_route* && "$captured" != *10_0_0_1* ]] || test_fail probe_categories_sensitive_leak
 test_pass probe_categories_closed_and_atomic
 
+# The final public publisher is itself closed: even a simulated extractor that
+# returns text cannot bypass syntax, cardinality, ID/category or label checks.
+simulated_category_extractor() { printf '%s' "$1"; }
+published="$(publish_failure_categories probe_ready_failure_categories "$(simulated_category_extractor 'routes=ipv4_query_error,tcp_blocked=inconclusive')")" || test_fail probe_category_publication_valid_rejected
+[[ "$published" == 'INFO probe_ready_failure_categories=routes=ipv4_query_error,tcp_blocked=inconclusive' ]] || test_fail probe_category_publication_wrong_output
+set +e; published="$(publish_failure_categories probe_ready_failure_categories "$(simulated_category_extractor 'routes=ipv4_query_error,private_id=secret')")"; rc=$?; set -e
+[[ "$rc" != 0 && -z "$published" ]] || test_fail probe_category_publication_partial_invalid
+set +e; published="$(publish_failure_categories probe_final_failure_categories "$(simulated_category_extractor 'routes=private_route_10_0_0_1')")"; rc=$?; set -e
+[[ "$rc" != 0 && -z "$published" ]] || test_fail probe_category_publication_unknown_category
+set +e; published="$(publish_failure_categories unexpected_label "$(simulated_category_extractor 'routes=present')")"; rc=$?; set -e
+[[ "$rc" != 0 && -z "$published" ]] || test_fail probe_category_publication_bad_label
+unset -f simulated_category_extractor
+test_pass probe_category_publication_closed_and_atomic
+
 cp "$valid_final" "$tmp/final-before-ready.log"
 python3 - "$tmp/final-before-ready.log" <<'PY'
 from pathlib import Path
@@ -1072,6 +1086,26 @@ cgroup_directory_identity() { return 2; }
 set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail cgroup_observer_disappeared_not_inconclusive
 
+# Bound reads must re-check the directory identity around every file access.
+# These fixtures model replacement before the read, during cgroup.events, and
+# during cgroup.procs; none may retain a PASS result.
+cgroup_directory_identity() { [[ "$1" == /sys/fs/cgroup/synthetic ]] || return 2; printf '%s\n' "${CGROUP_IDENTITY:-9:9:directory}"; }
+cgroup_events_populated() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.events ]] || return 2; return 0; }
+cgroup_procs_is_empty() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.procs ]] || return 2; return 0; }
+CGROUP_IDENTITY='10:10:directory'
+set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_bound_read_identity_changed_before
+CGROUP_IDENTITY='9:9:directory'
+cgroup_events_populated() { CGROUP_IDENTITY='10:10:directory'; return 0; }
+set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_bound_read_identity_changed_during_events
+CGROUP_IDENTITY='9:9:directory'
+cgroup_events_populated() { return 0; }
+cgroup_procs_is_empty() { CGROUP_IDENTITY='10:10:directory'; return 0; }
+set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_bound_read_identity_changed_during_procs
+unset CGROUP_IDENTITY
+
 # The real transition observer samples the same cgroup identity while active
 # and accepts emptiness only in an iteration that has already observed the
 # terminal state, Result=timeout and MainPID=0.
@@ -1084,18 +1118,19 @@ show_value() {
   local step
   case "$2" in
     Description) printf '%s\n' "${TEST_DESCRIPTION:-$owner_tag}" ;;
-    ActiveState) step="$(<"$transition_file")"; step=$(( step + 1 )); printf '%s\n' "$step" >"$transition_file"; [[ "$step" -eq 1 ]] && printf '%s\n' active || printf '%s\n' failed ;;
+    ActiveState) step="$(<"$transition_file")"; step=$(( step + 1 )); printf '%s\n' "$step" >"$transition_file"; case "$step" in 1) printf '%s\n' active ;; 2) printf '%s\n' deactivating ;; *) printf '%s\n' failed ;; esac ;;
     MainPID) step="$(<"$transition_file")"; [[ "$step" -le 1 ]] && printf '%s\n' 123 || printf '%s\n' 0 ;;
     ControlGroup) printf '%s\n' /synthetic ;;
     Result) printf '%s\n' timeout ;;
     *) return 1 ;;
   esac
 }
-cgroup_events_populated() { local step; [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.events ]] || return 2; step="$(<"$transition_file")"; (( step <= 1 )) && return 1 || return "${CGROUP_EVENTS_RC:-0}"; }
+cgroup_events_populated() { local step; [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.events ]] || return 2; step="$(<"$transition_file")"; (( step < 3 )) && return 1 || return "${CGROUP_EVENTS_RC:-0}"; }
 sleep() { :; }
 timeout_cgroup_path=/sys/fs/cgroup/synthetic; timeout_cgroup_identity='9:9:directory'; timeout_cgroup_pid=123
 CGROUP_EVENTS_RC=0; CGROUP_PROCS_RC=0
 observe_timeout_cgroup_transition || test_fail cgroup_transition_terminal_empty_rejected
+[[ "$(<"$transition_file")" == 3 ]] || test_fail cgroup_transition_intermediate_accepted
 printf '%s\n' 0 >"$transition_file"; CGROUP_EVENTS_RC=1
 set +e; observe_timeout_cgroup_transition; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail cgroup_transition_terminal_populated_not_rejected
