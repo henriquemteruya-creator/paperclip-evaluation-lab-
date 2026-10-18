@@ -677,6 +677,8 @@ check_environment
 [[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail environment_partial_collection_accepted
 unset -f env ok bad check_environment
 grep -Fq 'REPOSITORY_IS_PRIVATE WORKFLOW_SHA RUN_OWNER_TAG SUMMARY_PATH' "$tmp/controller.sh" || test_fail controller_environment_not_unset
+grep -Fq '/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$PROBE_PATH" "$RELEASE_FILE"' "$tmp/controller.sh" || test_fail controller_probe_environment_not_scrubbed
+grep -Fq '/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/sleep 30' "$tmp/controller.sh" || test_fail controller_canary_environment_not_scrubbed
 test_pass environment_collection_fail_closed
 
 # The controller accepts only root-owned 0600 regular files; GNU stat names an
@@ -825,7 +827,7 @@ check_network
 [[ "$network_ok_ids" == *' routes'* && "$network_ok_ids" == *' https_blocked'* && -z "$network_bad_ids" ]] || test_fail network_empty_routes_not_accepted
 NET_IP6_ERROR=true; network_ok_ids=''; network_bad_ids=''
 check_network
-[[ "$network_bad_ids" == *'routes:query_error'* ]] || test_fail network_route_query_error_not_rejected
+[[ "$network_bad_ids" == *'routes:query_error'* && "$network_bad_ids" == *'https_blocked:inconclusive'* ]] || test_fail network_route_query_error_not_causal
 unset -f check_network enumerate_network_interfaces ip getent timeout ok bad
 unset NET_IP6_ERROR WORK
 test_pass network_orchestration_fail_closed
@@ -885,6 +887,12 @@ if validate_run_mountinfo "$tmp/mount-duplicate" >/dev/null 2>&1; then test_fail
 make_mountinfo "$tmp/mount-submount" "$valid_run"
 printf '%s\n' '26 25 0:46 / /run/unexpected ro,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k' >>"$tmp/mount-submount"
 if validate_run_mountinfo "$tmp/mount-submount" >/dev/null 2>&1; then test_fail run_mount_accepted_submount; fi
+
+# A path made inaccessible below /run can legitimately cause a runtime mount,
+# but it remains NO-GO until its exact representation is independently proven.
+make_mountinfo "$tmp/mount-known-inaccessible" "$valid_run"
+printf '%s\n' '26 25 0:46 /run/systemd/inaccessible/reg /run/docker.sock ro,nosuid,nodev,noexec - tmpfs tmpfs ro,size=1024k' >>"$tmp/mount-known-inaccessible"
+if validate_run_mountinfo "$tmp/mount-known-inaccessible" >/dev/null 2>&1; then test_fail run_mount_accepted_known_inaccessible_submount; fi
 printf '%s\n' 'malformed' >"$tmp/mount-malformed"
 set +e; validate_run_mountinfo "$tmp/mount-malformed" >/dev/null; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail run_mount_malformed_not_inconclusive

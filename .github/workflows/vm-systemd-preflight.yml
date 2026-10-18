@@ -609,7 +609,7 @@ jobs:
 
             build_service_args "$main_log" 45s
             local start_rc=0
-            systemd-run --system --quiet --unit="$MAIN_UNIT" --description="$owner_tag" --service-type=exec "${SERVICE_ARGS[@]}" "$PROBE_PATH" "$RELEASE_FILE" >"$PRIVATE_ROOT/controller-start.out" 2>&1 || start_rc=$?
+            systemd-run --system --quiet --unit="$MAIN_UNIT" --description="$owner_tag" --service-type=exec "${SERVICE_ARGS[@]}" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C "$PROBE_PATH" "$RELEASE_FILE" >"$PRIVATE_ROOT/controller-start.out" 2>&1 || start_rc=$?
             if (( start_rc != 0 )); then
               if [[ "$(show_value "$MAIN_UNIT" Description 2>/dev/null || true)" == "$owner_tag" ]]; then main_owned=true; fi
               fail 'main_unit_start_failed'
@@ -749,7 +749,7 @@ jobs:
 
             build_service_args "$timeout_log" 3s
             local timeout_start_rc=0 timeout_wait_rc=0
-            systemd-run --system --quiet --unit="$TIMEOUT_UNIT" --description="$owner_tag" --service-type=exec "${SERVICE_ARGS[@]}" /usr/bin/sleep 30 >"$PRIVATE_ROOT/controller-timeout-start.out" 2>&1 || timeout_start_rc=$?
+            systemd-run --system --quiet --unit="$TIMEOUT_UNIT" --description="$owner_tag" --service-type=exec "${SERVICE_ARGS[@]}" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/sleep 30 >"$PRIVATE_ROOT/controller-timeout-start.out" 2>&1 || timeout_start_rc=$?
             if (( timeout_start_rc != 0 )); then
               if [[ "$(show_value "$TIMEOUT_UNIT" Description 2>/dev/null || true)" == "$owner_tag" ]]; then timeout_owned=true; fi
               fail 'timeout_canary_start_failed'
