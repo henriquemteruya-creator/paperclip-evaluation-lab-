@@ -798,6 +798,15 @@ stat() { [[ "${*: -1}" == "$cgroup_pids" ]] && { printf '0\n'; return 0; }; comm
 set +e; cgroup_procs_is_empty "$cgroup_pids"; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail cgroup_zero_size_pids_accepted
 unset -f stat
+# The external parser's exit status is authoritative: no output (failure
+# before any PID) and output followed by failure (partial read) are both NO-GO.
+awk() { return 74; }
+set +e; cgroup_procs_is_empty "$cgroup_empty"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_pre_pid_read_error_not_inconclusive
+awk() { command awk "$@"; return 75; }
+set +e; cgroup_procs_is_empty "$cgroup_pids"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_partial_read_error_not_inconclusive
+unset -f awk
 set +e; cgroup_procs_is_empty "$cgroup_bad"; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail cgroup_malformed_not_inconclusive
 set +e; cgroup_procs_is_empty "$tmp/missing-cgroup.procs"; rc=$?; set -e

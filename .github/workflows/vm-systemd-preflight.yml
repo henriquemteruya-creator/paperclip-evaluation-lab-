@@ -453,16 +453,28 @@ jobs:
           }
 
           cgroup_procs_is_empty() {
-            local file="$1" pid saw=false
+            local file="$1" result
             [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
             # cgroup v2 pseudo-files may report st_size=0 even with PIDs; read
-            # the stream rather than trusting metadata such as test -s.
-            while IFS= read -r pid || [[ -n "$pid" ]]; do
-              saw=true
-              [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
-            done <"$file" || return 2
-            [[ "$saw" == false ]] && return 0
-            return 1
+            # the stream rather than trusting metadata such as test -s.  awk
+            # makes a read error observable through its process exit status.
+            result="$(LC_ALL=C awk '
+              BEGIN { count=0; invalid=0 }
+              {
+                if ($0 !~ /^[1-9][0-9]*$/) { invalid=1; exit 2 }
+                count++
+                if (count > 64) { invalid=1; exit 2 }
+              }
+              END {
+                if (invalid) exit 2
+                if (count == 0) print "empty"; else print "pids"
+              }
+            ' "$file")" || return 2
+            case "$result" in
+              empty) return 0 ;;
+              pids) return 1 ;;
+              *) return 2 ;;
+            esac
           }
 
           verify_unit_cgroup_empty() {
