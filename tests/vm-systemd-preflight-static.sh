@@ -643,8 +643,41 @@ ln -s missing-sudo "$privbin/sudo"
 ok_calls=0; bad_calls=0
 PATH="$privbin" check_privilege_tools
 [[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail dangling_privilege_tool_symlink_accepted
+for ambiguous_path in '' ":$privbin" "$privbin:" "$privbin::$tmp/other"; do
+  ok_calls=0; bad_calls=0
+  PATH="$ambiguous_path" check_privilege_tools
+  [[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail privilege_tool_ambiguous_path_accepted
+done
 unset -f ok bad check_privilege_tools
 test_pass privilege_tool_effective_access
+
+# The real environment checker must reject controller-only inheritance, parser
+# errors and a command that produces partial data before failing.
+awk '/^[[:space:]]*check_environment\(\) \{/ {inside=1} inside {print} /# FD_VALIDATOR_BEGIN/ {exit}' "$tmp/probe.sh" >"$tmp/environment.sh"
+source "$tmp/environment.sh"
+environment_baseline=$'PATH=/usr/sbin:/usr/bin:/sbin:/bin\nLANG=C\nLC_ALL=C\nINVOCATION_ID=fixture\nSYSTEMD_EXEC_PID=123\nPWD=/var/lib/ti0093-vm-preflight/work\nSHLVL=1\n_=/usr/bin/env'
+environment_fixture="$environment_baseline"
+env() { printf '%s\n' "$environment_fixture"; }
+ok_calls=0; bad_calls=0
+ok() { (( ++ok_calls )); }
+bad() { (( ++bad_calls )); }
+check_environment
+[[ "$ok_calls" == 1 && "$bad_calls" == 0 ]] || test_fail environment_systemd_owned_fixture_rejected
+environment_fixture+=$'\nRUN_OWNER_TAG=not-for-service'
+ok_calls=0; bad_calls=0
+check_environment
+[[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail environment_controller_inheritance_accepted
+environment_fixture="$environment_baseline"$'\nGITHUB_TOKEN=not-published'
+ok_calls=0; bad_calls=0
+check_environment
+[[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail environment_sensitive_name_accepted
+env() { printf '%s\n' "$environment_fixture"; return 73; }
+ok_calls=0; bad_calls=0
+check_environment
+[[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail environment_partial_collection_accepted
+unset -f env ok bad check_environment
+grep -Fq 'REPOSITORY_IS_PRIVATE WORKFLOW_SHA RUN_OWNER_TAG SUMMARY_PATH' "$tmp/controller.sh" || test_fail controller_environment_not_unset
+test_pass environment_collection_fail_closed
 
 # The controller accepts only root-owned 0600 regular files; GNU stat names an
 # empty regular file differently, so both exact GNU names are covered here.
@@ -767,6 +800,35 @@ set +e; classify_https_result 7 false true; rc=$?; set -e; [[ "$rc" == 2 ]] || t
 set +e; classify_https_result 35 true true; rc=$?; set -e; [[ "$rc" == 1 ]] || test_fail tls_reachability_not_rejected
 set +e; classify_https_result 28 true true; rc=$?; set -e; [[ "$rc" == 2 ]] || test_fail https_timeout_not_inconclusive
 test_pass network_result_classification
+
+# Run the real orchestration with only shell mocks: no DNS, TCP or HTTPS
+# request is made. A route-query error must stay distinct from an empty table.
+awk '/^[[:space:]]*check_network\(\) \{/ {inside=1} /^[[:space:]]*check_cgroups\(\)/ {exit} inside {print}' "$tmp/probe.sh" >"$tmp/network-check.sh"
+source "$tmp/network-check.sh"
+network_ok_ids=''; network_bad_ids=''; network_work="$tmp/network-check-work"; mkdir "$network_work"
+WORK="$network_work"
+ok() { network_ok_ids+=" $1"; }
+bad() { network_bad_ids+=" $1:$2"; }
+enumerate_network_interfaces() { return 0; }
+ip() { [[ "${NET_IP6_ERROR:-false}" != true || "$1" != -6 ]] || return 71; }
+getent() { return 0; }
+timeout() {
+  local seconds="$1" command="$2"; shift 2
+  case "$command" in
+    getent) [[ "$1" == hosts ]] && return 0 || return 2 ;;
+    bash) printf '%s\n' 'bash: connect: Network is unreachable' >"$WORK/tcp.error"; return 1 ;;
+    curl) return 7 ;;
+    *) return 127 ;;
+  esac
+}
+check_network
+[[ "$network_ok_ids" == *' routes'* && "$network_ok_ids" == *' https_blocked'* && -z "$network_bad_ids" ]] || test_fail network_empty_routes_not_accepted
+NET_IP6_ERROR=true; network_ok_ids=''; network_bad_ids=''
+check_network
+[[ "$network_bad_ids" == *'routes:query_error'* ]] || test_fail network_route_query_error_not_rejected
+unset -f check_network enumerate_network_interfaces ip getent timeout ok bad
+unset NET_IP6_ERROR WORK
+test_pass network_orchestration_fail_closed
 
 # The actual synchronous enumerator must preserve producer and sorter failures.
 extract_marker_block INTERFACE_ENUMERATOR_BEGIN INTERFACE_ENUMERATOR_END "$tmp/probe.sh" "$tmp/interfaces.sh"

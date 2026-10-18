@@ -465,7 +465,7 @@ jobs:
               -p 'StandardInput=null'
               -p "StandardOutput=append:$log_file"
               -p "StandardError=append:$log_file"
-              -p 'UnsetEnvironment=GITHUB_TOKEN GH_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN GITHUB_ENV GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_PATH HOME HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS OPENAI_API_KEY ANTHROPIC_API_KEY'
+              -p 'UnsetEnvironment=GITHUB_TOKEN GH_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN GITHUB_ENV GITHUB_OUTPUT GITHUB_STEP_SUMMARY GITHUB_PATH HOME HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AZURE_CLIENT_SECRET GOOGLE_APPLICATION_CREDENTIALS OPENAI_API_KEY ANTHROPIC_API_KEY REPOSITORY_IS_PRIVATE WORKFLOW_SHA RUN_OWNER_TAG SUMMARY_PATH'
               --setenv='PATH=/usr/sbin:/usr/bin:/sbin:/bin'
               --setenv='LANG=C'
               --setenv='LC_ALL=C'
@@ -998,23 +998,15 @@ jobs:
           }
           # PRIVILEGE_TOOL_VALIDATOR_BEGIN
           check_privilege_tools() {
-            local tool dir path
-            local -a path_dirs=()
-            IFS=: read -r -a path_dirs <<<"$PATH"
-            (( ${#path_dirs[@]} > 0 )) || { bad privilege_tools path_invalid; return; }
-            for tool in sudo su pkexec doas; do
-              for dir in "${path_dirs[@]}"; do
-                [[ "$dir" == /* && "$dir" != *'..'* && -d "$dir" ]] || { bad privilege_tools path_invalid; return; }
-                path="$dir/$tool"
-                if [[ -L "$path" ]]; then
-                  bad privilege_tools symlink
-                  return
-                elif [[ -e "$path" ]]; then
-                  [[ -f "$path" ]] || { bad privilege_tools unverifiable; return; }
-                  [[ ! -x "$path" ]] || { bad privilege_tools executable; return; }
-                fi
-              done
-            done
+            local tool dir path;local -a path_dirs
+            [[ -n "$PATH" && "$PATH" != :* && "$PATH" != *: && "$PATH" != *::* ]]||{ bad privilege_tools path_invalid; return; }
+            IFS=: read -ra path_dirs <<<"$PATH"
+            for tool in sudo su pkexec doas; do for dir in "${path_dirs[@]}"; do
+              [[ "$dir" == /* && "$dir" != *..* && -d "$dir" ]]||{ bad privilege_tools path_invalid; return; }
+              path="$dir/$tool"; [[ -L "$path" ]]&&{ bad privilege_tools symlink; return; }
+              [[ -e "$path" ]]||continue
+              [[ -f "$path" && ! -x "$path" ]]||{ bad privilege_tools executable; return; }
+            done; done
             ok privilege_tools
           }
           # PRIVILEGE_TOOL_VALIDATOR_END
@@ -1030,15 +1022,15 @@ jobs:
             [[ "$(awk '$1=="NoNewPrivs:" {print $2}' /proc/self/status 2>/dev/null)" == 1 ]] && ok nonewprivs || bad nonewprivs disabled
           }
           check_environment() {
-            local name line unknown=0 sensitive=0 count=0
-            while IFS= read -r line; do
-              name="${line%%=*}"; (( ++count ))
-              case "$name" in PATH|LANG|LC_ALL|USER|LOGNAME|SHELL|INVOCATION_ID|SYSTEMD_EXEC_PID|PWD|SHLVL|_) ;;
-                *) unknown=1 ;;
-              esac
-              [[ "$name" =~ (GITHUB|ACTIONS|TOKEN|SECRET|CREDENTIAL|PASSWORD|PROXY|AWS|AZURE|GOOGLE|OPENAI|ANTHROPIC) ]] && sensitive=1
-            done < <(env)
-            if (( sensitive == 0 && unknown == 0 && count <= 11 )); then ok environment; else bad environment unexpected; fi
+            local n l s c=0
+            s="$(env)"&&[[ -n "$s" ]]||{ bad environment inspection_error; return; }
+            while IFS= read -r l; do
+              n="${l%%=*}"; (( ++c<=12 ))||{ bad environment unexpected; return; }
+              [[ "$l" == "$n="* && "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]||{ bad environment malformed; return; }
+              case "$n" in PATH|LANG|LC_ALL|SHELL|INVOCATION_ID|SYSTEMD_EXEC_PID|PWD|SHLVL|_) ;; *) bad environment unexpected; return ;; esac
+              [[ "$n" =~ (GITHUB|ACTIONS|TOKEN|SECRET|CREDENTIAL|PASSWORD|PROXY|AWS|AZURE|GOOGLE|OPENAI|ANTHROPIC) ]]&&{ bad environment sensitive; return; }
+            done <<<"$s"
+            ok environment
           }
           # FD_VALIDATOR_BEGIN
           validate_descriptor_snapshot() {
