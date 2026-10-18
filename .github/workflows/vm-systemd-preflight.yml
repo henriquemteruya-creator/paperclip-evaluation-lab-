@@ -177,6 +177,21 @@ jobs:
             return 1
           }
 
+          # PROBE_READY_WAITER_BEGIN
+          wait_for_probe_ready() {
+            local file="$1" attempts=0
+            while (( attempts < 150 )); do
+              if [[ -f "$file" && ! -L "$file" ]]; then
+                grep -Fxq -- "READY status=PASS records=$EXPECTED_RECORDS" "$file" 2>/dev/null && return 0
+                grep -Fxq -- "READY status=FAIL records=$EXPECTED_RECORDS" "$file" 2>/dev/null && return 1
+              fi
+              sleep 0.1
+              (( ++attempts ))
+            done
+            return 2
+          }
+          # PROBE_READY_WAITER_END
+
           wait_for_unit_terminal() {
             local unit="$1" attempts=0 state
             while (( attempts < 150 )); do
@@ -587,18 +602,26 @@ jobs:
             fi
             main_owned=true
 
-            if ! wait_for_log_marker "$main_log" "READY status=PASS records=$EXPECTED_RECORDS"; then
-              fail 'probe_ready_missing'
-            fi
+            local probe_ready_rc=0 probe_ready_passed=false
+            wait_for_probe_ready "$main_log" || probe_ready_rc=$?
+            case "$probe_ready_rc" in
+              0) probe_ready_passed=true ;;
+              1) fail 'probe_ready_failed_early' ;;
+              *) fail 'probe_ready_missing' ;;
+            esac
 
             main_pid="$(show_value "$MAIN_UNIT" MainPID 2>/dev/null || true)"
             local runtime_ns_rc=0 runtime_run_rc=0 cgroup_rc=0 probe_ids=''
-            verify_runtime_namespaces "$main_pid" || runtime_ns_rc=$?
-            case "$runtime_ns_rc" in
-              0) pass 'runtime_namespaces_distinct' ;;
-              1) fail 'runtime_namespaces_not_distinct' ;;
-              *) fail 'runtime_namespace_verification_inconclusive' ;;
-            esac
+            if [[ "$probe_ready_passed" == true ]]; then
+              verify_runtime_namespaces "$main_pid" || runtime_ns_rc=$?
+              case "$runtime_ns_rc" in
+                0) pass 'runtime_namespaces_distinct' ;;
+                1) fail 'runtime_namespaces_not_distinct' ;;
+                *) fail 'runtime_namespace_verification_inconclusive' ;;
+              esac
+            else
+              fail 'runtime_namespace_evidence_unavailable_after_probe_failure'
+            fi
 
             local property expected id
             while IFS='|' read -r property expected id; do
@@ -637,12 +660,16 @@ jobs:
                 *) fail 'unit_run_tmpfs_inconclusive' ;;
               esac
             fi
-            verify_run_mount_distinct "$MAIN_UNIT" "$main_pid" || runtime_run_rc=$?
-            case "$runtime_run_rc" in
-              0) pass 'runtime_run_mount_distinct' ;;
-              1) fail 'runtime_run_mount_not_distinct' ;;
-              *) fail 'runtime_run_mount_verification_inconclusive' ;;
-            esac
+            if [[ "$probe_ready_passed" == true ]]; then
+              verify_run_mount_distinct "$MAIN_UNIT" "$main_pid" || runtime_run_rc=$?
+              case "$runtime_run_rc" in
+                0) pass 'runtime_run_mount_distinct' ;;
+                1) fail 'runtime_run_mount_not_distinct' ;;
+                *) fail 'runtime_run_mount_verification_inconclusive' ;;
+              esac
+            else
+              fail 'runtime_run_mount_evidence_unavailable_after_probe_failure'
+            fi
 
             case "$(parse_probe_log "$main_log" ready; printf '%s' "$?")" in
               0) pass 'probe_ready_log_valid' ;;
@@ -662,39 +689,45 @@ jobs:
               *) fail 'probe_ready_parser_error' ;;
             esac
 
-            install -o "$LAB_USER" -g "$LAB_GROUP" -m 0600 /dev/null "$RELEASE_FILE"
             local main_wait_rc=0
+            if [[ "$probe_ready_passed" == true ]]; then
+              install -o "$LAB_USER" -g "$LAB_GROUP" -m 0600 /dev/null "$RELEASE_FILE"
+            fi
             wait_for_unit_terminal "$MAIN_UNIT" || main_wait_rc=$?
             case "$main_wait_rc" in
               0) ;;
               1) fail 'main_unit_completion_timeout' ;;
               *) fail 'main_unit_state_query_error' ;;
             esac
-            show_exact "$MAIN_UNIT" Result success 'main_unit_result_success'
-            show_exact "$MAIN_UNIT" ExecMainStatus 0 'main_unit_exit_zero'
-            verify_unit_cgroup_empty "$MAIN_UNIT" || cgroup_rc=$?
-            case "$cgroup_rc" in
-              0) pass 'main_unit_cgroup_empty' ;;
-              1) fail 'main_unit_cgroup_has_processes' ;;
-              *) fail 'main_unit_cgroup_verification_inconclusive' ;;
-            esac
-            case "$(parse_probe_log "$main_log" final; printf '%s' "$?")" in
-              0) pass 'probe_final_log_valid' ;;
-              1)
-                fail 'probe_final_reported_failure'
-                probe_ids=''
-                if probe_ids="$(probe_failure_ids "$main_log" final)"; then
-                  if [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ && ${#probe_ids} -le 512 ]]; then
-                    printf '%s\n' "INFO probe_final_failed_ids=$probe_ids"
+            if [[ "$probe_ready_passed" == true ]]; then
+              show_exact "$MAIN_UNIT" Result success 'main_unit_result_success'
+              show_exact "$MAIN_UNIT" ExecMainStatus 0 'main_unit_exit_zero'
+              verify_unit_cgroup_empty "$MAIN_UNIT" || cgroup_rc=$?
+              case "$cgroup_rc" in
+                0) pass 'main_unit_cgroup_empty' ;;
+                1) fail 'main_unit_cgroup_has_processes' ;;
+                *) fail 'main_unit_cgroup_verification_inconclusive' ;;
+              esac
+              case "$(parse_probe_log "$main_log" final; printf '%s' "$?")" in
+                0) pass 'probe_final_log_valid' ;;
+                1)
+                  fail 'probe_final_reported_failure'
+                  probe_ids=''
+                  if probe_ids="$(probe_failure_ids "$main_log" final)"; then
+                    if [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ && ${#probe_ids} -le 512 ]]; then
+                      printf '%s\n' "INFO probe_final_failed_ids=$probe_ids"
+                    else
+                      fail 'probe_final_failure_diagnostics_unavailable'
+                    fi
                   else
                     fail 'probe_final_failure_diagnostics_unavailable'
                   fi
-                else
-                  fail 'probe_final_failure_diagnostics_unavailable'
-                fi
-                ;;
-              *) fail 'probe_final_parser_error' ;;
-            esac
+                  ;;
+                *) fail 'probe_final_parser_error' ;;
+              esac
+            else
+              fail 'main_unit_dynamic_evidence_unavailable_after_probe_failure'
+            fi
 
             build_service_args "$timeout_log" 3s
             local timeout_start_rc=0 timeout_wait_rc=0
@@ -945,9 +978,23 @@ jobs:
             groups="$(id -Gn 2>/dev/null)" || { bad groups query_error; return; }
             [[ "$(wc -w <<<"$groups")" == 1 && "$groups" == "$EXPECTED_GROUP" ]] && ok groups || bad groups unexpected
           }
+          # PRIVILEGE_TOOL_VALIDATOR_BEGIN
           check_privilege_tools() {
-            if ! command -v sudo >/dev/null 2>&1 && ! command -v su >/dev/null 2>&1 && ! command -v pkexec >/dev/null 2>&1 && ! command -v doas >/dev/null 2>&1; then ok privilege_tools; else bad privilege_tools visible; fi
+            local tool path
+            # Name resolution alone is not authority: an inaccessible bind mount can
+            # remain discoverable through PATH.  A tool is unsafe only if its resolved
+            # regular file is executable by this service process.
+            for tool in sudo su pkexec doas; do
+              path="$(type -P "$tool" 2>/dev/null || true)"
+              [[ -z "$path" ]] && continue
+              if [[ -f "$path" && ! -L "$path" && -x "$path" ]]; then
+                bad privilege_tools executable
+                return
+              fi
+            done
+            ok privilege_tools
           }
+          # PRIVILEGE_TOOL_VALIDATOR_END
           check_capabilities() {
             local value key
             for key in CapInh CapPrm CapEff CapBnd CapAmb; do

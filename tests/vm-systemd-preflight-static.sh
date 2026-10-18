@@ -569,6 +569,45 @@ captured="$(parse_probe_log "$tmp/sanitization.log" ready 2>&1 || true)"
 [[ "$captured" != *"$secret"* && "$captured" != *'/home/runner'* && "$captured" != *'abc123'* ]] || test_fail parser_leak
 test_pass parser_sanitization
 
+# READY FAIL is a terminal diagnostic state, not a delayed timeout or a PASS.
+extract_marker_block PROBE_READY_WAITER_BEGIN PROBE_READY_WAITER_END "$tmp/controller.sh" "$tmp/probe-ready-waiter.sh"
+source "$tmp/probe-ready-waiter.sh"
+ready_pass="$tmp/ready-pass.log"; ready_fail="$tmp/ready-fail.log"
+printf 'READY status=PASS records=24\n' >"$ready_pass"
+printf 'READY status=FAIL records=24\n' >"$ready_fail"
+wait_for_probe_ready "$ready_pass" || test_fail ready_pass_not_recognized
+set +e; wait_for_probe_ready "$ready_fail"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail ready_fail_not_recognized
+sleep() { :; }
+set +e; wait_for_probe_ready "$tmp/ready-absent.log"; rc=$?; set -e
+unset -f sleep
+[[ "$rc" == 2 ]] || test_fail ready_missing_not_inconclusive
+test_pass ready_state_fail_closed
+grep -Fq "probe_ready_failed_early" "$tmp/controller.sh" || test_fail ready_failure_not_classified_early
+grep -Fq "runtime_namespace_evidence_unavailable_after_probe_failure" "$tmp/controller.sh" || test_fail namespace_post_failure_not_guarded
+grep -Fq "runtime_run_mount_evidence_unavailable_after_probe_failure" "$tmp/controller.sh" || test_fail run_mount_post_failure_not_guarded
+grep -Fq "main_unit_dynamic_evidence_unavailable_after_probe_failure" "$tmp/controller.sh" || test_fail terminal_post_failure_not_guarded
+! grep -Fq 'wait_for_log_marker "$main_log" "READY status=PASS' "$tmp/controller.sh" || test_fail pass_only_ready_wait_retained
+test_pass ready_failure_causal_guards
+
+# `type -P` may find an inaccessible path; only a regular file executable by
+# the probe is treated as a privilege-escalation exposure.
+extract_marker_block PRIVILEGE_TOOL_VALIDATOR_BEGIN PRIVILEGE_TOOL_VALIDATOR_END "$tmp/probe.sh" "$tmp/privilege-tools.sh"
+source "$tmp/privilege-tools.sh"
+privbin="$tmp/privbin"; mkdir "$privbin"
+printf '%s\n' '#!/bin/sh' >"$privbin/sudo"; chmod 0644 "$privbin/sudo"
+ok_calls=0; bad_calls=0
+ok() { (( ++ok_calls )); }
+bad() { (( ++bad_calls )); }
+PATH="$privbin" check_privilege_tools
+[[ "$ok_calls" == 1 && "$bad_calls" == 0 ]] || test_fail inaccessible_privilege_tool_rejected
+chmod 0700 "$privbin/sudo"
+ok_calls=0; bad_calls=0
+PATH="$privbin" check_privilege_tools
+[[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail executable_privilege_tool_accepted
+unset -f ok bad check_privilege_tools
+test_pass privilege_tool_effective_access
+
 # The controller accepts only root-owned 0600 regular files; GNU stat names an
 # empty regular file differently, so both exact GNU names are covered here.
 extract_marker_block PRIVATE_LOG_VALIDATOR_BEGIN PRIVATE_LOG_VALIDATOR_END "$tmp/controller.sh" "$tmp/private-log-validator.sh"
