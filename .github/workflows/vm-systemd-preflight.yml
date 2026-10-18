@@ -192,6 +192,22 @@ jobs:
           }
           # PROBE_READY_WAITER_END
 
+          # PROBE_READY_GATE_BEGIN
+          probe_ready_gate() {
+            local file="$1" observed_rc="$2" parser_rc=0
+            case "$observed_rc" in
+              0|1) ;;
+              *) return 2 ;;
+            esac
+            parse_probe_log "$file" ready || parser_rc=$?
+            case "$parser_rc:$observed_rc" in
+              0:0) return 0 ;;
+              1:1) return 1 ;;
+              *) return 2 ;;
+            esac
+          }
+          # PROBE_READY_GATE_END
+
           wait_for_unit_terminal() {
             local unit="$1" attempts=0 state
             while (( attempts < 150 )); do
@@ -602,16 +618,36 @@ jobs:
             fi
             main_owned=true
 
-            local probe_ready_rc=0 probe_ready_passed=false
+            local probe_ready_rc=0 probe_gate_rc=0 probe_ready_passed=false probe_ids=''
             wait_for_probe_ready "$main_log" || probe_ready_rc=$?
             case "$probe_ready_rc" in
-              0) probe_ready_passed=true ;;
-              1) fail 'probe_ready_failed_early' ;;
+              0|1)
+                probe_ready_gate "$main_log" "$probe_ready_rc" || probe_gate_rc=$?
+                case "$probe_gate_rc" in
+                  0)
+                    probe_ready_passed=true
+                    pass 'probe_ready_log_valid'
+                    ;;
+                  1)
+                    fail 'probe_ready_reported_failure'
+                    if probe_ids="$(probe_failure_ids "$main_log" ready)"; then
+                      if [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ && ${#probe_ids} -le 512 ]]; then
+                        printf '%s\n' "INFO probe_ready_failed_ids=$probe_ids"
+                      else
+                        fail 'probe_ready_failure_diagnostics_unavailable'
+                      fi
+                    else
+                      fail 'probe_ready_failure_diagnostics_unavailable'
+                    fi
+                    ;;
+                  *) fail 'probe_ready_parser_error' ;;
+                esac
+                ;;
               *) fail 'probe_ready_missing' ;;
             esac
 
             main_pid="$(show_value "$MAIN_UNIT" MainPID 2>/dev/null || true)"
-            local runtime_ns_rc=0 runtime_run_rc=0 cgroup_rc=0 probe_ids=''
+            local runtime_ns_rc=0 runtime_run_rc=0 cgroup_rc=0
             if [[ "$probe_ready_passed" == true ]]; then
               verify_runtime_namespaces "$main_pid" || runtime_ns_rc=$?
               case "$runtime_ns_rc" in
@@ -670,24 +706,6 @@ jobs:
             else
               fail 'runtime_run_mount_evidence_unavailable_after_probe_failure'
             fi
-
-            case "$(parse_probe_log "$main_log" ready; printf '%s' "$?")" in
-              0) pass 'probe_ready_log_valid' ;;
-              1)
-                fail 'probe_ready_reported_failure'
-                probe_ids=''
-                if probe_ids="$(probe_failure_ids "$main_log" ready)"; then
-                  if [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ && ${#probe_ids} -le 512 ]]; then
-                    printf '%s\n' "INFO probe_ready_failed_ids=$probe_ids"
-                  else
-                    fail 'probe_ready_failure_diagnostics_unavailable'
-                  fi
-                else
-                  fail 'probe_ready_failure_diagnostics_unavailable'
-                fi
-                ;;
-              *) fail 'probe_ready_parser_error' ;;
-            esac
 
             local main_wait_rc=0
             if [[ "$probe_ready_passed" == true ]]; then
@@ -980,17 +998,22 @@ jobs:
           }
           # PRIVILEGE_TOOL_VALIDATOR_BEGIN
           check_privilege_tools() {
-            local tool path
-            # Name resolution alone is not authority: an inaccessible bind mount can
-            # remain discoverable through PATH.  A tool is unsafe only if its resolved
-            # regular file is executable by this service process.
+            local tool dir path
+            local -a path_dirs=()
+            IFS=: read -r -a path_dirs <<<"$PATH"
+            (( ${#path_dirs[@]} > 0 )) || { bad privilege_tools path_invalid; return; }
             for tool in sudo su pkexec doas; do
-              path="$(type -P "$tool" 2>/dev/null || true)"
-              [[ -z "$path" ]] && continue
-              if [[ -f "$path" && ! -L "$path" && -x "$path" ]]; then
-                bad privilege_tools executable
-                return
-              fi
+              for dir in "${path_dirs[@]}"; do
+                [[ "$dir" == /* && "$dir" != *'..'* && -d "$dir" ]] || { bad privilege_tools path_invalid; return; }
+                path="$dir/$tool"
+                if [[ -L "$path" ]]; then
+                  bad privilege_tools symlink
+                  return
+                elif [[ -e "$path" ]]; then
+                  [[ -f "$path" ]] || { bad privilege_tools unverifiable; return; }
+                  [[ ! -x "$path" ]] || { bad privilege_tools executable; return; }
+                fi
+              done
             done
             ok privilege_tools
           }

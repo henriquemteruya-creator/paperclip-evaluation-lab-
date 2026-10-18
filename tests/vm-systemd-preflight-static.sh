@@ -583,15 +583,42 @@ set +e; wait_for_probe_ready "$tmp/ready-absent.log"; rc=$?; set -e
 unset -f sleep
 [[ "$rc" == 2 ]] || test_fail ready_missing_not_inconclusive
 test_pass ready_state_fail_closed
-grep -Fq "probe_ready_failed_early" "$tmp/controller.sh" || test_fail ready_failure_not_classified_early
+extract_marker_block PROBE_READY_GATE_BEGIN PROBE_READY_GATE_END "$tmp/controller.sh" "$tmp/probe-ready-gate.sh"
+source "$tmp/probe-ready-gate.sh"
+probe_ready_gate "$valid_ready" 0 || test_fail valid_ready_pass_not_released
+
+ready_failure="$tmp/ready-failure.log"
+cp "$valid_ready" "$ready_failure"
+sed -i '1cRESULT id=identity status=FAIL code=mismatch' "$ready_failure"
+sed -i 's/^READY status=PASS /READY status=FAIL /' "$ready_failure"
+set +e; probe_ready_gate "$ready_failure" 1; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail valid_ready_fail_not_classified
+
+# The raw waiter can observe the first marker, but no contradictory, duplicate
+# or malformed log is allowed to produce the gate's release result.
+for invalid_case in contradictory duplicate malformed; do
+  invalid_log="$tmp/ready-$invalid_case.log"
+  cp "$valid_ready" "$invalid_log"
+  case "$invalid_case" in
+    contradictory) printf 'READY status=FAIL records=24\n' >>"$invalid_log" ;;
+    duplicate) printf 'READY status=PASS records=24\n' >>"$invalid_log" ;;
+    malformed) printf 'untrusted=malformed\n' >>"$invalid_log" ;;
+  esac
+  wait_for_probe_ready "$invalid_log" || test_fail "raw_waiter_did_not_observe_${invalid_case}_pass"
+  set +e; probe_ready_gate "$invalid_log" 0; rc=$?; set -e
+  [[ "$rc" == 2 ]] || test_fail "invalid_ready_${invalid_case}_released"
+done
+unset -f probe_ready_gate
+test_pass ready_release_requires_full_parser
+grep -Fq 'probe_ready_gate "$main_log" "$probe_ready_rc"' "$tmp/controller.sh" || test_fail ready_gate_not_used_by_controller
 grep -Fq "runtime_namespace_evidence_unavailable_after_probe_failure" "$tmp/controller.sh" || test_fail namespace_post_failure_not_guarded
 grep -Fq "runtime_run_mount_evidence_unavailable_after_probe_failure" "$tmp/controller.sh" || test_fail run_mount_post_failure_not_guarded
 grep -Fq "main_unit_dynamic_evidence_unavailable_after_probe_failure" "$tmp/controller.sh" || test_fail terminal_post_failure_not_guarded
 ! grep -Fq 'wait_for_log_marker "$main_log" "READY status=PASS' "$tmp/controller.sh" || test_fail pass_only_ready_wait_retained
 test_pass ready_failure_causal_guards
 
-# `type -P` may find an inaccessible path; only a regular file executable by
-# the probe is treated as a privilege-escalation exposure.
+# Every PATH entry is inspected directly. Any executable privilege tool or
+# symlink is an exposure (or an inconclusive resolution) and therefore NO-GO.
 extract_marker_block PRIVILEGE_TOOL_VALIDATOR_BEGIN PRIVILEGE_TOOL_VALIDATOR_END "$tmp/probe.sh" "$tmp/privilege-tools.sh"
 source "$tmp/privilege-tools.sh"
 privbin="$tmp/privbin"; mkdir "$privbin"
@@ -605,6 +632,17 @@ chmod 0700 "$privbin/sudo"
 ok_calls=0; bad_calls=0
 PATH="$privbin" check_privilege_tools
 [[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail executable_privilege_tool_accepted
+rm -f -- "$privbin/sudo"
+printf '%s\n' '#!/bin/sh' >"$privbin/real-sudo"; chmod 0700 "$privbin/real-sudo"
+ln -s real-sudo "$privbin/sudo"
+ok_calls=0; bad_calls=0
+PATH="$privbin" check_privilege_tools
+[[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail executable_privilege_tool_symlink_accepted
+rm -f -- "$privbin/sudo"
+ln -s missing-sudo "$privbin/sudo"
+ok_calls=0; bad_calls=0
+PATH="$privbin" check_privilege_tools
+[[ "$ok_calls" == 0 && "$bad_calls" == 1 ]] || test_fail dangling_privilege_tool_symlink_accepted
 unset -f ok bad check_privilege_tools
 test_pass privilege_tool_effective_access
 
