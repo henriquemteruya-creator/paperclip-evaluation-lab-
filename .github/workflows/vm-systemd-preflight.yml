@@ -194,12 +194,17 @@ jobs:
             return 1
           }
 
+          # PRIVATE_LOG_VALIDATOR_BEGIN
           log_file_is_private() {
             local file="$1" metadata
             [[ -f "$file" && ! -L "$file" ]] || return 1
             metadata="$(stat -Lc '%u:%g:%a:%F' -- "$file" 2>/dev/null)" || return 1
-            [[ "$metadata" == '0:0:600:regular file' ]]
+            # GNU stat distinguishes an empty regular file from a non-empty
+            # regular file.  Both are acceptable only with the same strict
+            # root ownership and 0600 mode.
+            [[ "$metadata" == '0:0:600:regular file' || "$metadata" == '0:0:600:regular empty file' ]]
           }
+          # PRIVATE_LOG_VALIDATOR_END
 
           # PROBE_LOG_PARSER_BEGIN
           parse_probe_log() {
@@ -263,6 +268,34 @@ jobs:
             return 0
           }
           # PROBE_LOG_PARSER_END
+
+          # PROBE_DIAGNOSTICS_BEGIN
+          probe_failure_ids() {
+            local file="$1" line id status code first=true
+            local -A expected=()
+            local expected_ids=(
+              identity groups privilege_tools capabilities nonewprivs environment
+              descriptors workdir_write outside_write_denied tmp_write_denied
+              vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount
+              network_interfaces routes dns_blocked tcp_blocked https_blocked
+              cgroup_memory cgroup_pids cgroup_cpu
+            )
+            [[ -f "$file" && ! -L "$file" ]] || return 2
+            for id in "${expected_ids[@]}"; do expected["$id"]=1; done
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^RESULT\ id=([a-z0-9_]+)\ status=(PASS|FAIL)\ code=([a-z0-9_]+)$ ]]; then
+                id="${BASH_REMATCH[1]}"; status="${BASH_REMATCH[2]}"; code="${BASH_REMATCH[3]}"
+                [[ -n "${expected[$id]+x}" ]] || return 2
+                if [[ "$status" == FAIL ]]; then
+                  [[ "$first" == true ]] || printf ','
+                  printf '%s' "$id"
+                  first=false
+                fi
+              fi
+            done <"$file"
+            [[ "$first" == false ]] || return 1
+          }
+          # PROBE_DIAGNOSTICS_END
 
           # RUN_PROPERTY_VALIDATOR_BEGIN
           validate_run_tmpfs_property() {
@@ -401,6 +434,7 @@ jobs:
             )
           }
 
+          # RUNTIME_LIFECYCLE_VERIFIERS_BEGIN
           verify_runtime_namespaces() {
             local pid="$1" host_net service_net host_mnt service_mnt
             [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
@@ -415,12 +449,10 @@ jobs:
             local unit="$1" cgroup
             cgroup="$(show_value "$unit" ControlGroup)" || return 2
             [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
-            if [[ -e "/sys/fs/cgroup$cgroup/cgroup.procs" ]]; then
-              [[ ! -s "/sys/fs/cgroup$cgroup/cgroup.procs" ]]
-            else
-              return 0
-            fi
+            [[ -f "/sys/fs/cgroup$cgroup/cgroup.procs" && ! -L "/sys/fs/cgroup$cgroup/cgroup.procs" && -r "/sys/fs/cgroup$cgroup/cgroup.procs" ]] || return 2
+            [[ ! -s "/sys/fs/cgroup$cgroup/cgroup.procs" ]]
           }
+          # RUNTIME_LIFECYCLE_VERIFIERS_END
 
           write_summary() {
             local verdict="$1" summary_path="${SUMMARY_PATH:-}"
@@ -528,11 +560,13 @@ jobs:
             fi
 
             main_pid="$(show_value "$MAIN_UNIT" MainPID 2>/dev/null || true)"
-            if ! verify_runtime_namespaces "$main_pid"; then
-              fail 'runtime_namespace_verification_failed'
-            else
-              pass 'runtime_namespaces_distinct'
-            fi
+            local runtime_ns_rc=0 runtime_run_rc=0 cgroup_rc=0 probe_ids=''
+            verify_runtime_namespaces "$main_pid" || runtime_ns_rc=$?
+            case "$runtime_ns_rc" in
+              0) pass 'runtime_namespaces_distinct' ;;
+              1) fail 'runtime_namespaces_not_distinct' ;;
+              *) fail 'runtime_namespace_verification_inconclusive' ;;
+            esac
 
             local property expected id
             while IFS='|' read -r property expected id; do
@@ -571,15 +605,24 @@ jobs:
                 *) fail 'unit_run_tmpfs_inconclusive' ;;
               esac
             fi
-            if verify_run_mount_distinct "$MAIN_UNIT" "$main_pid"; then
-              pass 'runtime_run_mount_distinct'
-            else
-              fail 'runtime_run_mount_not_distinct'
-            fi
+            verify_run_mount_distinct "$MAIN_UNIT" "$main_pid" || runtime_run_rc=$?
+            case "$runtime_run_rc" in
+              0) pass 'runtime_run_mount_distinct' ;;
+              1) fail 'runtime_run_mount_not_distinct' ;;
+              *) fail 'runtime_run_mount_verification_inconclusive' ;;
+            esac
 
             case "$(parse_probe_log "$main_log" ready; printf '%s' "$?")" in
               0) pass 'probe_ready_log_valid' ;;
-              1) fail 'probe_ready_reported_failure' ;;
+              1)
+                fail 'probe_ready_reported_failure'
+                probe_ids=''
+                probe_failure_ids "$main_log" >"$PRIVATE_ROOT/probe-ready.ids" 2>/dev/null || true
+                if [[ -f "$PRIVATE_ROOT/probe-ready.ids" ]]; then
+                  probe_ids="$(<"$PRIVATE_ROOT/probe-ready.ids")"
+                  [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] && printf '%s\n' "INFO probe_ready_failed_ids=$probe_ids"
+                fi
+                ;;
               *) fail 'probe_ready_parser_error' ;;
             esac
 
@@ -593,10 +636,23 @@ jobs:
             esac
             show_exact "$MAIN_UNIT" Result success 'main_unit_result_success'
             show_exact "$MAIN_UNIT" ExecMainStatus 0 'main_unit_exit_zero'
-            if verify_unit_cgroup_empty "$MAIN_UNIT"; then pass 'main_unit_cgroup_empty'; else fail 'main_unit_cgroup_not_empty'; fi
+            verify_unit_cgroup_empty "$MAIN_UNIT" || cgroup_rc=$?
+            case "$cgroup_rc" in
+              0) pass 'main_unit_cgroup_empty' ;;
+              1) fail 'main_unit_cgroup_has_processes' ;;
+              *) fail 'main_unit_cgroup_verification_inconclusive' ;;
+            esac
             case "$(parse_probe_log "$main_log" final; printf '%s' "$?")" in
               0) pass 'probe_final_log_valid' ;;
-              1) fail 'probe_final_reported_failure' ;;
+              1)
+                fail 'probe_final_reported_failure'
+                probe_ids=''
+                probe_failure_ids "$main_log" >"$PRIVATE_ROOT/probe-final.ids" 2>/dev/null || true
+                if [[ -f "$PRIVATE_ROOT/probe-final.ids" ]]; then
+                  probe_ids="$(<"$PRIVATE_ROOT/probe-final.ids")"
+                  [[ "$probe_ids" =~ ^[a-z0-9_]+(,[a-z0-9_]+)*$ ]] && printf '%s\n' "INFO probe_final_failed_ids=$probe_ids"
+                fi
+                ;;
               *) fail 'probe_final_parser_error' ;;
             esac
 
@@ -616,7 +672,13 @@ jobs:
               esac
               show_exact "$TIMEOUT_UNIT" Result timeout 'timeout_canary_result'
               show_exact "$TIMEOUT_UNIT" MainPID 0 'timeout_canary_no_main_pid'
-              if verify_unit_cgroup_empty "$TIMEOUT_UNIT"; then pass 'timeout_canary_cgroup_empty'; else fail 'timeout_canary_cgroup_not_empty'; fi
+              cgroup_rc=0
+              verify_unit_cgroup_empty "$TIMEOUT_UNIT" || cgroup_rc=$?
+              case "$cgroup_rc" in
+                0) pass 'timeout_canary_cgroup_empty' ;;
+                1) fail 'timeout_canary_cgroup_has_processes' ;;
+                *) fail 'timeout_canary_cgroup_verification_inconclusive' ;;
+              esac
             fi
 
             if pgrep -u "$lab_uid" >/dev/null 2>&1; then

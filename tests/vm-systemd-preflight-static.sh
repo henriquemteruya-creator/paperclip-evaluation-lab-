@@ -569,6 +569,46 @@ captured="$(parse_probe_log "$tmp/sanitization.log" ready 2>&1 || true)"
 [[ "$captured" != *"$secret"* && "$captured" != *'/home/runner'* && "$captured" != *'abc123'* ]] || test_fail parser_leak
 test_pass parser_sanitization
 
+# The controller accepts only root-owned 0600 regular files; GNU stat names an
+# empty regular file differently, so both exact GNU names are covered here.
+extract_marker_block PRIVATE_LOG_VALIDATOR_BEGIN PRIVATE_LOG_VALIDATOR_END "$tmp/controller.sh" "$tmp/private-log-validator.sh"
+source "$tmp/private-log-validator.sh"
+empty_log="$tmp/empty-private.log"
+full_log="$tmp/full-private.log"
+: >"$empty_log"; printf '%s\n' data >"$full_log"; chmod 0600 "$empty_log" "$full_log"
+log_stat() { command stat "$@"; }
+# The disposable fixture is non-root, so simulate only the ownership prefix.
+stat() {
+  if [[ "${*: -1}" == "$empty_log" || "${*: -1}" == "$full_log" ]]; then
+    local last="${*: -1}" type
+    type="$(command stat -Lc '%F' -- "$last")"
+    printf '0:0:%s:%s\n' "$(command stat -Lc '%a' -- "$last")" "$type"
+  else command stat "$@"; fi
+}
+log_file_is_private "$empty_log" || test_fail private_empty_log_rejected
+log_file_is_private "$full_log" || test_fail private_full_log_rejected
+ln -s "$empty_log" "$tmp/private-log-link"
+if log_file_is_private "$tmp/private-log-link"; then test_fail private_log_symlink_accepted; fi
+chmod 0644 "$full_log"
+if log_file_is_private "$full_log"; then test_fail private_log_bad_mode_accepted; fi
+chmod 0600 "$full_log"
+unset -f stat log_stat
+test_pass private_log_gnu_stat_types
+
+# Extract the actual finite-ID diagnostic helper. It may reveal only an
+# allowlisted control ID, never a probe code, line, path, or environment value.
+extract_marker_block PROBE_DIAGNOSTICS_BEGIN PROBE_DIAGNOSTICS_END "$tmp/controller.sh" "$tmp/probe-diagnostics.sh"
+source "$tmp/probe-diagnostics.sh"
+cp "$valid_ready" "$tmp/diagnostic-failure.log"
+sed -i '1cRESULT id=identity status=FAIL code=untrusted_secret_path' "$tmp/diagnostic-failure.log"
+[[ "$(probe_failure_ids "$tmp/diagnostic-failure.log")" == identity ]] || test_fail probe_diagnostic_allowlisted_id
+printf '%s\n' 'RESULT id=private_path status=FAIL code=secret_value' >"$tmp/diagnostic-unknown.log"
+set +e; probe_failure_ids "$tmp/diagnostic-unknown.log" >/dev/null; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail probe_diagnostic_unknown_id_not_rejected
+captured="$(probe_failure_ids "$tmp/diagnostic-failure.log" 2>&1 || true)"
+[[ "$captured" != *untrusted_secret_path* && "$captured" != *private_path* ]] || test_fail probe_diagnostic_leak
+test_pass probe_diagnostics_allowlisted_and_sanitized
+
 cp "$valid_final" "$tmp/final-before-ready.log"
 python3 - "$tmp/final-before-ready.log" <<'PY'
 from pathlib import Path
@@ -713,6 +753,26 @@ set +e; run_mount_device "$tmp/mount-duplicate" >/dev/null; rc=$?; set -e
 grep -Fq 'host_device" != "$service_device' "$tmp/run-identity.sh" || test_fail run_identity_distinct_missing
 grep -Fq 'current_pid" == "$pid' "$tmp/run-identity.sh" || test_fail run_identity_pid_stability_missing
 test_pass run_mount_identity_validation
+
+# Runtime observations are tri-state: a same namespace/mount or residual
+# process is a failure, while a vanished PID or unavailable cgroup is an
+# inconclusive NO-GO.  Neither condition can become a pass.
+extract_marker_block RUNTIME_LIFECYCLE_VERIFIERS_BEGIN RUNTIME_LIFECYCLE_VERIFIERS_END "$tmp/controller.sh" "$tmp/runtime-lifecycle.sh"
+source "$tmp/runtime-lifecycle.sh"
+set +e; verify_runtime_namespaces 99999999; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail runtime_namespace_missing_pid_not_inconclusive
+show_value() { printf '%s\n' '/invalid/../cgroup'; }
+set +e; verify_unit_cgroup_empty synthetic.service; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_malformed_not_inconclusive
+show_value() { return 1; }
+set +e; verify_unit_cgroup_empty synthetic.service; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_query_error_not_inconclusive
+unset -f show_value
+grep -Fq "runtime_namespace_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_namespace_inconclusive_not_reported
+grep -Fq "runtime_run_mount_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_mount_inconclusive_not_reported
+grep -Fq "main_unit_cgroup_verification_inconclusive" "$tmp/controller.sh" || test_fail main_cgroup_inconclusive_not_reported
+grep -Fq "timeout_canary_cgroup_verification_inconclusive" "$tmp/controller.sh" || test_fail timeout_cgroup_inconclusive_not_reported
+test_pass runtime_lifecycle_fail_closed_classification
 
 extract_marker_block SOCKET_SCAN_VALIDATOR_BEGIN SOCKET_SCAN_VALIDATOR_END "$tmp/probe.sh" "$tmp/socket-validator.sh"
 source "$tmp/socket-validator.sh"
