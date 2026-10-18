@@ -35,7 +35,9 @@ extract_marker_block() {
 extract_heredoc CONTROLLER_A "$tmp/controller-a.sh"
 extract_heredoc CONTROLLER_B "$tmp/controller-b.sh"
 cat "$tmp/controller-a.sh" "$tmp/controller-b.sh" >"$tmp/controller.sh"
-extract_heredoc PROBE "$tmp/probe.sh"
+extract_heredoc PROBE_A "$tmp/probe-a.sh"
+extract_heredoc PROBE_B "$tmp/probe-b.sh"
+cat "$tmp/probe-a.sh" "$tmp/probe-b.sh" >"$tmp/probe.sh"
 bash -n "$tmp/controller.sh"
 bash -n "$tmp/probe.sh"
 test_pass embedded_scripts_parse
@@ -467,7 +469,7 @@ for index, line in enumerate(lines):
         block.append(candidate[trim:])
     lengths.append(len("".join(block)))
 
-if len(lengths) != 4 or any(length >= 21000 for length in lengths):
+if len(lengths) != 5 or any(length >= 21000 for length in lengths):
     raise SystemExit(1)
 PY
 test_pass run_expression_limits
@@ -497,7 +499,7 @@ test_pass socket_policy
 # Source the real parser function without installing the controller's EXIT trap.
 extract_marker_block PROBE_LOG_PARSER_BEGIN PROBE_LOG_PARSER_END "$tmp/controller.sh" "$tmp/parser.sh"
 MAX_LOG_BYTES=16384
-EXPECTED_RECORDS=24
+EXPECTED_RECORDS=25
 # shellcheck disable=SC1090
 source "$tmp/parser.sh"
 
@@ -507,13 +509,13 @@ make_valid_log() {
   local ids=(
     identity groups privilege_tools capabilities nonewprivs environment
     descriptors workdir_write outside_write_denied tmp_write_denied
-    vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount
+    vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount run_mount_diagnostic
     network_interfaces routes dns_blocked tcp_blocked https_blocked
     cgroup_memory cgroup_pids cgroup_cpu
   )
   for id in "${ids[@]}"; do printf 'RESULT id=%s status=PASS code=ok\n' "$id" >>"$output"; done
-  printf 'READY status=PASS records=24\n' >>"$output"
-  [[ "$phase" == final ]] && printf 'FINAL status=PASS records=24\n' >>"$output"
+  printf 'READY status=PASS records=25\n' >>"$output"
+  [[ "$phase" == final ]] && printf 'FINAL status=PASS records=25\n' >>"$output"
   chmod 0600 "$output"
 }
 
@@ -573,8 +575,8 @@ test_pass parser_sanitization
 extract_marker_block PROBE_READY_WAITER_BEGIN PROBE_READY_WAITER_END "$tmp/controller.sh" "$tmp/probe-ready-waiter.sh"
 source "$tmp/probe-ready-waiter.sh"
 ready_pass="$tmp/ready-pass.log"; ready_fail="$tmp/ready-fail.log"
-printf 'READY status=PASS records=24\n' >"$ready_pass"
-printf 'READY status=FAIL records=24\n' >"$ready_fail"
+printf 'READY status=PASS records=25\n' >"$ready_pass"
+printf 'READY status=FAIL records=25\n' >"$ready_fail"
 wait_for_probe_ready "$ready_pass" || test_fail ready_pass_not_recognized
 set +e; wait_for_probe_ready "$ready_fail"; rc=$?; set -e
 [[ "$rc" == 1 ]] || test_fail ready_fail_not_recognized
@@ -600,8 +602,8 @@ for invalid_case in contradictory duplicate malformed; do
   invalid_log="$tmp/ready-$invalid_case.log"
   cp "$valid_ready" "$invalid_log"
   case "$invalid_case" in
-    contradictory) printf 'READY status=FAIL records=24\n' >>"$invalid_log" ;;
-    duplicate) printf 'READY status=PASS records=24\n' >>"$invalid_log" ;;
+    contradictory) printf 'READY status=FAIL records=25\n' >>"$invalid_log" ;;
+    duplicate) printf 'READY status=PASS records=25\n' >>"$invalid_log" ;;
     malformed) printf 'untrusted=malformed\n' >>"$invalid_log" ;;
   esac
   wait_for_probe_ready "$invalid_log" || test_fail "raw_waiter_did_not_observe_${invalid_case}_pass"
@@ -754,7 +756,7 @@ PY
 expect_reject "$tmp/final-before-ready.log" final final_before_ready
 
 cp "$valid_ready" "$tmp/ready-early.log"
-sed -i '1iREADY status=PASS records=24' "$tmp/ready-early.log"
+sed -i '1iREADY status=PASS records=25' "$tmp/ready-early.log"
 expect_reject "$tmp/ready-early.log" ready ready_before_results
 
 cp "$valid_ready" "$tmp/result-after-ready.log"
@@ -762,7 +764,7 @@ sed -n '1p' "$valid_ready" >>"$tmp/result-after-ready.log"
 expect_reject "$tmp/result-after-ready.log" ready result_after_ready
 
 cp "$valid_final" "$tmp/after-final.log"
-printf '%s\n' 'READY status=PASS records=24' >>"$tmp/after-final.log"
+printf '%s\n' 'READY status=PASS records=25' >>"$tmp/after-final.log"
 expect_reject "$tmp/after-final.log" final record_after_final
 test_pass parser_marker_order
 
@@ -804,7 +806,7 @@ set +e; classify_https_result 28 true true; rc=$?; set -e; [[ "$rc" == 2 ]] || t
 test_pass network_result_classification
 
 # Run the real orchestration with only shell mocks: no DNS, TCP or HTTPS
-# request is made. A route-query error must stay distinct from an empty table.
+# request is made. A route-query error must prevent TCP/HTTPS classification.
 awk '/^[[:space:]]*check_network\(\) \{/ {inside=1} /^[[:space:]]*check_cgroups\(\)/ {exit} inside {print}' "$tmp/probe.sh" >"$tmp/network-check.sh"
 source "$tmp/network-check.sh"
 network_ok_ids=''; network_bad_ids=''; network_work="$tmp/network-check-work"; mkdir "$network_work"
@@ -812,7 +814,11 @@ WORK="$network_work"
 ok() { network_ok_ids+=" $1"; }
 bad() { network_bad_ids+=" $1:$2"; }
 enumerate_network_interfaces() { return 0; }
-ip() { [[ "${NET_IP6_ERROR:-false}" != true || "$1" != -6 ]] || return 71; }
+ip() {
+  [[ "${NET_IP4_ERROR:-false}" != true || "$1" != -4 ]] || return 70
+  [[ "${NET_IP6_ERROR:-false}" != true || "$1" != -6 ]] || return 71
+  [[ "${NET_ROUTES_PRESENT:-false}" != true ]] || printf '%s\n' route
+}
 getent() { return 0; }
 timeout() {
   local seconds="$1" command="$2"; shift 2
@@ -827,9 +833,18 @@ check_network
 [[ "$network_ok_ids" == *' routes'* && "$network_ok_ids" == *' https_blocked'* && -z "$network_bad_ids" ]] || test_fail network_empty_routes_not_accepted
 NET_IP6_ERROR=true; network_ok_ids=''; network_bad_ids=''
 check_network
-[[ "$network_bad_ids" == *'routes:query_error'* && "$network_bad_ids" == *'https_blocked:inconclusive'* ]] || test_fail network_route_query_error_not_causal
+[[ "$network_bad_ids" == *'routes:ipv6_query_error'* && "$network_bad_ids" == *'tcp_blocked:not_attempted_prerequisite'* && "$network_bad_ids" == *'https_blocked:not_attempted_prerequisite'* ]] || test_fail network_route_query_error_not_causal
+unset NET_IP6_ERROR
+NET_IP4_ERROR=true; network_ok_ids=''; network_bad_ids=''
+check_network
+[[ "$network_bad_ids" == *'routes:ipv4_query_error'* && "$network_bad_ids" == *'https_blocked:not_attempted_prerequisite'* ]] || test_fail network_ipv4_query_error_not_classified
+unset NET_IP4_ERROR
+NET_ROUTES_PRESENT=true; network_ok_ids=''; network_bad_ids=''
+check_network
+[[ "$network_bad_ids" == *'routes:present'* && "$network_bad_ids" == *'tcp_blocked:not_attempted_prerequisite'* ]] || test_fail network_present_route_not_classified
+unset NET_ROUTES_PRESENT
 unset -f check_network enumerate_network_interfaces ip getent timeout ok bad
-unset NET_IP6_ERROR WORK
+unset WORK
 test_pass network_orchestration_fail_closed
 
 # The actual synchronous enumerator must preserve producer and sorter failures.
@@ -900,6 +915,21 @@ set +e; validate_run_mountinfo "$tmp/missing-mountinfo" >/dev/null; rc=$?; set -
 [[ "$rc" == 2 ]] || test_fail run_mount_unavailable_not_inconclusive
 test_pass run_mountinfo_closed_validation
 
+# The diagnostic is strictly informational: even a restrictive known submount
+# is not accepted by the approval validator until an independently reviewed
+# runtime representation exists.
+extract_marker_block RUN_MOUNT_DIAGNOSTIC_BEGIN RUN_MOUNT_DIAGNOSTIC_END "$tmp/probe.sh" "$tmp/run-mount-diagnostic.sh"
+source "$tmp/run-mount-diagnostic.sh"
+[[ "$(diagnose_run_mountinfo "$tmp/mount-valid")" == no_submount ]] || test_fail run_mount_diagnostic_none
+[[ "$(diagnose_run_mountinfo "$tmp/mount-known-inaccessible")" == known_submount_restrictive ]] || test_fail run_mount_diagnostic_known_restrictive
+make_mountinfo "$tmp/mount-known-incompatible" "$valid_run"
+printf '%s\n' '26 25 0:46 /run/systemd/inaccessible/reg /run/docker.sock ro,nosuid,nodev - tmpfs tmpfs ro,size=1024k' >>"$tmp/mount-known-incompatible"
+[[ "$(diagnose_run_mountinfo "$tmp/mount-known-incompatible")" == known_submount_incompatible ]] || test_fail run_mount_diagnostic_known_incompatible
+[[ "$(diagnose_run_mountinfo "$tmp/mount-submount")" == unexpected_submount ]] || test_fail run_mount_diagnostic_unexpected
+set +e; diagnose_run_mountinfo "$tmp/mount-malformed" >/dev/null; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail run_mount_diagnostic_malformed_not_inconclusive
+test_pass run_mount_diagnostic_sanitized
+
 # Validate the system-manager representation semantically and fail closed.
 extract_marker_block RUN_PROPERTY_VALIDATOR_BEGIN RUN_PROPERTY_VALIDATOR_END "$tmp/controller.sh" "$tmp/run-property.sh"
 source "$tmp/run-property.sh"
@@ -965,12 +995,78 @@ show_value() { return 1; }
 set +e; verify_unit_cgroup_empty synthetic.service; rc=$?; set -e
 [[ "$rc" == 2 ]] || test_fail cgroup_query_error_not_inconclusive
 unset -f show_value
+# The observer accepts only a fully parsed transition from populated=1 while
+# active to populated=0 on the same directory identity after timeout.
+cgroup_events_live="$tmp/cgroup.events.live"
+cgroup_events_empty="$tmp/cgroup.events.empty"
+cgroup_events_bad="$tmp/cgroup.events.bad"
+printf '%s\n%s\n' 'populated 1' 'frozen 0' >"$cgroup_events_live"
+printf '%s\n%s\n' 'populated 0' 'frozen 0' >"$cgroup_events_empty"
+printf '%s\n' 'populated unknown' >"$cgroup_events_bad"
+set +e; cgroup_events_populated "$cgroup_events_live"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail cgroup_events_live_not_observed
+cgroup_events_populated "$cgroup_events_empty" || test_fail cgroup_events_empty_not_observed
+set +e; cgroup_events_populated "$cgroup_events_bad"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_events_malformed_not_inconclusive
+set +e; cgroup_events_populated "$tmp/missing-cgroup.events"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_events_missing_not_inconclusive
+awk() { return 74; }
+set +e; cgroup_events_populated "$cgroup_events_empty"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_events_read_error_not_inconclusive
+unset -f awk
+cgroup_proc_root="$tmp/cgroup-proc-root"
+mkdir -p "$cgroup_proc_root/123"
+printf '%s\n' '0::/synthetic' >"$cgroup_proc_root/123/cgroup"
+cgroup_membership_matches 123 /synthetic "$cgroup_proc_root" || test_fail cgroup_membership_valid_rejected
+set +e; cgroup_membership_matches 123 /other "$cgroup_proc_root"; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail cgroup_membership_mismatch_not_rejected
+printf '%s\n%s\n' '0::/synthetic' '0::/other' >"$cgroup_proc_root/123/cgroup"
+set +e; cgroup_membership_matches 123 /synthetic "$cgroup_proc_root"; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_membership_ambiguous_not_inconclusive
+printf '%s\n' '0::/synthetic' >"$cgroup_proc_root/123/cgroup"
+TIMEOUT_UNIT=synthetic.service
+timeout_cgroup_path=''; timeout_cgroup_identity=''
+show_value() { case "$2" in ActiveState) printf '%s\n' active ;; MainPID) printf '%s\n' 123 ;; ControlGroup) printf '%s\n' /synthetic ;; *) return 1 ;; esac; }
+cgroup_directory_identity() { [[ "$1" == /sys/fs/cgroup/synthetic ]] || return 2; printf '%s\n' "${CGROUP_IDENTITY:-9:9:directory}"; }
+cgroup_membership_matches() { [[ "$1:$2" == '123:/synthetic' ]] || return 2; return 0; }
+cgroup_events_populated() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.events ]] || return 2; return "${CGROUP_EVENTS_RC:-1}"; }
+cgroup_procs_is_empty() { [[ "$1" == /sys/fs/cgroup/synthetic/cgroup.procs ]] || return 2; return "${CGROUP_PROCS_RC:-0}"; }
+capture_timeout_cgroup_live || test_fail cgroup_observer_live_capture_rejected
+[[ "$timeout_cgroup_path" == /sys/fs/cgroup/synthetic && "$timeout_cgroup_identity" == '9:9:directory' ]] || test_fail cgroup_observer_identity_not_captured
+CGROUP_EVENTS_RC=0; CGROUP_PROCS_RC=0
+verify_timeout_cgroup_quiescent || test_fail cgroup_observer_quiescent_rejected
+CGROUP_EVENTS_RC=1
+set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
+[[ "$rc" == 1 ]] || test_fail cgroup_observer_residual_not_rejected
+CGROUP_EVENTS_RC=0
+CGROUP_IDENTITY='10:10:directory'
+set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_observer_identity_change_not_inconclusive
+unset CGROUP_IDENTITY
+cgroup_directory_identity() { return 2; }
+set +e; verify_timeout_cgroup_quiescent; rc=$?; set -e
+[[ "$rc" == 2 ]] || test_fail cgroup_observer_disappeared_not_inconclusive
+unset -f show_value cgroup_directory_identity cgroup_membership_matches cgroup_events_populated cgroup_procs_is_empty
+
 grep -Fq "runtime_namespace_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_namespace_inconclusive_not_reported
 grep -Fq "runtime_run_mount_verification_inconclusive" "$tmp/controller.sh" || test_fail runtime_mount_inconclusive_not_reported
 grep -Fq "main_unit_cgroup_verification_inconclusive" "$tmp/controller.sh" || test_fail main_cgroup_inconclusive_not_reported
 grep -Fq "timeout_canary_cgroup_verification_inconclusive" "$tmp/controller.sh" || test_fail timeout_cgroup_inconclusive_not_reported
 ! grep -Fq '[[ ! -s ' "$tmp/runtime-lifecycle.sh" || test_fail cgroup_uses_st_size
 test_pass runtime_lifecycle_fail_closed_classification
+
+# The split probe has a private read-only first fragment. The writer step
+# rechecks ownership and owner marker before a temporary write transition.
+grep -Fq "# PROBE_HEREDOC_PART_A_BEGIN" "$workflow" || test_fail probe_part_a_missing
+grep -Fq "# PROBE_HEREDOC_PART_B_BEGIN" "$workflow" || test_fail probe_part_b_missing
+grep -Fq 'chmod 0400 "$probe_stage"' "$workflow" || test_fail probe_part_a_identity_missing
+grep -Fq 'chmod 0600 "$probe_stage"' "$workflow" || test_fail probe_part_append_write_transition_missing
+grep -Fq 'cat >>"$probe_stage" <<' "$workflow" || test_fail probe_part_append_missing
+probe_part_a_hash="$(sha256sum -- "$tmp/probe-a.sh")" || test_fail probe_part_hash_unavailable
+probe_part_a_hash="${probe_part_a_hash%% *}"
+[[ "$(grep -Fc "EXPECTED_PROBE_PART_A_SHA256='$probe_part_a_hash'" "$workflow")" == 2 ]] || test_fail probe_part_hash_commitment_mismatch
+test_pass probe_source_split_integrity
+
 
 extract_marker_block SOCKET_SCAN_VALIDATOR_BEGIN SOCKET_SCAN_VALIDATOR_END "$tmp/probe.sh" "$tmp/socket-validator.sh"
 source "$tmp/socket-validator.sh"
@@ -1015,7 +1111,8 @@ test_pass private_log_channel
 
 grep -Fq "RuntimeMaxSec=\$runtime" "$tmp/controller.sh" || test_fail runtime_limit
 grep -Fq "Result timeout" "$tmp/controller.sh" || test_fail timeout_result
-grep -Fq 'verify_unit_cgroup_empty "$TIMEOUT_UNIT"' "$tmp/controller.sh" || test_fail timeout_cleanup
+grep -Fq 'capture_timeout_cgroup_live' "$tmp/controller.sh" || test_fail timeout_live_capture
+grep -Fq 'verify_timeout_cgroup_quiescent' "$tmp/controller.sh" || test_fail timeout_quiescent_verification
 grep -Fq "pgrep -u \"\$lab_uid\"" "$tmp/controller.sh" || test_fail process_cleanup
 test_pass timeout_and_cleanup_logic
 

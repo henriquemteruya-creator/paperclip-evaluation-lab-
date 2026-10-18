@@ -56,7 +56,7 @@ jobs:
           readonly MAIN_UNIT='ti0093-vm-preflight.service'
           readonly TIMEOUT_UNIT='ti0093-vm-timeout-canary.service'
           readonly MAX_LOG_BYTES=16384
-          readonly EXPECTED_RECORDS=24
+          readonly EXPECTED_RECORDS=25
 
           failures=()
           main_log=''
@@ -246,7 +246,7 @@ jobs:
             local expected_ids=(
               identity groups privilege_tools capabilities nonewprivs environment
               descriptors workdir_write outside_write_denied tmp_write_denied
-              vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount
+              vartmp_write_denied devshm_write_denied workspace_hidden controller_hidden sockets_hidden run_mount run_mount_diagnostic
               network_interfaces routes dns_blocked tcp_blocked https_blocked
               cgroup_memory cgroup_pids cgroup_cpu
             )
@@ -311,7 +311,7 @@ jobs:
             local -A seen=()
             [[ "$phase" == ready || "$phase" == final ]] || return 2
             # The parser verifies file bounds, line grammar, the complete
-            # 24-record allowlist, cardinality and marker order before this
+            # 25-record allowlist, cardinality and marker order before this
             # helper is allowed to construct any public string.
             parse_probe_log "$file" "$phase" || parser_rc=$?
             [[ "$parser_rc" == 1 ]] || return 2
@@ -385,6 +385,124 @@ jobs:
             [[ "$current_pid" == "$pid" && "$host_device" != "$service_device" ]]
           }
           # RUN_IDENTITY_VALIDATOR_END
+
+          # RUNTIME_LIFECYCLE_VERIFIERS_BEGIN
+          verify_runtime_namespaces() {
+            local pid="$1" host_net service_net host_mnt service_mnt
+            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+            host_net="$(readlink /proc/self/ns/net 2>/dev/null)" || return 2
+            service_net="$(readlink "/proc/$pid/ns/net" 2>/dev/null)" || return 2
+            host_mnt="$(readlink /proc/self/ns/mnt 2>/dev/null)" || return 2
+            service_mnt="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)" || return 2
+            [[ "$host_net" != "$service_net" && "$host_mnt" != "$service_mnt" ]]
+          }
+
+          cgroup_procs_is_empty() {
+            local file="$1" result
+            [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
+            # cgroup v2 pseudo-files may report st_size=0 even with PIDs; read
+            # the stream rather than trusting metadata such as test -s.  awk
+            # makes a read error observable through its process exit status.
+            result="$(LC_ALL=C awk '
+              BEGIN { count=0; invalid=0 }
+              {
+                if ($0 !~ /^[1-9][0-9]*$/) { invalid=1; exit 2 }
+                count++
+                if (count > 64) { invalid=1; exit 2 }
+              }
+              END {
+                if (invalid) exit 2
+                if (count == 0) print "empty"; else print "pids"
+              }
+            ' "$file")" || return 2
+            case "$result" in
+              empty) return 0 ;;
+              pids) return 1 ;;
+              *) return 2 ;;
+            esac
+          }
+
+          verify_unit_cgroup_empty() {
+            local unit="$1" cgroup file
+            cgroup="$(show_value "$unit" ControlGroup)" || return 2
+            [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
+            file="/sys/fs/cgroup$cgroup/cgroup.procs"
+            cgroup_procs_is_empty "$file"
+          }
+
+          # TIMEOUT_CGROUP_OBSERVER_BEGIN
+          timeout_cgroup_path=''
+          timeout_cgroup_identity=''
+          cgroup_events_populated() {
+            local file="$1" result
+            [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
+            result="$(LC_ALL=C awk '
+              BEGIN { populated=""; invalid=0 }
+              NF != 2 { invalid=1; exit 2 }
+              $1 == "populated" { if ($2 !~ /^[01]$/ || populated != "") { invalid=1; exit 2 }; populated=$2; next }
+              $1 == "frozen" && $2 ~ /^[01]$/ { next }
+              { invalid=1; exit 2 }
+              END { if (invalid || populated == "") exit 2; print populated }
+            ' "$file")" || return 2
+            case "$result" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+          }
+
+          cgroup_directory_identity() {
+            local path="$1" metadata
+            [[ -d "$path" && ! -L "$path" ]] || return 2
+            metadata="$(stat -Lc '%d:%i:%F' -- "$path" 2>/dev/null)" || return 2
+            [[ "$metadata" =~ ^[0-9]+:[0-9]+:directory$ ]] || return 2
+            printf '%s\n' "$metadata"
+          }
+
+          cgroup_membership_matches() {
+            local pid="$1" expected_cgroup="$2" proc_root="${3:-/proc}" result
+            [[ "$pid" =~ ^[1-9][0-9]*$ && "$expected_cgroup" == /* && "$expected_cgroup" != *'..'* ]] || return 2
+            [[ -f "$proc_root/$pid/cgroup" && ! -L "$proc_root/$pid/cgroup" && -r "$proc_root/$pid/cgroup" ]] || return 2
+            result="$(awk -F: '$1=="0" && $2=="" { count++; value=$3 } END { if (count != 1 || value == "") exit 2; print value }' "$proc_root/$pid/cgroup")" || return 2
+            [[ "$result" == "$expected_cgroup" ]] || return 1
+          }
+
+          capture_timeout_cgroup_live() {
+            local state pid cgroup path identity populated_rc=0 attempts=0
+            while (( attempts < 30 )); do
+              state="$(show_value "$TIMEOUT_UNIT" ActiveState 2>/dev/null || true)"
+              pid="$(show_value "$TIMEOUT_UNIT" MainPID 2>/dev/null || true)"
+              if [[ "$state" == active && "$pid" =~ ^[1-9][0-9]*$ ]]; then
+                cgroup="$(show_value "$TIMEOUT_UNIT" ControlGroup)" || return 2
+                [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
+                cgroup_membership_matches "$pid" "$cgroup" || return 2
+                path="/sys/fs/cgroup$cgroup"
+                identity="$(cgroup_directory_identity "$path")" || return 2
+                cgroup_events_populated "$path/cgroup.events" || populated_rc=$?
+                [[ "$populated_rc" == 1 ]] || return 2
+                timeout_cgroup_path="$path"
+                timeout_cgroup_identity="$identity"
+                return 0
+              fi
+              [[ "$state" == inactive || "$state" == failed ]] && return 2
+              sleep 0.1
+              (( ++attempts ))
+            done
+            return 2
+          }
+
+          verify_timeout_cgroup_quiescent() {
+            local cgroup path identity populated_rc=0 procs_rc=0
+            [[ -n "$timeout_cgroup_path" && -n "$timeout_cgroup_identity" ]] || return 2
+            cgroup="$(show_value "$TIMEOUT_UNIT" ControlGroup)" || return 2
+            [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
+            path="/sys/fs/cgroup$cgroup"
+            [[ "$path" == "$timeout_cgroup_path" ]] || return 2
+            identity="$(cgroup_directory_identity "$path")" || return 2
+            [[ "$identity" == "$timeout_cgroup_identity" ]] || return 2
+            cgroup_events_populated "$path/cgroup.events" || populated_rc=$?
+            [[ "$populated_rc" == 0 ]] || { [[ "$populated_rc" == 1 ]] && return 1; return 2; }
+            cgroup_procs_is_empty "$path/cgroup.procs" || procs_rc=$?
+            [[ "$procs_rc" == 0 ]] || { [[ "$procs_rc" == 1 ]] && return 1; return 2; }
+          }
+          # TIMEOUT_CGROUP_OBSERVER_END
+          # RUNTIME_LIFECYCLE_VERIFIERS_END
 
           CONTROLLER_A
           owner_marker="$stage/.owner"
@@ -471,51 +589,6 @@ jobs:
               --setenv='LC_ALL=C'
             )
           }
-
-          # RUNTIME_LIFECYCLE_VERIFIERS_BEGIN
-          verify_runtime_namespaces() {
-            local pid="$1" host_net service_net host_mnt service_mnt
-            [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
-            host_net="$(readlink /proc/self/ns/net 2>/dev/null)" || return 2
-            service_net="$(readlink "/proc/$pid/ns/net" 2>/dev/null)" || return 2
-            host_mnt="$(readlink /proc/self/ns/mnt 2>/dev/null)" || return 2
-            service_mnt="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)" || return 2
-            [[ "$host_net" != "$service_net" && "$host_mnt" != "$service_mnt" ]]
-          }
-
-          cgroup_procs_is_empty() {
-            local file="$1" result
-            [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
-            # cgroup v2 pseudo-files may report st_size=0 even with PIDs; read
-            # the stream rather than trusting metadata such as test -s.  awk
-            # makes a read error observable through its process exit status.
-            result="$(LC_ALL=C awk '
-              BEGIN { count=0; invalid=0 }
-              {
-                if ($0 !~ /^[1-9][0-9]*$/) { invalid=1; exit 2 }
-                count++
-                if (count > 64) { invalid=1; exit 2 }
-              }
-              END {
-                if (invalid) exit 2
-                if (count == 0) print "empty"; else print "pids"
-              }
-            ' "$file")" || return 2
-            case "$result" in
-              empty) return 0 ;;
-              pids) return 1 ;;
-              *) return 2 ;;
-            esac
-          }
-
-          verify_unit_cgroup_empty() {
-            local unit="$1" cgroup file
-            cgroup="$(show_value "$unit" ControlGroup)" || return 2
-            [[ "$cgroup" == /* && "$cgroup" != *'..'* ]] || return 2
-            file="/sys/fs/cgroup$cgroup/cgroup.procs"
-            cgroup_procs_is_empty "$file"
-          }
-          # RUNTIME_LIFECYCLE_VERIFIERS_END
 
           write_summary() {
             local verdict="$1" summary_path="${SUMMARY_PATH:-}"
@@ -748,13 +821,19 @@ jobs:
             fi
 
             build_service_args "$timeout_log" 3s
-            local timeout_start_rc=0 timeout_wait_rc=0
+            local timeout_start_rc=0 timeout_wait_rc=0 timeout_cgroup_capture_rc=0
             systemd-run --system --quiet --unit="$TIMEOUT_UNIT" --description="$owner_tag" --service-type=exec "${SERVICE_ARGS[@]}" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C LC_ALL=C /usr/bin/sleep 30 >"$PRIVATE_ROOT/controller-timeout-start.out" 2>&1 || timeout_start_rc=$?
             if (( timeout_start_rc != 0 )); then
               if [[ "$(show_value "$TIMEOUT_UNIT" Description 2>/dev/null || true)" == "$owner_tag" ]]; then timeout_owned=true; fi
               fail 'timeout_canary_start_failed'
             else
               timeout_owned=true
+              capture_timeout_cgroup_live || timeout_cgroup_capture_rc=$?
+              if (( timeout_cgroup_capture_rc == 0 )); then
+                pass 'timeout_canary_cgroup_live_observed'
+              else
+                fail 'timeout_canary_cgroup_live_evidence_unavailable'
+              fi
               wait_for_unit_terminal "$TIMEOUT_UNIT" || timeout_wait_rc=$?
               case "$timeout_wait_rc" in
                 0) ;;
@@ -764,7 +843,11 @@ jobs:
               show_exact "$TIMEOUT_UNIT" Result timeout 'timeout_canary_result'
               show_exact "$TIMEOUT_UNIT" MainPID 0 'timeout_canary_no_main_pid'
               cgroup_rc=0
-              verify_unit_cgroup_empty "$TIMEOUT_UNIT" || cgroup_rc=$?
+              if (( timeout_cgroup_capture_rc == 0 )); then
+                verify_timeout_cgroup_quiescent || cgroup_rc=$?
+              else
+                cgroup_rc=2
+              fi
               case "$cgroup_rc" in
                 0) pass 'timeout_canary_cgroup_empty' ;;
                 1) fail 'timeout_canary_cgroup_has_processes' ;;
@@ -811,6 +894,186 @@ jobs:
           [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):500" ]] || exit 86
           trap - EXIT
 
+      - name: Stage benign probe source part A
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          stage="${RUNNER_TEMP:?}/ti0093-vm-preflight-source"
+          controller_stage="$stage/controller.sh"
+          probe_stage="$stage/probe.sh"
+          owner_marker="$stage/.owner"
+          expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"
+          readonly EXPECTED_PROBE_PART_A_SHA256='113d392c896a8d85edca93f49b381ba2147ea4811fb07a7e7aec36002759237c'
+          stage_owned=false
+          cleanup_probe_source_on_error() {
+            local rc=$?
+            if (( rc != 0 )) && [[ "$stage_owned" == true ]]; then
+              if ! rm -rf -- "$stage" >/dev/null 2>&1 || [[ -e "$stage" || -L "$stage" ]]; then trap - EXIT; exit 86; fi
+            fi
+            return "$rc"
+          }
+          trap cleanup_probe_source_on_error EXIT
+          [[ -d "$stage" && ! -L "$stage" && -f "$controller_stage" && ! -L "$controller_stage" && -f "$owner_marker" && ! -L "$owner_marker" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$stage")" == "$(id -u):$(id -g):700" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):500" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$owner_marker")" == "$(id -u):$(id -g):400" ]] || exit 86
+          [[ "$(<"$owner_marker")" == "$expected_owner" && ! -e "$probe_stage" && ! -L "$probe_stage" ]] || exit 86
+          stage_owned=true
+
+          # PROBE_HEREDOC_PART_A_BEGIN
+          cat >"$probe_stage" <<'PROBE_A'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          umask 077
+
+          readonly EXPECTED_USER='ti0093probe'
+          readonly EXPECTED_GROUP='ti0093probe'
+          readonly WORK='/var/lib/ti0093-vm-preflight/work'
+          readonly OUTSIDE='/var/lib/ti0093-vm-preflight/outside-writable-by-uid'
+          readonly HOST_SENTINEL='/home/runner/work/.ti0093-vm-preflight-sentinel'
+          readonly PRIVATE_ROOT='/run/ti0093-vm-preflight'
+          readonly EXPECTED_RECORDS=25
+          release_file="${1:-}"
+          records=0
+          failures=0
+
+          emit() {
+            local id="$1" status="$2" code="$3"
+            [[ "$id" =~ ^[a-z0-9_]+$ && "$status" =~ ^(PASS|FAIL)$ && "$code" =~ ^[a-z0-9_]+$ ]] || exit 90
+            printf 'RESULT id=%s status=%s code=%s\n' "$id" "$status" "$code"
+            (( ++records ))
+            [[ "$status" == PASS ]] || (( ++failures ))
+          }
+          ok() { emit "$1" PASS ok; }
+          bad() { emit "$1" FAIL "$2"; }
+
+          check_identity() {
+            [[ "$(id -u)" != 0 && "$(id -un)" == "$EXPECTED_USER" && "$(id -gn)" == "$EXPECTED_GROUP" ]] && ok identity || bad identity mismatch
+          }
+          check_groups() {
+            local groups
+            groups="$(id -Gn 2>/dev/null)" || { bad groups query_error; return; }
+            [[ "$(wc -w <<<"$groups")" == 1 && "$groups" == "$EXPECTED_GROUP" ]] && ok groups || bad groups unexpected
+          }
+          # PRIVILEGE_TOOL_VALIDATOR_BEGIN
+          check_privilege_tools() {
+            local tool dir path;local -a path_dirs
+            [[ -n "$PATH" && "$PATH" != :* && "$PATH" != *: && "$PATH" != *::* ]]||{ bad privilege_tools path_invalid; return; }
+            IFS=: read -ra path_dirs <<<"$PATH"
+            for tool in sudo su pkexec doas; do for dir in "${path_dirs[@]}"; do
+              [[ "$dir" == /* && "$dir" != *..* && -d "$dir" ]]||{ bad privilege_tools path_invalid; return; }
+              path="$dir/$tool"; [[ -L "$path" ]]&&{ bad privilege_tools symlink; return; }
+              [[ -e "$path" ]]||continue
+              [[ -f "$path" && ! -x "$path" ]]||{ bad privilege_tools executable; return; }
+            done; done
+            ok privilege_tools
+          }
+          # PRIVILEGE_TOOL_VALIDATOR_END
+          check_capabilities() {
+            local value key
+            for key in CapInh CapPrm CapEff CapBnd CapAmb; do
+              value="$(awk -v k="$key:" '$1==k {print $2}' /proc/self/status 2>/dev/null)" || { bad capabilities read_error; return; }
+              [[ "$value" == 0000000000000000 ]] || { bad capabilities nonzero; return; }
+            done
+            ok capabilities
+          }
+          check_nonewprivs() {
+            [[ "$(awk '$1=="NoNewPrivs:" {print $2}' /proc/self/status 2>/dev/null)" == 1 ]] && ok nonewprivs || bad nonewprivs disabled
+          }
+          check_environment() {
+            local n l s c=0
+            s="$(env)"&&[[ -n "$s" ]]||{ bad environment inspection_error; return; }
+            while IFS= read -r l; do
+              n="${l%%=*}"; (( ++c<=12 ))||{ bad environment unexpected; return; }
+              [[ "$l" == "$n="* && "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]||{ bad environment malformed; return; }
+              case "$n" in PATH|LANG|LC_ALL|SHELL|INVOCATION_ID|SYSTEMD_EXEC_PID|PWD|SHLVL|_) ;; *) bad environment unexpected; return ;; esac
+              [[ "$n" =~ (GITHUB|ACTIONS|TOKEN|SECRET|CREDENTIAL|PASSWORD|PROXY|AWS|AZURE|GOOGLE|OPENAI|ANTHROPIC) ]]&&{ bad environment sensitive; return; }
+            done <<<"$s"
+            ok environment
+          }
+          # FD_VALIDATOR_BEGIN
+          validate_descriptor_snapshot() {
+            local fd_root="$1" script_path="$2" fd number metadata target
+            local numbers='' stdout_identity='' stderr_identity='' script_identity=''
+            [[ -d "$fd_root" && -f "$script_path" && ! -L "$script_path" ]] || return 2
+            for fd in "$fd_root"/[0-9]*; do
+              [[ -e "$fd" || -L "$fd" ]] || continue
+              number="${fd##*/}"
+              [[ "$number" =~ ^[0-9]+$ ]] || return 2
+              numbers+=" $number"
+            done
+            [[ "$numbers" == ' 0 1 2 255' ]] || return 1
+
+            target="$(readlink "$fd_root/0" 2>/dev/null)" || return 2
+            metadata="$(stat -Lc '%F' "$fd_root/0" 2>/dev/null)" || return 2
+            [[ "$target" == /dev/null && "$metadata" == 'character special file' ]] || return 1
+
+            metadata="$(stat -Lc '%f:%d:%i' "$fd_root/1" 2>/dev/null)" || return 2
+            [[ "${metadata%%:*}" =~ ^8[0-9a-f]{3}$ ]] || return 1
+            stdout_identity="${metadata#*:}"
+            metadata="$(stat -Lc '%f:%d:%i' "$fd_root/2" 2>/dev/null)" || return 2
+            [[ "${metadata%%:*}" =~ ^8[0-9a-f]{3}$ ]] || return 1
+            stderr_identity="${metadata#*:}"
+            [[ "$stdout_identity" == "$stderr_identity" ]] || return 1
+
+            metadata="$(stat -Lc '%f:%d:%i' "$fd_root/255" 2>/dev/null)" || return 2
+            [[ "${metadata%%:*}" =~ ^8[0-9a-f]{3}$ ]] || return 1
+            script_identity="$(stat -Lc '%f:%d:%i' "$script_path" 2>/dev/null)" || return 2
+            [[ "$metadata" == "$script_identity" ]] || return 1
+            return 0
+          }
+          # FD_VALIDATOR_END
+
+          check_descriptors() {
+            local rc=0
+            validate_descriptor_snapshot "/proc/$$/fd" "$0" || rc=$?
+            case "$rc" in
+              0) ok descriptors ;;
+              1) bad descriptors unexpected ;;
+              *) bad descriptors inspection_error ;;
+            esac
+          }
+          check_filesystem() {
+            if printf x >"$WORK/allowed" 2>/dev/null && rm -f "$WORK/allowed"; then ok workdir_write; else bad workdir_write denied; fi
+            if ( printf x >"$OUTSIDE/denied" ) 2>/dev/null; then rm -f "$OUTSIDE/denied"; bad outside_write_denied writable; else ok outside_write_denied; fi
+            if ( printf x >/tmp/ti0093-denied ) 2>/dev/null; then rm -f /tmp/ti0093-denied; bad tmp_write_denied writable; else ok tmp_write_denied; fi
+            if ( printf x >/var/tmp/ti0093-denied ) 2>/dev/null; then rm -f /var/tmp/ti0093-denied; bad vartmp_write_denied writable; else ok vartmp_write_denied; fi
+            if ( printf x >/dev/shm/ti0093-denied ) 2>/dev/null; then rm -f /dev/shm/ti0093-denied; bad devshm_write_denied writable; else ok devshm_write_denied; fi
+            if [[ ! -r "$HOST_SENTINEL" ]] && ! ls /home/runner/work >/dev/null 2>&1; then ok workspace_hidden; else bad workspace_hidden visible; fi
+            if [[ ! -e "$PRIVATE_ROOT" ]] && ! ls "$PRIVATE_ROOT" >/dev/null 2>&1; then ok controller_hidden; else bad controller_hidden visible; fi
+          }
+          # SOCKET_SCAN_VALIDATOR_BEGIN
+          validate_socket_scan() {
+            local rc="$1" found="$2"
+            (( rc == 0 )) || return 2
+            [[ -z "$found" ]] || return 1
+            return 0
+          }
+          # SOCKET_SCAN_VALIDATOR_END
+          check_sockets() {
+            local socket_path root found rc validation_rc
+            local paths=(/run/docker.sock /var/run/docker.sock /run/systemd/private /var/run/systemd/private /run/dbus/system_bus_socket /var/run/dbus/system_bus_socket /run/containerd/containerd.sock /run/snapd.socket /run/udev/control)
+            for socket_path in "${paths[@]}"; do
+              if [[ -e "$socket_path" || -S "$socket_path" ]]; then bad sockets_hidden visible; return; fi
+            done
+            for root in /run /dev /tmp /var/tmp; do
+              found=''; rc=0
+              found="$(find -L "$root" -xdev -type s -print -quit 2>/dev/null)" || rc=$?
+              validation_rc=0; validate_socket_scan "$rc" "$found" || validation_rc=$?
+              case "$validation_rc" in 0) ;; 1) bad sockets_hidden visible; return ;; *) bad sockets_hidden inspection_error; return ;; esac
+            done
+            ok sockets_hidden
+          }
+          PROBE_A
+          # PROBE_HEREDOC_PART_A_END
+          chmod 0400 "$probe_stage"
+          [[ "$(stat -Lc '%u:%g:%a:%F' "$probe_stage")" == "$(id -u):$(id -g):400:regular file" ]] || exit 86
+          probe_part_a_hash="$(sha256sum -- "$probe_stage" 2>/dev/null)" || exit 86
+          [[ "${probe_part_a_hash%% *}" == "$EXPECTED_PROBE_PART_A_SHA256" ]] || exit 86
+          trap - EXIT
+
       - name: Stage benign probe and install reviewed scripts
         shell: bash
         run: |
@@ -823,6 +1086,7 @@ jobs:
           owner_marker="$stage/.owner"
           manifest="$stage/.installed-manifest"
           expected_owner="${GITHUB_RUN_ID:-invalid}:${GITHUB_RUN_ATTEMPT:-invalid}:${GITHUB_SHA:-invalid}"
+          readonly EXPECTED_PROBE_PART_A_SHA256='113d392c896a8d85edca93f49b381ba2147ea4811fb07a7e7aec36002759237c'
           controller_installed='/usr/local/sbin/ti0093-vm-preflight-controller'
           probe_installed='/usr/local/sbin/ti0093-vm-preflight-probe'
           controller_installed_by_run=false
@@ -957,154 +1221,20 @@ jobs:
           }
           # PARTIAL_INSTALL_CLEANUP_END
           trap cleanup_partial_install EXIT
-          [[ -f "$controller_stage" && ! -L "$controller_stage" ]] || exit 86
+          [[ -d "$stage" && ! -L "$stage" && -f "$controller_stage" && ! -L "$controller_stage" && -f "$probe_stage" && ! -L "$probe_stage" && -f "$owner_marker" && ! -L "$owner_marker" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$stage")" == "$(id -u):$(id -g):700" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$controller_stage")" == "$(id -u):$(id -g):500" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$probe_stage")" == "$(id -u):$(id -g):400" ]] || exit 86
+          [[ "$(stat -Lc '%u:%g:%a' "$owner_marker")" == "$(id -u):$(id -g):400" && "$(<"$owner_marker")" == "$expected_owner" ]] || exit 86
+          probe_part_a_hash="$(sha256sum -- "$probe_stage" 2>/dev/null)" || exit 86
+          [[ "${probe_part_a_hash%% *}" == "$EXPECTED_PROBE_PART_A_SHA256" ]] || exit 86
           [[ ! -e "$controller_installed" && ! -L "$controller_installed" ]] || exit 86
           [[ ! -e "$probe_installed" && ! -L "$probe_installed" ]] || exit 86
 
-          # PROBE_HEREDOC_BEGIN
-          cat >"$probe_stage" <<'PROBE'
-          #!/usr/bin/env bash
-          set -uo pipefail
-          umask 077
-
-          readonly EXPECTED_USER='ti0093probe'
-          readonly EXPECTED_GROUP='ti0093probe'
-          readonly WORK='/var/lib/ti0093-vm-preflight/work'
-          readonly OUTSIDE='/var/lib/ti0093-vm-preflight/outside-writable-by-uid'
-          readonly HOST_SENTINEL='/home/runner/work/.ti0093-vm-preflight-sentinel'
-          readonly PRIVATE_ROOT='/run/ti0093-vm-preflight'
-          readonly EXPECTED_RECORDS=24
-          release_file="${1:-}"
-          records=0
-          failures=0
-
-          emit() {
-            local id="$1" status="$2" code="$3"
-            [[ "$id" =~ ^[a-z0-9_]+$ && "$status" =~ ^(PASS|FAIL)$ && "$code" =~ ^[a-z0-9_]+$ ]] || exit 90
-            printf 'RESULT id=%s status=%s code=%s\n' "$id" "$status" "$code"
-            (( ++records ))
-            [[ "$status" == PASS ]] || (( ++failures ))
-          }
-          ok() { emit "$1" PASS ok; }
-          bad() { emit "$1" FAIL "$2"; }
-
-          check_identity() {
-            [[ "$(id -u)" != 0 && "$(id -un)" == "$EXPECTED_USER" && "$(id -gn)" == "$EXPECTED_GROUP" ]] && ok identity || bad identity mismatch
-          }
-          check_groups() {
-            local groups
-            groups="$(id -Gn 2>/dev/null)" || { bad groups query_error; return; }
-            [[ "$(wc -w <<<"$groups")" == 1 && "$groups" == "$EXPECTED_GROUP" ]] && ok groups || bad groups unexpected
-          }
-          # PRIVILEGE_TOOL_VALIDATOR_BEGIN
-          check_privilege_tools() {
-            local tool dir path;local -a path_dirs
-            [[ -n "$PATH" && "$PATH" != :* && "$PATH" != *: && "$PATH" != *::* ]]||{ bad privilege_tools path_invalid; return; }
-            IFS=: read -ra path_dirs <<<"$PATH"
-            for tool in sudo su pkexec doas; do for dir in "${path_dirs[@]}"; do
-              [[ "$dir" == /* && "$dir" != *..* && -d "$dir" ]]||{ bad privilege_tools path_invalid; return; }
-              path="$dir/$tool"; [[ -L "$path" ]]&&{ bad privilege_tools symlink; return; }
-              [[ -e "$path" ]]||continue
-              [[ -f "$path" && ! -x "$path" ]]||{ bad privilege_tools executable; return; }
-            done; done
-            ok privilege_tools
-          }
-          # PRIVILEGE_TOOL_VALIDATOR_END
-          check_capabilities() {
-            local value key
-            for key in CapInh CapPrm CapEff CapBnd CapAmb; do
-              value="$(awk -v k="$key:" '$1==k {print $2}' /proc/self/status 2>/dev/null)" || { bad capabilities read_error; return; }
-              [[ "$value" == 0000000000000000 ]] || { bad capabilities nonzero; return; }
-            done
-            ok capabilities
-          }
-          check_nonewprivs() {
-            [[ "$(awk '$1=="NoNewPrivs:" {print $2}' /proc/self/status 2>/dev/null)" == 1 ]] && ok nonewprivs || bad nonewprivs disabled
-          }
-          check_environment() {
-            local n l s c=0
-            s="$(env)"&&[[ -n "$s" ]]||{ bad environment inspection_error; return; }
-            while IFS= read -r l; do
-              n="${l%%=*}"; (( ++c<=12 ))||{ bad environment unexpected; return; }
-              [[ "$l" == "$n="* && "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]||{ bad environment malformed; return; }
-              case "$n" in PATH|LANG|LC_ALL|SHELL|INVOCATION_ID|SYSTEMD_EXEC_PID|PWD|SHLVL|_) ;; *) bad environment unexpected; return ;; esac
-              [[ "$n" =~ (GITHUB|ACTIONS|TOKEN|SECRET|CREDENTIAL|PASSWORD|PROXY|AWS|AZURE|GOOGLE|OPENAI|ANTHROPIC) ]]&&{ bad environment sensitive; return; }
-            done <<<"$s"
-            ok environment
-          }
-          # FD_VALIDATOR_BEGIN
-          validate_descriptor_snapshot() {
-            local fd_root="$1" script_path="$2" fd number metadata target
-            local numbers='' stdout_identity='' stderr_identity='' script_identity=''
-            [[ -d "$fd_root" && -f "$script_path" && ! -L "$script_path" ]] || return 2
-            for fd in "$fd_root"/[0-9]*; do
-              [[ -e "$fd" || -L "$fd" ]] || continue
-              number="${fd##*/}"
-              [[ "$number" =~ ^[0-9]+$ ]] || return 2
-              numbers+=" $number"
-            done
-            [[ "$numbers" == ' 0 1 2 255' ]] || return 1
-
-            target="$(readlink "$fd_root/0" 2>/dev/null)" || return 2
-            metadata="$(stat -Lc '%F' "$fd_root/0" 2>/dev/null)" || return 2
-            [[ "$target" == /dev/null && "$metadata" == 'character special file' ]] || return 1
-
-            metadata="$(stat -Lc '%f:%d:%i' "$fd_root/1" 2>/dev/null)" || return 2
-            [[ "${metadata%%:*}" =~ ^8[0-9a-f]{3}$ ]] || return 1
-            stdout_identity="${metadata#*:}"
-            metadata="$(stat -Lc '%f:%d:%i' "$fd_root/2" 2>/dev/null)" || return 2
-            [[ "${metadata%%:*}" =~ ^8[0-9a-f]{3}$ ]] || return 1
-            stderr_identity="${metadata#*:}"
-            [[ "$stdout_identity" == "$stderr_identity" ]] || return 1
-
-            metadata="$(stat -Lc '%f:%d:%i' "$fd_root/255" 2>/dev/null)" || return 2
-            [[ "${metadata%%:*}" =~ ^8[0-9a-f]{3}$ ]] || return 1
-            script_identity="$(stat -Lc '%f:%d:%i' "$script_path" 2>/dev/null)" || return 2
-            [[ "$metadata" == "$script_identity" ]] || return 1
-            return 0
-          }
-          # FD_VALIDATOR_END
-
-          check_descriptors() {
-            local rc=0
-            validate_descriptor_snapshot "/proc/$$/fd" "$0" || rc=$?
-            case "$rc" in
-              0) ok descriptors ;;
-              1) bad descriptors unexpected ;;
-              *) bad descriptors inspection_error ;;
-            esac
-          }
-          check_filesystem() {
-            if printf x >"$WORK/allowed" 2>/dev/null && rm -f "$WORK/allowed"; then ok workdir_write; else bad workdir_write denied; fi
-            if ( printf x >"$OUTSIDE/denied" ) 2>/dev/null; then rm -f "$OUTSIDE/denied"; bad outside_write_denied writable; else ok outside_write_denied; fi
-            if ( printf x >/tmp/ti0093-denied ) 2>/dev/null; then rm -f /tmp/ti0093-denied; bad tmp_write_denied writable; else ok tmp_write_denied; fi
-            if ( printf x >/var/tmp/ti0093-denied ) 2>/dev/null; then rm -f /var/tmp/ti0093-denied; bad vartmp_write_denied writable; else ok vartmp_write_denied; fi
-            if ( printf x >/dev/shm/ti0093-denied ) 2>/dev/null; then rm -f /dev/shm/ti0093-denied; bad devshm_write_denied writable; else ok devshm_write_denied; fi
-            if [[ ! -r "$HOST_SENTINEL" ]] && ! ls /home/runner/work >/dev/null 2>&1; then ok workspace_hidden; else bad workspace_hidden visible; fi
-            if [[ ! -e "$PRIVATE_ROOT" ]] && ! ls "$PRIVATE_ROOT" >/dev/null 2>&1; then ok controller_hidden; else bad controller_hidden visible; fi
-          }
-          # SOCKET_SCAN_VALIDATOR_BEGIN
-          validate_socket_scan() {
-            local rc="$1" found="$2"
-            (( rc == 0 )) || return 2
-            [[ -z "$found" ]] || return 1
-            return 0
-          }
-          # SOCKET_SCAN_VALIDATOR_END
-          check_sockets() {
-            local socket_path root found rc validation_rc
-            local paths=(/run/docker.sock /var/run/docker.sock /run/systemd/private /var/run/systemd/private /run/dbus/system_bus_socket /var/run/dbus/system_bus_socket /run/containerd/containerd.sock /run/snapd.socket /run/udev/control)
-            for socket_path in "${paths[@]}"; do
-              if [[ -e "$socket_path" || -S "$socket_path" ]]; then bad sockets_hidden visible; return; fi
-            done
-            for root in /run /dev /tmp /var/tmp; do
-              found=''; rc=0
-              found="$(find -L "$root" -xdev -type s -print -quit 2>/dev/null)" || rc=$?
-              validation_rc=0; validate_socket_scan "$rc" "$found" || validation_rc=$?
-              case "$validation_rc" in 0) ;; 1) bad sockets_hidden visible; return ;; *) bad sockets_hidden inspection_error; return ;; esac
-            done
-            ok sockets_hidden
-          }
+          chmod 0600 "$probe_stage"
+          [[ "$(stat -Lc '%u:%g:%a' "$probe_stage")" == "$(id -u):$(id -g):600" ]] || exit 86
+          # PROBE_HEREDOC_PART_B_BEGIN
+          cat >>"$probe_stage" <<'PROBE_B'
           # RUN_MOUNT_VALIDATOR_BEGIN
           validate_run_mountinfo() {
             local file="$1"
@@ -1141,6 +1271,39 @@ jobs:
             ' "$file"
           }
           # RUN_MOUNT_VALIDATOR_END
+          # RUN_MOUNT_DIAGNOSTIC_BEGIN
+          diagnose_run_mountinfo() {
+            local file="$1"
+            [[ -f "$file" && ! -L "$file" && -r "$file" ]] || return 2
+            awk '
+              function has(optlist, wanted, a, n, i) {
+                n=split(optlist,a,",")
+                for (i=1;i<=n;i++) if (a[i]==wanted) return 1
+                return 0
+              }
+              function known(path) {
+                return path=="/run/docker.sock" || path=="/run/systemd/private" || path=="/run/dbus/system_bus_socket" || path=="/run/containerd/containerd.sock" || path=="/run/snapd.socket" || path=="/run/udev/control"
+              }
+              BEGIN { bad=0; total=0; unknown=0; incompatible=0; delete seen }
+              {
+                sep=0
+                for (i=7;i<=NF;i++) if ($i=="-") {sep=i; break}
+                if (NF<10 || sep==0 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+:[0-9]+$/) {bad=1; next}
+                if ($5 !~ /^\/run\//) next
+                total++
+                if (!known($5)) {unknown=1; next}
+                if (++seen[$5] != 1 || sep != 7 || $(sep+1) != "tmpfs" || $(sep+2) != "tmpfs" || !has($6,"ro") || !has($6,"nosuid") || !has($6,"nodev") || !has($6,"noexec") || has($6,"rw")) incompatible=1
+              }
+              END {
+                if (bad) exit 2
+                if (total==0) print "no_submount"
+                else if (unknown) print "unexpected_submount"
+                else if (incompatible) print "known_submount_incompatible"
+                else print "known_submount_restrictive"
+              }
+            ' "$file"
+          }
+          # RUN_MOUNT_DIAGNOSTIC_END
           check_run_mount() {
             local device rc=0
             device="$(validate_run_mountinfo /proc/self/mountinfo)" || rc=$?
@@ -1148,6 +1311,15 @@ jobs:
               0) [[ "$device" =~ ^[0-9]+:[0-9]+$ ]] && ok run_mount || bad run_mount parser_error ;;
               1) bad run_mount mismatch ;;
               *) bad run_mount inspection_error ;;
+            esac
+          }
+          check_run_mount_diagnostic() {
+            local observation rc=0
+            observation="$(diagnose_run_mountinfo /proc/self/mountinfo)" || rc=$?
+            case "$rc:$observation" in
+              0:no_submount) ok run_mount_diagnostic ;;
+              0:known_submount_restrictive|0:known_submount_incompatible|0:unexpected_submount) bad run_mount_diagnostic "$observation" ;;
+              *) bad run_mount_diagnostic inspection_error ;;
             esac
           }
           # INTERFACE_ENUMERATOR_BEGIN
@@ -1190,13 +1362,27 @@ jobs:
           }
           # NETWORK_CLASSIFIERS_END
           check_network() {
-            local routes4 routes6 dns_rc=0 tcp_rc=0 https_rc=0 rc=0
-            local routes_blocked=false tcp_was_blocked=false
+            local routes4='' routes6='' dns_rc=0 tcp_rc=0 https_rc=0 route4_rc=0 route6_rc=0 rc=0
+            local routes_blocked=false tcp_was_blocked=false ip_available=false
             rc=0; enumerate_network_interfaces /sys/class/net "$WORK" || rc=$?
             case "$rc" in 0) ok network_interfaces ;; 1) bad network_interfaces unexpected ;; *) bad network_interfaces inspection_error ;; esac
-            if ! routes4="$(ip -4 route show 2>/dev/null)" || ! routes6="$(ip -6 route show 2>/dev/null)"; then
-              bad routes query_error
-            elif [[ -z "$routes4" && -z "$routes6" ]]; then ok routes; routes_blocked=true; else bad routes external; fi
+            if ! command -v ip >/dev/null 2>&1; then
+              bad routes tool_unavailable
+            else
+              ip_available=true
+              routes4="$(ip -4 route show 2>/dev/null)" || route4_rc=$?
+              routes6="$(ip -6 route show 2>/dev/null)" || route6_rc=$?
+            fi
+            if [[ "$ip_available" == true ]] && (( route4_rc != 0 )); then
+              bad routes ipv4_query_error
+            elif [[ "$ip_available" == true ]] && (( route6_rc != 0 )); then
+              bad routes ipv6_query_error
+            elif [[ "$ip_available" == true && -z "$routes4" && -z "$routes6" ]]; then
+              ok routes
+              routes_blocked=true
+            elif [[ "$ip_available" == true ]]; then
+              bad routes present
+            fi
 
             if ! command -v getent >/dev/null 2>&1 || ! timeout 2 getent hosts localhost >/dev/null 2>&1; then
               bad dns_blocked tool_error
@@ -1204,6 +1390,13 @@ jobs:
               timeout 3 getent ahosts example.com >/dev/null 2>&1 || dns_rc=$?
               rc=0; classify_dns_result "$dns_rc" || rc=$?
               case "$rc" in 0) ok dns_blocked ;; 1) bad dns_blocked resolved ;; *) bad dns_blocked inconclusive ;; esac
+            fi
+
+            if [[ "$routes_blocked" != true ]]; then
+              bad tcp_blocked not_attempted_prerequisite
+              bad https_blocked not_attempted_prerequisite
+              rm -f -- "$WORK/tcp.error" "$WORK/https.error"
+              return
             fi
 
             : >"$WORK/tcp.error"
@@ -1242,6 +1435,7 @@ jobs:
           check_filesystem
           check_sockets
           check_run_mount
+          check_run_mount_diagnostic
           check_network
           check_cgroups
 
@@ -1263,8 +1457,8 @@ jobs:
             exit 93
           fi
           printf 'FINAL status=PASS records=%s\n' "$records"
-          PROBE
-          # PROBE_HEREDOC_END
+          PROBE_B
+          # PROBE_HEREDOC_PART_B_END
 
           chmod 0500 "$probe_stage"
           bash -n "$controller_stage"

@@ -161,8 +161,9 @@ The controller invokes the system manager explicitly with
   the private systemd manager socket, system D-Bus, containerd, snapd and udev;
 - `MemoryMax=256M`, `CPUQuota=50%`, `TasksMax=64` and
   `RuntimeMaxSec=45s`;
-- explicit minimal environment and removal of credential, token, proxy and
-  GitHub file-command names;
+- explicit minimal environment: the probe and timeout canary are invoked through
+  `env -i` with only fixed `PATH`, `LANG` and `LC_ALL`; credential, token,
+  proxy and GitHub file-command names are also removed by systemd;
 - stdin from `/dev/null`; stdout/stderr appended to a pre-created root-owned
   mode `0600` file.
 
@@ -185,14 +186,19 @@ The benign service checks effective behavior, not only declared properties:
 9. a unique `/run` tmpfs mount with expected identity, filesystem, mount-level
    `ro,nosuid,nodev,noexec`, no propagation/submount and an observable 1 MiB
    size; the controller also requires a distinct device from the host `/run`
-   and validates the system manager's effective `TemporaryFileSystem` value;
+   and validates the system manager's effective `TemporaryFileSystem` value.
+   A separate sanitized diagnostic classifies no submount, known restrictive
+   submount, known incompatible submount, unexpected submount or malformed
+   evidence. It does not authorize any submount: the approval predicate remains
+   fail-closed until a representation is independently reviewed;
 10. inability to observe the controller directory and known host-control
    sockets, plus a fail-closed filesystem scan for pathname AF_UNIX sockets
    below the service's `/run`, `/dev`, `/tmp` and `/var/tmp`;
 11. synchronously enumerated loopback-only interfaces and no IPv4/IPv6 routes;
     producer/sorter errors, partial output and stderr are inconclusive NO-GO;
-    DNS, direct TCP and HTTPS
-    results are separately classified as blocked, connected or inconclusive.
+    DNS, direct TCP and HTTPS results are separately classified. TCP and HTTPS
+    are not attempted if route evidence is unavailable or a route is present;
+    this is reported as a sanitized prerequisite failure, not as blocked.
     Missing tools, timeouts and unrecognized failures are NO-GO, not PASS;
 12. exact `memory.max` and `pids.max`, plus semantic 50% `cpu.max`, read from
     the service's cgroup v2 path.
@@ -207,8 +213,8 @@ The service may emit only these closed forms to the private file:
 
 ```text
 RESULT id=<known_id> status=PASS code=ok
-READY status=PASS records=24
-FINAL status=PASS records=24
+READY status=PASS records=25
+FINAL status=PASS records=25
 ```
 
 The controller rejects unknown/duplicate/missing IDs, failures, malformed
@@ -225,7 +231,11 @@ with the same profile and `RuntimeMaxSec=3s`. Approval requires:
 
 - systemd reports `Result=timeout`;
 - `MainPID=0` after termination;
-- the service cgroup has no processes;
+- while active, the controller captures the cgroup's private path and
+  device/inode identity and observes `cgroup.events populated=1`; after the
+  timeout it requires the same still-accessible cgroup identity,
+  `populated=0`, and an empty `cgroup.procs` read. A vanished, unreadable or
+  changed cgroup is inconclusive NO-GO, never evidence of emptiness;
 - no process remains under the dedicated UID after both units are stopped;
 - controller cleanup removes only units, UID/GID, sentinel and directories
   proven to have been created by this execution; the trusted workflow step
@@ -241,7 +251,7 @@ GO requires all of the following:
 - repository visibility is reported as public and workflow SHA is valid;
 - system manager and cgroup v2 are available;
 - every manager-property comparison passes;
-- all 24 runtime records pass and both markers parse in exact order;
+- all 25 runtime records pass and both markers parse in exact order;
 - mount and network namespaces differ from the controller;
 - `/run` mountinfo, device separation and effective systemd property all pass;
 - main service exits zero with `Result=success` and an empty cgroup;
