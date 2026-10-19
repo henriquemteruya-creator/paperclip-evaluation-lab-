@@ -4,14 +4,21 @@ umask 077
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="$repo_root/.github/workflows/vm-systemd-preflight.yml"
-tmp="$(mktemp -d)"
+# VERDICT_BEGIN
+# The terminal verdict is printed in exactly one place, suite_finish, which runs
+# as the EXIT handler after cleanup.  Nothing earlier may print a RESULT line, so a
+# PASS can never precede a failed cleanup, and every exit path (explicit failure,
+# set -e abort with any code, early exit, signal, handler error) is normalised to
+# the contract: PASS -> exit 0, INCONCLUSIVE -> exit 2, FAIL -> exit 1.
+# Precedence: FAIL > INCONCLUSIVE > PASS.
+tmp=''
+tmp_owned=false
 pass_count=0
 inconclusive_count=0
-result_emitted=false
+suite_complete=false
+suite_failed=false
+suite_terminal_emitted=false
 
-# Final verdict.  FAIL (a check failed) dominates INCONCLUSIVE (a required check
-# could not run or finish), which dominates PASS (every required check passed).
-# Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE.  Only a complete run is PASS.
 result_status() {
   local failures="$1" inconclusive="$2"
   if (( failures > 0 )); then printf '%s\n' FAIL
@@ -21,26 +28,47 @@ result_status() {
 result_exit_code() {
   case "$1" in PASS) return 0 ;; INCONCLUSIVE) return 2 ;; *) return 1 ;; esac
 }
-emit_result() {
-  local failures="$1" status rc=0
-  status="$(result_status "$failures" "$inconclusive_count")"
-  result_emitted=true
-  printf 'RESULT offline_static_tests=%s inconclusive=%s status=%s\n' "$pass_count" "$inconclusive_count" "$status"
-  result_exit_code "$status" || rc=$?
-  return "$rc"
+# Overridable in the regressions; the default is the only destructive operation.
+suite_remove() { rm -rf -- "$1"; }
+# Remove only the private directory this run created: it must have been created by
+# suite_init, lie under TMPDIR, be a real directory (not a symlink) owned by us.
+# Any doubt is a cleanup failure and nothing is removed.
+suite_cleanup_tmp() {
+  [[ "$tmp_owned" == true ]] || return 0
+  [[ -n "$tmp" && "$tmp" == "${TMPDIR:-/tmp}"/* && -d "$tmp" && ! -L "$tmp" && -O "$tmp" ]] || return 1
+  suite_remove "$tmp" || return 1
+  [[ ! -e "$tmp" && ! -L "$tmp" ]]
 }
-cleanup_suite() {
-  local rc=$?
-  rm -rf -- "$tmp"
-  # An unexpected abort (set -e) must not leave a result-less, ambiguous exit.
-  if [[ "$result_emitted" != true ]] && (( rc == 0 )); then rc=1; fi
-  if [[ "$result_emitted" != true ]]; then emit_result 1 || true; fi
-  exit "$rc"
+suite_finish() {
+  local rc=$? failures=0 cleanup_rc=0 status code=0
+  trap - EXIT
+  set +e +E +u
+  [[ "$suite_terminal_emitted" != true ]] || exit 1
+  suite_terminal_emitted=true
+  if [[ "$suite_failed" == true || "$suite_complete" != true || "$rc" != 0 ]]; then failures=1; fi
+  # Subshell: an error or exit inside cleanup is contained and counted, not lost.
+  ( suite_cleanup_tmp ); cleanup_rc=$?
+  if [[ "$cleanup_rc" != 0 ]]; then printf 'FAIL suite_cleanup rc=%s\n' "$cleanup_rc" >&2; failures=1; fi
+  status="$(result_status "$failures" "$inconclusive_count")" || status=FAIL
+  [[ "$status" == PASS || "$status" == INCONCLUSIVE || "$status" == FAIL ]] || status=FAIL
+  printf 'RESULT offline_static_tests=%s inconclusive=%s status=%s\n' "$pass_count" "$inconclusive_count" "$status" || exit 1
+  result_exit_code "$status" || code=$?
+  exit "$code"
 }
-trap cleanup_suite EXIT
-
-test_fail() { printf 'FAIL %s\n' "$1" >&2; emit_result 1 || true; exit 1; }
+# A fatal signal must end through the same single handler with exit 1, not with the
+# signal's own status.
+suite_signal() { suite_failed=true; exit 1; }
+suite_init() {
+  trap suite_finish EXIT
+  trap suite_signal INT TERM HUP
+  tmp="$(mktemp -d)"
+  tmp_owned=true
+}
+test_fail() { printf 'FAIL %s\n' "$1" >&2; suite_failed=true; exit 1; }
 test_pass() { (( ++pass_count )); printf 'PASS %s\n' "$1"; }
+# VERDICT_END
+
+suite_init
 
 extract_heredoc() {
   local delimiter="$1" output="$2"
@@ -1955,26 +1983,113 @@ grep -Fq "write_summary 'NO-GO'" "$tmp/controller.sh" || test_fail fail_closed_s
 grep -Fq 'exit 86' "$tmp/controller.sh" || test_fail fail_closed_exit
 test_pass fail_closed_decision
 
-# --- Final verdict semantics: PASS / INCONCLUSIVE / FAIL are distinct ----------
+# --- Terminal verdict: PASS / INCONCLUSIVE / FAIL, one result, after cleanup ----
 [[ "$(result_status 0 0)" == PASS ]] || test_fail result_clean_not_pass
 [[ "$(result_status 0 1)" == INCONCLUSIVE && "$(result_status 0 7)" == INCONCLUSIVE ]] || test_fail result_inconclusive_reported_as_other
 [[ "$(result_status 1 0)" == FAIL && "$(result_status 2 5)" == FAIL ]] || test_fail result_failure_not_dominant
-rc=0; result_exit_code PASS || rc=$?; [[ "$rc" == 0 ]] || test_fail result_pass_exit_code
-rc=0; result_exit_code INCONCLUSIVE || rc=$?; [[ "$rc" == 2 ]] || test_fail result_inconclusive_exit_code
-rc=0; result_exit_code FAIL || rc=$?; [[ "$rc" == 1 ]] || test_fail result_fail_exit_code
-rc=0; result_exit_code garbage || rc=$?; [[ "$rc" == 1 ]] || test_fail result_unknown_status_not_failure
-# End-to-end through the real emitter, in subshells so the outer verdict is unaffected.
-out="$( inconclusive_count=0 pass_count=3; emit_result 0 )" && rc=0 || rc=$?
-[[ "$rc" == 0 && "$out" == 'RESULT offline_static_tests=3 inconclusive=0 status=PASS' ]] || test_fail result_emit_pass
-out="$( inconclusive_count=2 pass_count=3; emit_result 0 )" && rc=0 || rc=$?
-[[ "$rc" == 2 && "$out" == 'RESULT offline_static_tests=3 inconclusive=2 status=INCONCLUSIVE' && "$out" != *status=PASS* ]] || test_fail result_emit_inconclusive_looks_like_pass
-out="$( inconclusive_count=2 pass_count=3; emit_result 1 )" && rc=0 || rc=$?
-[[ "$rc" == 1 && "$out" == 'RESULT offline_static_tests=3 inconclusive=2 status=FAIL' ]] || test_fail result_emit_fail
-# A failing check must itself print a FAIL verdict and exit 1.
-out="$( inconclusive_count=0 pass_count=4; test_fail sample_check 2>/dev/null )" && rc=0 || rc=$?
-[[ "$rc" == 1 && "$out" == 'RESULT offline_static_tests=4 inconclusive=0 status=FAIL' ]] || test_fail result_test_fail_emits_fail
-# The suite must reach its verdict only through emit_result, never a literal PASS.
+for pair in PASS:0 INCONCLUSIVE:2 FAIL:1 garbage:1; do
+  rc=0; result_exit_code "${pair%%:*}" || rc=$?; [[ "$rc" == "${pair##*:}" ]] || test_fail "result_exit_code_${pair%%:*}"
+done
+extract_marker_block '# VERDICT_BEGIN' '# VERDICT_END' "${BASH_SOURCE[0]}" "$tmp/verdict.sh"
+vs_root="$tmp/vs"; mkdir "$vs_root"
+# Run one scenario in its own bash process (a real EXIT handler), TMPDIR confined to
+# $vs_root.  Result: vs_rc, vs_log (stdout and stderr interleaved).
+run_verdict_scenario() {
+  local name="$1" body="$2" script="$vs_root/$1.sh"
+  mkdir -p "$vs_root/$name.tmp"
+  { printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' 'umask 077'
+    cat "$tmp/verdict.sh"
+    printf '%s\n' 'suite_init' "$body"; } >"$script"
+  vs_rc=0
+  TMPDIR="$vs_root/$name.tmp" bash "$script" >"$vs_root/$name.log" 2>&1 || vs_rc=$?
+  vs_log="$(<"$vs_root/$name.log")"
+}
+# vs_expect name want_rc want_status want_pass want_inc
+vs_expect() {
+  local name="$1" want_rc="$2" want_status="$3" want_pass="$4" want_inc="$5" results
+  results="$(grep -c '^RESULT offline_static_tests=' "$vs_root/$name.log" || true)"
+  [[ "$results" == 1 ]] || test_fail "verdict_${name}_result_count_$results"
+  [[ "$vs_rc" == "$want_rc" ]] || test_fail "verdict_${name}_exit_${vs_rc}"
+  [[ "$(tail -n 1 "$vs_root/$name.log")" == "RESULT offline_static_tests=$want_pass inconclusive=$want_inc status=$want_status" ]] || test_fail "verdict_${name}_final_line"
+  if [[ "$want_status" != PASS ]]; then [[ "$vs_log" != *status=PASS* ]] || test_fail "verdict_${name}_premature_pass"; fi
+}
+run_verdict_scenario pass 'test_pass a; test_pass b; suite_complete=true'
+vs_expect pass 0 PASS 2 0
+run_verdict_scenario inconclusive 'test_pass a; inconclusive_count=2; suite_complete=true'
+vs_expect inconclusive 2 INCONCLUSIVE 1 2
+run_verdict_scenario explicit_fail 'test_pass a; test_fail x; echo UNREACHABLE'
+vs_expect explicit_fail 1 FAIL 1 0
+[[ "$vs_log" != *UNREACHABLE* ]] || test_fail verdict_explicit_fail_continued
+run_verdict_scenario fail_beats_inconclusive 'inconclusive_count=3; test_fail x'
+vs_expect fail_beats_inconclusive 1 FAIL 0 3
+# Unexpected aborts, whatever their own exit code, are a FAIL with exit 1.
+run_verdict_scenario abort73 'test_pass a; ( exit 73 ); suite_complete=true'
+vs_expect abort73 1 FAIL 1 0
+run_verdict_scenario exit73 'test_pass a; suite_complete=true; exit 73'
+vs_expect exit73 1 FAIL 1 0
+run_verdict_scenario exit0_early 'test_pass a; exit 0'
+vs_expect exit0_early 1 FAIL 1 0
+run_verdict_scenario abort_inconclusive 'inconclusive_count=1; ( exit 9 )'
+vs_expect abort_inconclusive 1 FAIL 0 1
+run_verdict_scenario sigterm 'test_pass a; kill -TERM $$; sleep 5'
+vs_expect sigterm 1 FAIL 1 0
+# A failed cleanup is a FAIL and no PASS precedes it.
+run_verdict_scenario cleanup_fails 'suite_remove() { echo CLEANUP_ATTEMPT; return 1; }; test_pass a; suite_complete=true'
+vs_expect cleanup_fails 1 FAIL 1 0
+[[ "$(grep -n 'CLEANUP_ATTEMPT\|^RESULT' "$vs_root/cleanup_fails.log" | cut -d: -f2- | tr '\n' ' ')" == 'CLEANUP_ATTEMPT RESULT offline_static_tests=1 inconclusive=0 status=FAIL ' ]] || test_fail verdict_result_not_after_cleanup
+grep -Fq 'FAIL suite_cleanup' "$vs_root/cleanup_fails.log" || test_fail verdict_cleanup_error_suppressed
+run_verdict_scenario cleanup_fails_with_inconclusive 'suite_remove() { return 1; }; inconclusive_count=1; suite_complete=true'
+vs_expect cleanup_fails_with_inconclusive 1 FAIL 0 1
+# Errors inside the shutdown handler itself.
+run_verdict_scenario handler_exits 'suite_remove() { exit 99; }; test_pass a; suite_complete=true'
+vs_expect handler_exits 1 FAIL 1 0
+run_verdict_scenario handler_errors 'suite_remove() { false; }; test_pass a; suite_complete=true'
+vs_expect handler_errors 1 FAIL 1 0
+run_verdict_scenario handler_noop_remove 'suite_remove() { :; }; test_pass a; suite_complete=true'
+vs_expect handler_noop_remove 1 FAIL 1 0
+run_verdict_scenario handler_status_broken 'result_status() { echo bogus; }; test_pass a; suite_complete=true'
+vs_expect handler_status_broken 1 FAIL 1 0
+run_verdict_scenario handler_status_errors 'result_status() { return 1; }; test_pass a; suite_complete=true'
+vs_expect handler_status_errors 1 FAIL 1 0
+# Re-entry: an explicit second invocation or a re-armed trap cannot duplicate the result.
+run_verdict_scenario reentrant 'test_pass a; suite_complete=true; trap suite_finish EXIT; suite_finish'
+vs_expect reentrant 0 PASS 1 0
+# Removal is refused unless this run's own private directory is proven.
+canary="$vs_root/canary"; mkdir "$canary"; : >"$canary/keep"
+ln -s "$canary" "$vs_root/canary-link"
+run_verdict_scenario refuse_symlink "suite_remove() { echo REMOVE_CALLED; }; tmp='$vs_root/canary-link'; suite_complete=true"
+vs_expect refuse_symlink 1 FAIL 0 0
+run_verdict_scenario refuse_outside_tmpdir "suite_remove() { echo REMOVE_CALLED; }; tmp='$canary'; suite_complete=true"
+vs_expect refuse_outside_tmpdir 1 FAIL 0 0
+run_verdict_scenario refuse_empty "suite_remove() { echo REMOVE_CALLED; }; tmp=''; suite_complete=true"
+vs_expect refuse_empty 1 FAIL 0 0
+refused='refuse_symlink refuse_outside_tmpdir refuse_empty'
+if [[ "$(id -u)" != 0 ]]; then
+  run_verdict_scenario refuse_not_owned "suite_remove() { echo REMOVE_CALLED; }; TMPDIR=/usr; tmp=/usr/bin; suite_complete=true"
+  vs_expect refuse_not_owned 1 FAIL 0 0
+  refused="$refused refuse_not_owned"
+fi
+for n in $refused; do
+  ! grep -Fq REMOVE_CALLED "$vs_root/$n.log" || test_fail "verdict_${n}_removed_unproven_path"
+done
+[[ -e "$canary/keep" && -d "$canary" ]] || test_fail verdict_canary_removed
+# Not owned and not created by this run: nothing to remove, nothing to fail on.
+run_verdict_scenario not_owned_noop "tmp_owned=false; suite_remove() { echo REMOVE_CALLED; }; test_pass a; suite_complete=true"
+vs_expect not_owned_noop 0 PASS 1 0
+# Real filesystem failure (unprivileged only): an undeletable entry must fail the run.
+if [[ "$(id -u)" != 0 ]]; then
+  run_verdict_scenario real_cleanup_failure 'mkdir "$tmp/locked"; : >"$tmp/locked/f"; chmod 500 "$tmp/locked"; test_pass a; suite_complete=true'
+  vs_expect real_cleanup_failure 1 FAIL 1 0
+  chmod -R u+rwx "$vs_root/real_cleanup_failure.tmp"
+else
+  inconclusive_count=$(( inconclusive_count + 1 )); printf '%s\n' 'INCONCLUSIVE real_cleanup_failure_running_as_root'
+fi
+# Structural guards: one terminal printer, no early or duplicate verdicts.
+[[ "$(grep -c "^  printf 'RESULT offline_static_tests=" "${BASH_SOURCE[0]}")" == 1 ]] || test_fail verdict_printer_not_unique
+! grep -qE '^[[:space:]]*(emit_result|printf .RESULT offline_static_tests=)' <(sed '/^# VERDICT_BEGIN/,/^# VERDICT_END/d' "${BASH_SOURCE[0]}") || test_fail verdict_emitted_outside_handler
 [[ "$(grep -c 'status=PASS\\n' "${BASH_SOURCE[0]}")" == 0 ]] || test_fail result_literal_pass_line
-test_pass final_verdict_distinguishes_pass_inconclusive_fail
+test_pass final_verdict_single_terminal_after_cleanup
 
-emit_result 0
+# Reaching this point is the last required step; suite_finish prints the verdict
+# only after cleanup succeeded.
+suite_complete=true
