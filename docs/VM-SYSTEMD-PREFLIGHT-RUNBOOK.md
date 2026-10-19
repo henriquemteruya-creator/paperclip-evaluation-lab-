@@ -347,7 +347,7 @@ GO requires all of the following:
 - repository visibility is reported as public and workflow SHA is valid;
 - system manager and cgroup v2 are available;
 - every manager-property comparison passes;
-- all 25 runtime records pass and both markers parse in exact order;
+- all 26 runtime records pass and both markers parse in exact order;
 - mount and network namespaces differ from the controller;
 - `/run` mountinfo, device separation and effective systemd property all pass;
 - main service exits zero with `Result=success` and an empty cgroup;

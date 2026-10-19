@@ -5,10 +5,41 @@ umask 077
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="$repo_root/.github/workflows/vm-systemd-preflight.yml"
 tmp="$(mktemp -d)"
-trap 'rm -rf -- "$tmp"' EXIT
-
 pass_count=0
-test_fail() { printf 'FAIL %s\n' "$1" >&2; exit 1; }
+inconclusive_count=0
+result_emitted=false
+
+# Final verdict.  FAIL (a check failed) dominates INCONCLUSIVE (a required check
+# could not run or finish), which dominates PASS (every required check passed).
+# Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE.  Only a complete run is PASS.
+result_status() {
+  local failures="$1" inconclusive="$2"
+  if (( failures > 0 )); then printf '%s\n' FAIL
+  elif (( inconclusive > 0 )); then printf '%s\n' INCONCLUSIVE
+  else printf '%s\n' PASS; fi
+}
+result_exit_code() {
+  case "$1" in PASS) return 0 ;; INCONCLUSIVE) return 2 ;; *) return 1 ;; esac
+}
+emit_result() {
+  local failures="$1" status rc=0
+  status="$(result_status "$failures" "$inconclusive_count")"
+  result_emitted=true
+  printf 'RESULT offline_static_tests=%s inconclusive=%s status=%s\n' "$pass_count" "$inconclusive_count" "$status"
+  result_exit_code "$status" || rc=$?
+  return "$rc"
+}
+cleanup_suite() {
+  local rc=$?
+  rm -rf -- "$tmp"
+  # An unexpected abort (set -e) must not leave a result-less, ambiguous exit.
+  if [[ "$result_emitted" != true ]] && (( rc == 0 )); then rc=1; fi
+  if [[ "$result_emitted" != true ]]; then emit_result 1 || true; fi
+  exit "$rc"
+}
+trap cleanup_suite EXIT
+
+test_fail() { printf 'FAIL %s\n' "$1" >&2; emit_result 1 || true; exit 1; }
 test_pass() { (( ++pass_count )); printf 'PASS %s\n' "$1"; }
 
 extract_heredoc() {
@@ -905,7 +936,7 @@ if [[ "$(id -u)" != 0 ]]; then
   [[ "$rc" == 3 && ! -e "$sf/scratch/unreadable.snap" ]] || test_fail snapshot_unreadable_not_unavailable
   chmod 644 "$sf/unreadable"
 else
-  inconclusive_count=$(( ${inconclusive_count:-0} + 1 )); printf '%s\n' 'INCONCLUSIVE snapshot_unreadable_running_as_root'
+  inconclusive_count=$(( inconclusive_count + 1 )); printf '%s\n' 'INCONCLUSIVE snapshot_unreadable_running_as_root'
 fi
 test_pass proc_snapshot_binary_safe_and_bounded
 
@@ -1344,7 +1375,7 @@ if [[ "$ns_rc" == 0 ]]; then
   [[ "$ns_extra" == '0 0 1 1' ]] || test_fail "mechanism_extra_interface_unexpected_$ns_extra"
   test_pass netlink_denial_and_lo_only_namespace_mechanisms_on_this_kernel
 else
-  inconclusive_count=$(( ${inconclusive_count:-0} + 1 ))
+  inconclusive_count=$(( inconclusive_count + 1 ))
   printf 'INCONCLUSIVE mechanism_namespaces_unavailable rc=%s\n' "$ns_rc"
 fi
 
@@ -1576,7 +1607,7 @@ if [[ "$(id -u)" != 0 ]]; then
   rc=0; run_access_denied other "$access_fx/f_open" || rc=$?; [[ "$rc" == 2 ]] || test_fail run_access_unknown_kind
   chmod 755 "$access_fx/d_denied"; chmod 644 "$access_fx/f_denied"
 else
-  inconclusive_count=$(( ${inconclusive_count:-0} + 1 ))
+  inconclusive_count=$(( inconclusive_count + 1 ))
   printf '%s\n' 'INCONCLUSIVE run_access_permission_bits_running_as_root'
 fi
 
@@ -1924,4 +1955,26 @@ grep -Fq "write_summary 'NO-GO'" "$tmp/controller.sh" || test_fail fail_closed_s
 grep -Fq 'exit 86' "$tmp/controller.sh" || test_fail fail_closed_exit
 test_pass fail_closed_decision
 
-printf 'RESULT offline_static_tests=%s inconclusive=%s status=PASS\n' "$pass_count" "${inconclusive_count:-0}"
+# --- Final verdict semantics: PASS / INCONCLUSIVE / FAIL are distinct ----------
+[[ "$(result_status 0 0)" == PASS ]] || test_fail result_clean_not_pass
+[[ "$(result_status 0 1)" == INCONCLUSIVE && "$(result_status 0 7)" == INCONCLUSIVE ]] || test_fail result_inconclusive_reported_as_other
+[[ "$(result_status 1 0)" == FAIL && "$(result_status 2 5)" == FAIL ]] || test_fail result_failure_not_dominant
+rc=0; result_exit_code PASS || rc=$?; [[ "$rc" == 0 ]] || test_fail result_pass_exit_code
+rc=0; result_exit_code INCONCLUSIVE || rc=$?; [[ "$rc" == 2 ]] || test_fail result_inconclusive_exit_code
+rc=0; result_exit_code FAIL || rc=$?; [[ "$rc" == 1 ]] || test_fail result_fail_exit_code
+rc=0; result_exit_code garbage || rc=$?; [[ "$rc" == 1 ]] || test_fail result_unknown_status_not_failure
+# End-to-end through the real emitter, in subshells so the outer verdict is unaffected.
+out="$( inconclusive_count=0 pass_count=3; emit_result 0 )" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$out" == 'RESULT offline_static_tests=3 inconclusive=0 status=PASS' ]] || test_fail result_emit_pass
+out="$( inconclusive_count=2 pass_count=3; emit_result 0 )" && rc=0 || rc=$?
+[[ "$rc" == 2 && "$out" == 'RESULT offline_static_tests=3 inconclusive=2 status=INCONCLUSIVE' && "$out" != *status=PASS* ]] || test_fail result_emit_inconclusive_looks_like_pass
+out="$( inconclusive_count=2 pass_count=3; emit_result 1 )" && rc=0 || rc=$?
+[[ "$rc" == 1 && "$out" == 'RESULT offline_static_tests=3 inconclusive=2 status=FAIL' ]] || test_fail result_emit_fail
+# A failing check must itself print a FAIL verdict and exit 1.
+out="$( inconclusive_count=0 pass_count=4; test_fail sample_check 2>/dev/null )" && rc=0 || rc=$?
+[[ "$rc" == 1 && "$out" == 'RESULT offline_static_tests=4 inconclusive=0 status=FAIL' ]] || test_fail result_test_fail_emits_fail
+# The suite must reach its verdict only through emit_result, never a literal PASS.
+[[ "$(grep -c 'status=PASS\\n' "${BASH_SOURCE[0]}")" == 0 ]] || test_fail result_literal_pass_line
+test_pass final_verdict_distinguishes_pass_inconclusive_fail
+
+emit_result 0

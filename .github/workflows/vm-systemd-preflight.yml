@@ -344,7 +344,7 @@ jobs:
             local -A seen=()
             [[ "$phase" == ready || "$phase" == final ]] || return 2
             # The parser verifies file bounds, line grammar, the complete
-            # 25-record allowlist, cardinality and marker order before this
+            # 26-record allowlist, cardinality and marker order before this
             # helper is allowed to construct any public string.
             parse_probe_log "$file" "$phase" || parser_rc=$?
             [[ "$parser_rc" == 1 ]] || return 2
