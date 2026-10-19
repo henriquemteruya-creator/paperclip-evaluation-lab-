@@ -2,9 +2,11 @@
 
 ## Status and scope
 
-- Implementation status: prepared for independent review
-- Execution status: execution #4 stopped during trusted-script installation;
-  controller and transient service were not started
+- Implementation status: offline corrections under independent review; NOT
+  ready for execution
+- Execution status: execution #8 ended NO-GO (exit 86). Execution #9 remains
+  NO-GO until the timeout-canary cgroup observation gate (below) is resolved by a
+  separate architecture decision; offline PASS never means runtime PASS
 - Paperclip status: not downloaded, installed, or executed
 - P01/P02/P04 status: `planned` / NO-GO
 - Cost target: R$0 incremental, conditional on a public repository and the
@@ -187,25 +189,105 @@ The benign service checks effective behavior, not only declared properties:
    `ro,nosuid,nodev,noexec`, no propagation/submount and an observable 1 MiB
    size; the controller also requires a distinct device from the host `/run`
    and validates the system manager's effective `TemporaryFileSystem` value.
-   A separate sanitized diagnostic classifies no submount, known restrictive
-   submount, known incompatible submount, unexpected submount or malformed
-   evidence. It does not authorize any submount: the approval predicate remains
-   fail-closed until a representation is independently reviewed;
+   A separate sanitized diagnostic classifies each submount below `/run` from
+   its properties, never from who probably created it (see "Meaning of the
+   `/run` diagnostic codes"). The only PASS is "no submount"; every other
+   outcome stays NO-GO, a restrictive classification does not authorize any
+   submount, and detailed mount data is never published;
 10. inability to observe the controller directory and known host-control
    sockets, plus a fail-closed filesystem scan for pathname AF_UNIX sockets
    below the service's `/run`, `/dev`, `/tmp` and `/var/tmp`;
-11. synchronously enumerated loopback-only interfaces and no IPv4/IPv6 routes;
-    producer/sorter errors, partial output and stderr are inconclusive NO-GO;
-    DNS, direct TCP and HTTPS results are separately classified. TCP and HTTPS
-    are not attempted if route evidence is unavailable or a route is present;
-    this is reported as a sanitized prerequisite failure, not as blocked.
-    Missing tools, timeouts and unrecognized failures are NO-GO, not PASS;
+11. network isolation, established by combined evidence rather than by route
+    tables (see "Network isolation: proven versus inferred"): an own network
+    namespace listing only `lo` in `/proc/self/net/dev` (strict parser), the
+    system manager's effective `PrivateNetwork`, an exact
+    `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` allow-list, a negative
+    `AF_NETLINK` probe, empty capability sets, host-socket masks and the
+    DNS/TCP/HTTPS negative probes. TCP and HTTPS are attempted only when the
+    interface listing and the complementary route files are both verified
+    clean; otherwise a sanitized prerequisite failure is reported, not
+    "blocked". Missing tools, timeouts and unrecognized failures are NO-GO;
 12. exact `memory.max` and `pids.max`, plus semantic 50% `cpu.max`, read from
     the service's cgroup v2 path.
 
 While the probe is alive, the controller independently queries the system
-manager for the expected properties and compares the service network and mount
-namespace identities with its own without publishing inode values.
+manager for the expected properties (including the exact address-family
+allow-list) and compares the service network and mount namespace identities with
+its own without publishing inode values. It also reads `/proc/<MainPID>/net/dev`
+itself, bound to the unit (MainPID unchanged before and after) and to one
+network namespace (same link before and after, different from its own), with the
+same strict parser as the probe.
+
+## Network isolation: proven versus inferred
+
+Property under test: the service runs in a network namespace of its own that
+contains only the loopback interface, and cannot reach the network.
+
+Verified by the preflight (each a separate NO-GO when absent or inconclusive):
+
+- the system manager reports `PrivateNetwork=yes` and the exact address-family
+  allow-list; AF_NETLINK is not in it;
+- the service's network and mount namespaces differ from the controller's;
+- the interface listing of the service's own namespace (`/proc/self/net/dev`
+  from inside, `/proc/<MainPID>/net/dev` from the controller) is exactly `lo`;
+  the parser demands the kernel header, a bounded row count, 16 numeric columns
+  per row, a final newline and printable ASCII, and refuses empty, truncated,
+  NUL-bearing or otherwise malformed input;
+- `/sys/class/net` must agree, but it is never an authority on its own: sysfs
+  follows the mount that created it, and in an unshared namespace it lists the
+  host's interfaces;
+- a negative probe: creating a netlink socket (through `ip`) must fail with the
+  exact EAFNOSUPPORT message; success or any other failure is NO-GO;
+- empty capability bounding/ambient sets, host-socket masks and the negative
+  DNS, TCP and HTTPS probes.
+
+Inferred, not demonstrated at runtime:
+
+- that no interface other than `lo` can exist is inferred from the listing at two
+  instants plus the absence of capabilities and of netlink; it is not a
+  continuous guarantee;
+- that no route can lead outside is inferred from the absence of an external
+  interface. Route files are only COMPLEMENTARY and PARTIAL: `/proc/<pid>/net/route`
+  lists the IPv4 main table only (not the local table, policy-routing tables or
+  rules, which have no procfs file); `ipv6_route` lists all IPv6 tables but only
+  the kernel's reject entry and the loopback `::1/128` entry are tolerated. They
+  are not evidence of an empty routing configuration;
+- negative connectivity probes are point-in-time and do not prove the absence of
+  every kernel communication channel.
+
+Offline evidence is limited to fixtures, an independent-oracle fuzz and
+mechanism checks on one disposable namespace of a WSL2 6.18 kernel, with GNU awk
+and mawk and Bash 5.3. It is not evidence about the GitHub-hosted runner.
+
+## Meaning of the `/run` diagnostic codes
+
+The record `run_mount_diagnostic` publishes one code from a closed grammar:
+
+- `no_submount`: the only PASS.
+- `sockets_|private_root_|run_user_|mixed_expected_` followed by `restrictive`:
+  every submount below `/run` targets an expected, exactly matched path and all
+  observed properties are restrictive. Still NO-GO.
+- the same prefixes followed by `not_restrictive_` and nine flags `b1..b9`
+  (`1` = observed): `b1` root is `/`; `b2` root is an inaccessible node of the
+  wrong kind; `b3` root unrecognised; `b4` filesystem type is not tmpfs; `b5`
+  mount source is not tmpfs; `b6` flags are not exactly `ro,nosuid,nodev,noexec`
+  (or `rw` present); `b7` a propagation field is present; `b8` another mount is
+  stacked on the same target; `b9` the target is accessible to the service.
+- `unexpected_target_<family>` with `systemd`, `user_child`,
+  `private_root_child`, `credentials`, `lock` or `other`: at least one submount
+  targets a path that is not an expected one. The family comes from a fixed
+  dictionary; look-alikes, children and escaped names are never matched as
+  expected. When several families occur the first in the listed order is shown.
+- `evidence_incomplete`: no property violation was observed but effective
+  access could not be proven.
+- `inspection_error`: the evidence was malformed or unreadable.
+
+Precedence: unexpected target, then observed property flags, then incomplete
+evidence. Only static tokens and bits are published; no path, identity, device
+number or raw mountinfo ever is. The grammar is validated by the probe and again
+by the controller, which publishes at most eight pairs and 512 characters.
+Retaining detailed evidence would need a separate, reviewed mechanism and is not
+implemented.
 
 ## Private evidence protocol
 
@@ -213,8 +295,8 @@ The service may emit only these closed forms to the private file:
 
 ```text
 RESULT id=<known_id> status=PASS code=ok
-READY status=PASS records=25
-FINAL status=PASS records=25
+READY status=PASS records=26
+FINAL status=PASS records=26
 ```
 
 The controller rejects unknown/duplicate/missing IDs, failures, malformed
@@ -222,9 +304,9 @@ records, control characters, workflow-command syntax, oversized output,
 missing final newline, symlinked logs, unexpected ownership/mode or absent
 markers. Results must precede READY; FINAL must follow READY and be the final
 record. It never echoes a rejected line. For a fully valid failing log it may
-publish at most four `id=category` pairs, limited to the reviewed diagnostic
-IDs `run_mount_diagnostic`, `routes`, `tcp_blocked` and `https_blocked` and
-their closed category vocabulary. A second closed publisher revalidates the
+publish at most eight `id=category` pairs, limited to the reviewed diagnostic
+IDs `run_mount_diagnostic`, `network_interfaces`, `routes`, `netlink_denied`,
+`tcp_blocked` and `https_blocked` and their closed category grammar. A second closed publisher revalidates the
 label, cardinality, syntax, IDs and categories immediately before `printf`.
 Unknown categories, duplicates, truncation or any parser error suppress those
 pairs entirely. The GitHub step summary is generated from controller-owned
@@ -316,11 +398,38 @@ root in the guest. A kernel or systemd vulnerability could bypass the tested
 boundary. A private `/run`, explicit masks and pathname-socket scan cover the
 inspected filesystem namespace at one moment; they do not prove absence of
 every kernel communication channel. Network failures are accepted only when
-their return code is consistent with the independently observed empty route
-table and direct unreachable result. Negative probes remain point-in-time
+their return code is consistent with the independently observed route
+evidence and direct unreachable result. Negative probes remain point-in-time
 evidence, not mathematical proof of non-connectivity.
 
 The service shares the guest kernel and its UID exists in the host user
 namespace; no separate user namespace is claimed. The design also does not yet
 address Node, pnpm, dependency stores, build scripts or Paperclip. Those remain
 separate future decisions after a dynamically reviewed GO.
+
+## Known open gate: timeout canary cgroup observation (BLOCKING)
+
+The original criterion is unchanged: `populated=1` while running, then
+`Result=timeout`, `MainPID=0`, a valid `populated=0` observation, an empty
+`cgroup.procs` read, the same cgroup identity and no residual processes.
+Disappearance of the cgroup is never accepted in place of an observation of
+emptiness. The system manager removes the unit's cgroup as part of the
+transition to inactive/failed, so the current observer cannot succeed and stays
+inconclusive (NO-GO); this gate is therefore STOP for the present architecture.
+No observer was changed. A dedicated-slice ancestor is NOT accepted as a
+substitute; it would be a different requirement and needs its own architecture
+decision. Future, separate investigation would have to establish: a dedicated
+slice with verifiable ownership, its persistence after the timeout, recursive
+`populated` behavior, exclusive membership of the service's processes,
+prevention of process migration, a stable identity and safe cleanup.
+
+## Conditions still missing for GO
+
+- a resolved architecture for the timeout-canary cgroup observation (above);
+- runtime evidence, never obtained, that the network, mount and cgroup
+  observations work on the GitHub-hosted runner;
+- the real representation of `/run` submounts, learned only from the sanitized
+  diagnostic codes, followed by an independent review before anything is
+  allowed;
+- independent review of the final immutable commit and explicit owner approval
+  of exactly one manual run.
