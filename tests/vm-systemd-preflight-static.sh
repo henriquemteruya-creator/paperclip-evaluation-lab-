@@ -11,6 +11,14 @@ workflow="$repo_root/.github/workflows/vm-systemd-preflight.yml"
 # set -e abort with any code, early exit, signal, handler error) is normalised to
 # the contract: PASS -> exit 0, INCONCLUSIVE -> exit 2, FAIL -> exit 1.
 # Precedence: FAIL > INCONCLUSIVE > PASS.
+# Consumer contract: a run is PASS only if the process exited 0 AND stdout holds exactly
+# one RESULT line AND that line says status=PASS.  A RESULT line on its own is never
+# proof of PASS; any other exit code, a missing or repeated line is FAIL.  Inevitable
+# limits: SIGKILL, a power loss or a fatal error before the first trap is armed give no
+# verdict (so no RESULT); a signal landing between the last status check and the
+# print can leave a PASS/INCONCLUSIVE line behind exit 1, and one that arrives after
+# the line was written to stdout cannot retract it.  In all of these the exit code
+# is 1 or the line is absent, which the contract reads as FAIL.
 tmp=''
 tmp_owned=false
 pass_count=0
@@ -58,6 +66,13 @@ suite_finish() {
   # A signal that arrived after the checks above (cleanup, status) still demotes the run.
   if [[ "$suite_signalled" == true || "$suite_failed" == true ]]; then status=FAIL; fi
   printf 'RESULT offline_static_tests=%s inconclusive=%s status=%s\n' "$pass_count" "$inconclusive_count" "$status" || exit 1
+  # The line is out; from here only the exit code is left.  Any signal now ends the
+  # run with 1 at once, and one recorded during or just before the print is honoured
+  # below, so a signal can never leave exit 0 or 2 behind a verdict it came too late
+  # to change.  The RESULT line may then say PASS or INCONCLUSIVE while the exit
+  # code is 1: the exit code is authoritative (see the consumer contract above).
+  trap 'exit 1' INT TERM HUP
+  if [[ "$suite_signalled" == true || "$suite_failed" == true ]]; then exit 1; fi
   result_exit_code "$status" || code=$?
   exit "$code"
 }
@@ -2052,6 +2067,25 @@ run_verdict_scenario sigterm_status 'result_status() { kill -TERM $$; printf "%s
 vs_expect sigterm_status 1 FAIL 1 0
 run_verdict_scenario sigterm_inconclusive_cleanup 'suite_remove() { kill -TERM $$; rm -rf -- "$1"; }; inconclusive_count=1; suite_complete=true'
 vs_expect sigterm_inconclusive_cleanup 1 FAIL 0 1
+# Signals in the final window (around the RESULT print and result_exit_code): the exit
+# code must be 1 whatever the line says, never the 0/2 of a verdict the signal outran.
+sig_print_hook='printf() { builtin printf "$@"; [[ "${1:-}" == RESULT* ]] && kill -SIG $$; return 0; }'
+sig_before_hook='printf() { [[ "${1:-}" == RESULT* ]] && kill -SIG $$; builtin printf "$@"; }'
+sig_code_hook='result_exit_code() { kill -SIG $$; case "$1" in PASS) return 0 ;; INCONCLUSIVE) return 2 ;; *) return 1 ;; esac; }'
+for sig in TERM INT HUP; do
+  run_verdict_scenario "sig${sig}_print_during" "${sig_print_hook//SIG/$sig}; test_pass a; suite_complete=true"
+  vs_expect "sig${sig}_print_during" 1 PASS 1 0
+  run_verdict_scenario "sig${sig}_print_before" "${sig_before_hook//SIG/$sig}; test_pass a; suite_complete=true"
+  vs_expect "sig${sig}_print_before" 1 PASS 1 0
+  run_verdict_scenario "sig${sig}_exit_code" "${sig_code_hook//SIG/$sig}; test_pass a; suite_complete=true"
+  vs_expect "sig${sig}_exit_code" 1 PASS 1 0
+done
+run_verdict_scenario sigterm_cleanup_fail_print "suite_remove() { return 1; }; ${sig_print_hook//SIG/TERM}; test_pass a; suite_complete=true"
+vs_expect sigterm_cleanup_fail_print 1 FAIL 1 0
+run_verdict_scenario sigterm_inconclusive_print "${sig_print_hook//SIG/TERM}; inconclusive_count=1; suite_complete=true"
+vs_expect sigterm_inconclusive_print 1 INCONCLUSIVE 0 1
+run_verdict_scenario sigterm_inconclusive_exit_code "${sig_code_hook//SIG/TERM}; inconclusive_count=1; suite_complete=true"
+vs_expect sigterm_inconclusive_exit_code 1 INCONCLUSIVE 0 1
 # A failed cleanup is a FAIL and no PASS precedes it.
 run_verdict_scenario cleanup_fails 'suite_remove() { echo CLEANUP_ATTEMPT; return 1; }; test_pass a; suite_complete=true'
 vs_expect cleanup_fails 1 FAIL 1 0
