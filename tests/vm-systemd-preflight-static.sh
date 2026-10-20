@@ -17,6 +17,7 @@ pass_count=0
 inconclusive_count=0
 suite_complete=false
 suite_failed=false
+suite_signalled=false
 suite_terminal_emitted=false
 
 result_status() {
@@ -42,6 +43,9 @@ suite_cleanup_tmp() {
 suite_finish() {
   local rc=$? failures=0 cleanup_rc=0 status code=0
   trap - EXIT
+  # From here the verdict must still be printed: a signal only records a failure and
+  # the handler carries on (suite_signal's exit would skip the RESULT line).
+  trap 'suite_signalled=true' INT TERM HUP
   set +e +E +u
   [[ "$suite_terminal_emitted" != true ]] || exit 1
   suite_terminal_emitted=true
@@ -51,12 +55,18 @@ suite_finish() {
   if [[ "$cleanup_rc" != 0 ]]; then printf 'FAIL suite_cleanup rc=%s\n' "$cleanup_rc" >&2; failures=1; fi
   status="$(result_status "$failures" "$inconclusive_count")" || status=FAIL
   [[ "$status" == PASS || "$status" == INCONCLUSIVE || "$status" == FAIL ]] || status=FAIL
+  # A signal that arrived after the checks above (cleanup, status) still demotes the run.
+  if [[ "$suite_signalled" == true || "$suite_failed" == true ]]; then status=FAIL; fi
   printf 'RESULT offline_static_tests=%s inconclusive=%s status=%s\n' "$pass_count" "$inconclusive_count" "$status" || exit 1
   result_exit_code "$status" || code=$?
   exit "$code"
 }
 # A fatal signal must end through the same single handler with exit 1, not with the
-# signal's own status.
+# signal's own status.  Once suite_finish runs it swaps this for a recorder.  Limits:
+# SIGKILL and a signal delivered before the first trap is armed or in the instant
+# between EXIT firing and suite_finish re-trapping cannot be handled; a signal inside
+# the final printf/exit is also unrecoverable.  Those end without a verdict, which a
+# consumer must treat as FAIL (no RESULT line).
 suite_signal() { suite_failed=true; exit 1; }
 suite_init() {
   trap suite_finish EXIT
@@ -2033,6 +2043,15 @@ run_verdict_scenario abort_inconclusive 'inconclusive_count=1; ( exit 9 )'
 vs_expect abort_inconclusive 1 FAIL 0 1
 run_verdict_scenario sigterm 'test_pass a; kill -TERM $$; sleep 5'
 vs_expect sigterm 1 FAIL 1 0
+# A signal during the shutdown handler itself must still yield exactly one FAIL verdict.
+for sig in TERM INT HUP; do
+  run_verdict_scenario "sig${sig}_cleanup" "suite_remove() { kill -$sig \$\$; rm -rf -- \"\$1\"; }; test_pass a; suite_complete=true"
+  vs_expect "sig${sig}_cleanup" 1 FAIL 1 0
+done
+run_verdict_scenario sigterm_status 'result_status() { kill -TERM $$; printf "%s\n" PASS; }; test_pass a; suite_complete=true'
+vs_expect sigterm_status 1 FAIL 1 0
+run_verdict_scenario sigterm_inconclusive_cleanup 'suite_remove() { kill -TERM $$; rm -rf -- "$1"; }; inconclusive_count=1; suite_complete=true'
+vs_expect sigterm_inconclusive_cleanup 1 FAIL 0 1
 # A failed cleanup is a FAIL and no PASS precedes it.
 run_verdict_scenario cleanup_fails 'suite_remove() { echo CLEANUP_ATTEMPT; return 1; }; test_pass a; suite_complete=true'
 vs_expect cleanup_fails 1 FAIL 1 0
